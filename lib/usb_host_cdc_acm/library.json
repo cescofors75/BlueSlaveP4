@@ -1,0 +1,12 @@
+{
+  "name": "usb_host_cdc_acm",
+  "version": "2.4.0",
+  "description": "USB Host CDC-ACM Class Driver (from espressif/esp-usb)",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include",
+    "srcFilter": "+<*.c>"
+  }
+}

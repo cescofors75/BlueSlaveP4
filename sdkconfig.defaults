@@ -1,0 +1,24 @@
+# BlueSlaveP4 — ESP32-P4 SDK overrides
+# Applied by PlatformIO before build (merged with framework defaults).
+
+# ── Task Watchdog ─────────────────────────────────────────────────────────────
+# LVGL 9 SW renderer on 1024x600 takes ~20ms per frame (vsync-gated).
+# With the default 5s timeout the idle task on Core 0 can be starved by the
+# render + touch tasks long enough to trigger a panic reset.
+# Extend to 30s so transient bursts (screen transitions, MIDI load) never trip
+# the WDT. Disable panic so a genuine stall logs the culprit task without
+# hard-resetting the instrument mid-session.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_TASK_WDT_PANIC=n
+
+# ── Interrupt Watchdog ────────────────────────────────────────────────────────
+# Keep IWDT at default (300ms) — ISRs should never block that long.
+# CONFIG_ESP_INT_WDT_TIMEOUT_MS=300  (default, no change needed)
+
+# ── FreeRTOS tick rate ────────────────────────────────────────────────────────
+# Default 1000Hz (1ms tick) is fine for our 10ms touch + 16ms render periods.
+# CONFIG_FREERTOS_HZ=1000  (default)
+
+# ── LVGL / ESP32-P4 PPA ──────────────────────────────────────────────────────
+# PPA requires LVGL draw buffers aligned to the L2 cache line size.
+CONFIG_LV_DRAW_BUF_ALIGN=64
