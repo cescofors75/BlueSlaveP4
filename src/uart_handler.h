@@ -1,68 +1,44 @@
 // =============================================================================
-// uart_handler.h — UART binary protocol receiver (P4 side)
-// Receives state from S3, sends touch commands back
+// uart_handler.h — P4 shared app state + local pattern cache + UDP pattern push
+//
+// The legacy UART/USB-C link to the ESP32-S3 has been removed; the P4 talks to
+// the RED808 Master over UDP only. This module now just owns the shared P4State
+// and the helpers that stage pattern data to the Master.
 // =============================================================================
 #pragma once
 
 #include <stdint.h>
-#include "../include/uart_protocol.h"
 
-// Initialize UART1 for S3 communication
+// Initialize default P4 state (call once at boot).
 void uart_handler_init(void);
 
-// Process pending UART packets — call from main loop.
-// Returns number of packets processed.
-int uart_handler_process(void);
-
-// Drain any pending MIDI→Master UDP burst a few packets at a time so it
-// never blocks the main loop. No-op when idle. Call every loop().
+// Drain any pending pattern push to the Master a few UDP packets at a time so
+// it never blocks the main loop. No-op when idle. Call every loop().
 void uart_handler_tick_pending_push(void);
 
-// Stage a pattern push to the Master from a raw 16×16 step grid.
-// Used by the MEM MIDI loader (P4-local flash) so it can reuse the same
-// non-blocking UDP drainer as the S3→P4 MSG_PATTERN_PUSH path.
-// Updates p4.steps and p4.current_pattern before staging.
+// Stage a pattern push to the Master from a raw 16×16 step grid (MEM MIDI
+// loader / sequencer). Updates p4.steps and p4.current_pattern, then streams
+// the pattern to the Master over UDP.
 void uart_stage_pattern_push_from_steps(uint8_t slot, const bool steps[16][16]);
 
-// Lock tempo for the given duration (ms). Incoming BPM updates from S3
-// (MSG_SYSTEM/SYS_BPM_INT/FRAC) are ignored while the lock is active.
-// Used when loading a MIDI file so the S3's cached tempo doesn't override
-// the tempo just sent to the Master.
+// Retained for the MIDI-load tempo path. No-op now that the Master is the only
+// tempo source (kept so callers don't need to change).
 void uart_lock_tempo(uint32_t duration_ms);
 
-// Send a basic command to S3 (P4→S3 touch commands)
-void uart_send_to_s3(uint8_t type, uint8_t id, uint8_t value);
-
-// SD remote browse commands (P4→S3)
-void uart_send_sd_mount(void);
-void uart_send_sd_select(uint8_t index);
-void uart_send_sd_back(void);
-void uart_send_sd_load(uint8_t pad);
-void uart_send_sd_load_midi(uint8_t slot);
-
-// Send full pattern step data to S3 as MSG_PATTERN_DATA extended packet
+// Cache the given pattern's steps locally so pattern switches restore instantly.
+// Despite the legacy name this no longer transmits to any S3.
 void uart_send_pattern_to_s3(int pattern, const bool steps[16][16]);
+
+// Restore a previously cached pattern into p4.steps. Returns false if the slot
+// has no cached data.
 bool uart_restore_cached_pattern(uint8_t slot);
 
-// Check if S3 is alive (heartbeat received recently)
-bool uart_s3_alive(void);
-
-// UART link statistics (for diagnostics)
-struct UartStats {
-    uint32_t tx_packets;
-    uint32_t rx_packets;
-    uint32_t rx_checksum_errors;
-    uint32_t rx_framing_errors;
-};
-extern UartStats uart_stats;
-
 // =============================================================================
-// P4 LOCAL STATE — updated by UART handler, read by UI
+// P4 LOCAL STATE — single source of truth for the UI
 // =============================================================================
 
-// v2.9 — Pending melody state received from S3 via UART.
-// Written by uart_handler_process(); consumed by main loop under lvgl_port_lock.
-// Direct S3→P4 sync (same model as pad sync — no master needed).
+// Pending melody state pushed by the Master over UDP (consumed by the main
+// loop under lvgl_port_lock). Kept under the legacy field/global name.
 struct PendingMelodyFromS3 {
     uint8_t engine = 3;
     uint8_t octave = 4;
@@ -71,6 +47,7 @@ struct PendingMelodyFromS3 {
     volatile bool pending = false;
 };
 extern PendingMelodyFromS3 g_pending_melody_from_s3;
+
 struct P4State {
     // System
     int  bpm_int;           // 40-240
@@ -112,7 +89,7 @@ struct P4State {
     bool sample_loaded[24];
     char sample_name[24][32];
 
-    // Pattern step data (updated via extended packets)
+    // Pattern step data
     bool steps[16][16];     // [track][step]
 
     // Pad triggers (flash feedback)
@@ -125,13 +102,13 @@ struct P4State {
     // Connection
     unsigned long last_heartbeat_ms;
     bool s3_connected;
-    bool s3_wifi_connected;  // S3's own WiFi status (from UART SYS_WIFI_STATE)
+    bool s3_wifi_connected;
 };
 
 extern P4State p4;
 
 // =============================================================================
-// SD REMOTE BROWSE STATE — populated by S3 via MSG_SD_DATA
+// SD BROWSE STATE — populated locally from the P4's own SD_MMC card
 // =============================================================================
 #define P4_SD_MAX_ENTRIES 64
 
@@ -149,9 +126,9 @@ struct P4SdState {
     bool selected_is_midi;   // true when selected entry is a .mid file
     // MIDI load result status (for UI feedback):
     //   -2 = idle / no request in flight
-    //   -1 = request in flight (waiting for S3 response)
+    //   -1 = request in flight
     //    0..N = loaded OK into pattern slot N
-    //  0x7F = parse/load failed on S3 (payload == 0xFF)
+    //  0x7F = parse/load failed
     int8_t midi_load_result;
     P4SdEntry entries[P4_SD_MAX_ENTRIES];
     int  entry_count;

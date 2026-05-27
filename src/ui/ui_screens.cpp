@@ -401,9 +401,7 @@ static void header_play_cb(lv_event_t* e) {
     // Notify S3 of the new state so its UI & isPlaying mirror us WITHOUT
     // triggering another UDP start/stop from S3 (that duplication is what
     // made the two sequencers fall out of sync on every P4 tap).
-    uart_send_to_s3(MSG_SYSTEM, SYS_PLAY_STATE, next_play ? 1 : 0);
     // P4 owns step clock: reset phase explicitly on every transport toggle.
-    uart_send_to_s3(MSG_SYSTEM, SYS_STEP, 0);
     p4.current_step = 0;
     p4.is_playing = next_play;
 }
@@ -436,24 +434,11 @@ static void header_pattern_cb(lv_event_t* e) {
     } else {
         seq_pattern_modal_hide();
     }
-#if !P4_STANDALONE_MASTER_ONLY
-    // Avoid overwriting the selected pattern with stale S3 cache while
-    // UDP master sync is active.
-    if (!udp_wifi_connected() && !udp_master_connected()) {
-        uart_restore_cached_pattern((uint8_t)next_pattern);
-    }
-#endif
     header_clear_track_isolation();
-    // Always push selection/request to Master; sendJson() already no-ops when
-    // UDP is not started, and this avoids stale UI transport flags blocking
-    // pattern changes.
+    // Push selection/request to the Master; sendJson() already no-ops when UDP
+    // is not started, which avoids stale UI transport flags blocking changes.
     udp_send_select_pattern(next_pattern);
     udp_send_get_pattern(next_pattern);
-    if (p4.s3_connected) {
-        // S3 owns local/demo patterns. Ask it to push the selected grid back
-        // through MSG_PATTERN_PUSH only when the slot has real local data.
-        uart_send_to_s3(MSG_TOUCH_CMD, TCMD_PATTERN_SEL, (uint8_t)next_pattern);
-    }
 }
 
 // =============================================================================
@@ -1419,7 +1404,6 @@ static void grid_sync_cb(lv_event_t* e) {
         if (lbl) lv_label_set_text(lbl, sync_pads_active ? "SYNC\nON" : "SYNC\nOFF");
     }
     // Sync state to S3
-    uart_send_to_s3(MSG_TOUCH_CMD, TCMD_SYNC_PADS, sync_pads_active ? 1 : 0);
 }
 
 // Cycle Note Repeat: OFF → 1/4 → 1/8 → 1/16 → 1/32 → 1/8T → 1/16T → OFF
@@ -1476,7 +1460,6 @@ static void grid_theme_cb(lv_event_t* e) {
     p4.theme = next;
     ui_theme_apply((VisualTheme)next);
     // Sync theme to S3
-    uart_send_to_s3(MSG_TOUCH_CMD, TCMD_THEME_NEXT, (uint8_t)next);
 }
 
 static void grid_master_vol_step_cb(lv_event_t* e) {
@@ -2751,8 +2734,10 @@ static void update_live_screen(void) {
     if (grid_home_vol_lbl && (int8_t)mstr_on != gp_prev_mstr_top) {
         gp_prev_mstr_top = (int8_t)mstr_on;
         lv_label_set_text(grid_home_vol_lbl, mstr_on ? "MASTER OK" : "NO LINK");
+        // RED808 theme has no real green (success is cream), so use explicit
+        // semaphore tints: soft green when linked, muted warm red when not.
         lv_obj_set_style_text_color(grid_home_vol_lbl,
-            mstr_on ? RED808_SUCCESS : RED808_TEXT_DIM, 0);
+            mstr_on ? lv_color_hex(0x5FB87A) : lv_color_hex(0xC96A4A), 0);
     }
 
     // Dedicated HOME controls labels
@@ -3776,7 +3761,6 @@ static void seq_mute_cb(lv_event_t* e) {
         ui_show_toast(tb, next ? RED808_ERROR : RED808_SUCCESS);
         if (ui_use_udp_transport()) enqueue_mute_control((uint8_t)track, next);
         // Relay mute to S3 so the sequencer trigger engine honors it.
-        uart_send_to_s3(MSG_TRACK, TRK_MUTE_BIT | (track & 0x0F), next ? 1 : 0);
     }
 }
 
@@ -3819,7 +3803,6 @@ static void seq_solo_cb(lv_event_t* e) {
         for (int t = 0; t < 16; t++) {
             p4.track_muted[t] = false;
             seq_saved_mute[t] = false;
-            uart_send_to_s3(MSG_TRACK, TRK_MUTE_BIT | (t & 0x0F), 0);
         }
         // Single atomic UDP packet — no flicker from partial state_sync.
         if (ui_use_udp_transport()) {
@@ -3840,8 +3823,6 @@ static void seq_solo_cb(lv_event_t* e) {
             bool shouldMute = (t != track);
             p4.track_muted[t] = shouldMute;
             if (shouldMute) muteMask |= (1u << t);
-            uart_send_to_s3(MSG_TRACK, TRK_MUTE_BIT | (t & 0x0F),
-                            shouldMute ? 1 : 0);
         }
         if (ui_use_udp_transport()) {
             enqueue_mute_mask_control(muteMask);
@@ -3927,10 +3908,8 @@ static void seq_swing_delta_cb(lv_event_t* e) {
 static void seq_drive_delta_cb(lv_event_t* e) {
     int delta = (int)(intptr_t)lv_event_get_user_data(e);
     if (delta > 0) {
-        uart_send_to_s3(MSG_TOUCH_CMD, TCMD_DRIVE_UP, 0);
         seq_ctrl_drive += 12;
     } else {
-        uart_send_to_s3(MSG_TOUCH_CMD, TCMD_DRIVE_DOWN, 0);
         seq_ctrl_drive -= 12;
     }
     if (seq_ctrl_drive < 0) seq_ctrl_drive = 0;
@@ -4053,8 +4032,6 @@ static void create_sequencer_screen(void) {
                 p4.track_muted[t]  = false;
                 p4.track_solo[t]   = false;
                 seq_saved_mute[t]  = false;
-                uart_send_to_s3(MSG_TRACK, TRK_MUTE_BIT | (t & 0x0F), 0);
-                uart_send_to_s3(MSG_TRACK, TRK_SOLO_BIT | (t & 0x0F), 0);
             }
             // Single atomic UDP packet for all 16 tracks (no flicker).
             if (ui_use_udp_transport()) {
@@ -4568,7 +4545,6 @@ static void vol_slider_cb(lv_event_t* e) {
     int val = lv_slider_get_value(slider);
     p4.track_volume[trk] = val;
     udp_send_set_track_volume(trk, val);
-    uart_send_to_s3(MSG_TRACK, TRK_VOLUME | (trk & 0x0F), (uint8_t)val);
 }
 
 static void create_volumes_screen(void) {
@@ -6361,7 +6337,6 @@ static void piano_send_on(uint8_t midi_note, bool legato) {
         }
     }
     if (s_piano_rec_active) {
-        uart_send_to_s3(MSG_TOUCH_CMD, TCMD_MELODY_NOTE, midi_note);
         int pc = midi_note % 12;
         int row = -1;
         for (int r = 0; r < 12; r++) {
@@ -6489,10 +6464,6 @@ static void piano_key_event_cb(lv_event_t* e) {
 // v2.9 — Envía el estado piano completo a S3 via UART (4 paquetes consecutivos).
 // Garantiza que el receptor aplique un estado coherente sin mezclar defaults.
 static void piano_uart_broadcast_state(void) {
-    uart_send_to_s3(MSG_TOUCH_CMD, TCMD_MELODY_ENGINE, PIANO_ENGINES[s_piano_engine_idx]);
-    uart_send_to_s3(MSG_TOUCH_CMD, TCMD_MELODY_OCTAVE, (uint8_t)s_piano_octave);
-    uart_send_to_s3(MSG_TOUCH_CMD, TCMD_MELODY_REC,    s_piano_rec_active ? 1 : 0);
-    uart_send_to_s3(MSG_TOUCH_CMD, TCMD_MELODY_PAD,    (uint8_t)s_piano_assign_pad);
 }
 
 static void piano_refresh_engine_chips(void) {
@@ -8618,10 +8589,7 @@ void ui_process_pad_queue(void) {
         if (!velocity) velocity = 100;   // defensive floor
         // Feed DSP spectrum with real velocity
         dsp_notify_pad(pad, velocity);
-        // Notify S3 via UART (fast, 5 bytes). Legacy TCMD_PAD_TAP ignores
-        // velocity; we still send it for forward compatibility.
-        uart_send_to_s3(MSG_TOUCH_CMD, TCMD_PAD_TAP, pad);
-        // Then send UDP to master with MPC-style velocity
+        // Send UDP to master with MPC-style velocity
         if (p4.wifi_connected || p4.master_connected) {
             // Kit per-pad: si el pad usa un engine drum (808/909/505) y su
             // kit asignado difiere del último aplicado a ese engine en la

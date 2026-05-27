@@ -114,35 +114,6 @@
 #endif
 
 // =============================================================================
-// USB-C connection to ESP32-S3 (via USB-OTG Host port)
-// Set to 1 to use USB-C instead of UART for S3 communication.
-// When enabled, P4 acts as USB Host on OTG port — S3 appears as CDC-ACM device.
-// =============================================================================
-#ifndef P4_USB_CDC_ENABLED
-#define P4_USB_CDC_ENABLED 0
-#endif
-
-// =============================================================================
-// STANDALONE MODE
-// 1 = P4 runs as the only control surface and talks only to Master.
-//     AUX/S3 transport is disabled at runtime so pads, sequencer, patterns
-//     and FX stay on the P4->Master path only.
-// =============================================================================
-#ifndef P4_STANDALONE_MASTER_ONLY
-#define P4_STANDALONE_MASTER_ONLY 1
-#endif
-
-// =============================================================================
-// LEGACY AUX/S3 FX CONTROLS
-// 0 = Delay/Reverb/Phaser visuals are authoritative from Master UDP only.
-//     UART/USB-C legacy FX packets must not overwrite those P4 UI values.
-// 1 = Allow old AUX/S3 encoder/pot FX packets to drive P4 FX visuals.
-// =============================================================================
-#ifndef P4_ENABLE_LEGACY_UART_FX_CONTROLS
-#define P4_ENABLE_LEGACY_UART_FX_CONTROLS 0
-#endif
-
-// =============================================================================
 // NETWORK — ESP32-C6 hosted WiFi link to RED808 Master
 // Override these with build_flags or a local config overlay when needed.
 // =============================================================================
@@ -152,19 +123,6 @@
 #ifndef P4_WIFI_PASS
 #define P4_WIFI_PASS "red808esp32"
 #endif
-
-// =============================================================================
-// UART — Connection to ESP32-S3 (binary protocol, fallback when USB disabled)
-// =============================================================================
-#ifndef UART_S3_TX_PIN
-#define UART_S3_TX_PIN  32      // P4 TX → S3 RX (GPIO15)
-#endif
-#ifndef UART_S3_RX_PIN
-#define UART_S3_RX_PIN  33      // P4 RX ← S3 TX (GPIO16)
-#endif
-#define UART_S3_PORT    1       // UART1 (UART0 used for USB debug)
-#define UART_RX_BUF     1024    // Was 512: ~9ms of 921600-baud headroom so LVGL flush stalls don't overflow
-#define UART_TX_BUF     256
 
 // =============================================================================
 // SEQUENCER (mirror of S3 constants for UI rendering)
