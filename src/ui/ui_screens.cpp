@@ -279,7 +279,11 @@ static bool ui_master_link_display_on(void) {
     static bool pending = false;
     static uint32_t pending_since = 0;
 
-    bool raw = p4.master_connected;
+    // "Linked" means we are on the Master's AP and can reach it over UDP.
+    // Don't gate on master_connected alone: that flag tracks *inbound* packets
+    // and drops after a few quiet seconds even while the link is fine, which
+    // made the indicator flap to NO LINK mid-session.
+    bool raw = p4.wifi_connected || p4.master_connected;
     uint32_t now = millis();
     uint32_t settle_ms = raw ? 350UL : 2200UL;
 
