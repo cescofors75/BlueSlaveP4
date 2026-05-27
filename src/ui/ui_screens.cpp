@@ -8557,6 +8557,7 @@ void ui_navigate_to(int screen_id) {
 static uint32_t s_pad_noteoff_at[16]    = {0};
 static int8_t   s_pad_noteoff_engine[16] = {-1, -1, -1, -1, -1, -1, -1, -1,
                                            -1, -1, -1, -1, -1, -1, -1, -1};
+static uint8_t  s_pad_noteoff_note[16]   = {0};
 
 void ui_process_control_queue(void) {
     if (s_ctrl_mute_mask_pending.exchange(false, std::memory_order_acquire)) {
@@ -8595,6 +8596,9 @@ void ui_process_pad_queue(void) {
         dsp_notify_pad(pad, velocity);
         // Send UDP to master with MPC-style velocity
         if (p4.wifi_connected || p4.master_connected) {
+            int8_t engine = (pad < 16) ? pad_inst_engine_code(s_pad_inst_sel[pad]) : -1;
+            bool melodic  = (engine >= 3 && engine <= 6);  // 303/WT/FM2/SH101
+
             // Kit per-pad: si el pad usa un engine drum (808/909/505) y su
             // kit asignado difiere del último aplicado a ese engine en la
             // Daisy, manda CMD_SYNTH_PRESET justo antes del trigger. Esto
@@ -8611,16 +8615,18 @@ void ui_process_pad_queue(void) {
                     }
                 }
             }
-            udp_send_trigger(pad, velocity);
-            // Schedule synth note-off for melodic engines so 303/WT/FM2/SH101
-            // don't get stuck after a tap. Drum samples (engine -1, 0, 1, 2)
-            // already self-terminate.
-            if (pad < 16) {
-                int8_t engine = pad_inst_engine_code(s_pad_inst_sel[pad]);
-                if (engine >= 3 && engine <= 6) {
-                    s_pad_noteoff_engine[pad] = engine;
-                    s_pad_noteoff_at[pad]     = now_ms + 220;
-                }
+
+            if (melodic) {
+                // Melodic synth engines don't sound from a bare trigger(pad):
+                // they need an explicit note, exactly like the XTRA pads. Map
+                // the 16 pads chromatically and schedule the matching note-off.
+                int note = constrain(48 + (int)pad, 24, 96);
+                udp_send_synth_note_on_ex((uint8_t)engine, (uint8_t)note, velocity, false, false);
+                s_pad_noteoff_engine[pad] = engine;
+                s_pad_noteoff_note[pad]   = (uint8_t)note;
+                s_pad_noteoff_at[pad]     = now_ms + 220;
+            } else {
+                udp_send_trigger(pad, velocity);
             }
         }
         // Mirror to legacy binary flash timer so screens that still read
@@ -8634,14 +8640,13 @@ void ui_process_pad_queue(void) {
         if (!s_pad_noteoff_at[pad]) continue;
         if ((int32_t)(now_ms - s_pad_noteoff_at[pad]) < 0) continue;
         int8_t engine = s_pad_noteoff_engine[pad];
+        uint8_t note  = s_pad_noteoff_note[pad];
         s_pad_noteoff_at[pad]     = 0;
         s_pad_noteoff_engine[pad] = -1;
         if (!(p4.wifi_connected || p4.master_connected)) continue;
-        if (engine == 3) {
-            // 303 is a single-voice mono synth on master
-            udp_send_synth303_note_off();
-        } else if (engine >= 0 && engine <= 6) {
-            udp_send_synth_note_off((uint8_t)engine, (uint8_t)pad);
+        // Release the note we played, matching the XTRA melodic note-off.
+        if (engine >= 3 && engine <= 6) {
+            udp_send_synth_note_off_ex((uint8_t)engine, 0, note);
         }
     }
 }
