@@ -6429,16 +6429,16 @@ static void piano_set_note_active(uint8_t note, bool pressed) {
 }
 
 static bool piano_poly_mode_active(void) {
-    return piano_engine_code() == 4 && !s_piano_glide_enabled && !s_piano_bend_enabled;
+    // All engines play polyphonically. Glide and pitch-bend are inherently
+    // monophonic gesture modes, so when either is on we fall back to the
+    // single-note (slide/bend) path instead of stacking notes.
+    return !s_piano_glide_enabled && !s_piano_bend_enabled;
 }
 
 static void piano_send_note_off_specific(uint8_t midi_note) {
     if (!ui_use_udp_transport()) return;
-    if (piano_engine_code() == 4) {
-        udp_send_synth_note_off_ex(piano_engine_code(), 0, midi_note);
-        return;
-    }
-    udp_send_synth_note_off(piano_engine_code(), 0);
+    // Release only this note so the other held notes keep ringing (polyphony).
+    udp_send_synth_note_off_ex(piano_engine_code(), 0, midi_note);
 }
 
 static void piano_send_engine_all_notes_off(uint8_t engine) {
@@ -6593,12 +6593,19 @@ static void piano_send_bend(float bend_st) {
 }
 
 static void piano_send_off(void) {
-    int held_note = s_piano_held_note;
-    if (held_note >= 0 && ui_use_udp_transport()) {
-        if (piano_engine_code() == 4) {
-            udp_send_synth_note_off_ex(piano_engine_code(), 0, (uint8_t)held_note);
-        } else {
-            udp_send_synth_note_off(piano_engine_code(), 0);
+    if (ui_use_udp_transport()) {
+        uint8_t engine = piano_engine_code();
+        bool any = false;
+        // Release every note currently held so chords don't hang on octave /
+        // engine changes or when leaving the screen.
+        for (int n = 0; n < 128; n++) {
+            if (s_piano_note_active[n]) {
+                udp_send_synth_note_off_ex(engine, 0, (uint8_t)n);
+                any = true;
+            }
+        }
+        if (!any && s_piano_held_note >= 0) {
+            udp_send_synth_note_off_ex(engine, 0, (uint8_t)s_piano_held_note);
         }
     }
     s_piano_release_pending = false;
