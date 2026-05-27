@@ -57,6 +57,12 @@ static const unsigned long LOCAL_STEP_OWNERSHIP_MS = 700;
 static int pendingPatternRequest = -1;
 static unsigned long pendingPatternLastTxMs = 0;
 static uint8_t pendingPatternRetries = 0;
+// HTTP is only a fallback when the UDP get_pattern reply is lost. Rate-limit it
+// and keep the request timeout short so a stalled master can't freeze the loop
+// (and starve pad/control sends) for long.
+static unsigned long lastPatternHttpMs = 0;
+static const unsigned long PATTERN_HTTP_FALLBACK_MS = 500;
+static const int          MASTER_HTTP_TIMEOUT_MS    = 350;
 static bool patternRowGrid[16][64] = {};
 static uint16_t patternRowMask = 0;
 static int patternRowPattern = -1;
@@ -407,7 +413,8 @@ static bool fetch_pattern_http(int pattern) {
     snprintf(url, sizeof(url), "http://192.168.4.1/api/getPattern?index=%d", pattern);
 
     HTTPClient http;
-    http.setTimeout(900);
+    http.setTimeout(MASTER_HTTP_TIMEOUT_MS);
+    http.setConnectTimeout(MASTER_HTTP_TIMEOUT_MS);
     if (!http.begin(url)) return false;
 
     int code = http.GET();
@@ -449,6 +456,7 @@ static bool fetch_pattern_http(int pattern) {
     pendingPatternLastTxMs = 0;
     masterAlive = true;
     p4.master_connected = true;
+    lastMasterPacket = millis();
     uart_send_pattern_to_s3(p4.current_pattern, p4.steps);
     P4_LOG_PRINTF("[HTTP][PAT] loaded pattern %d len=%d\n", pattern, raw_len);
     return true;
@@ -458,7 +466,8 @@ static bool fetch_master_state_http(void) {
     if (!wifiConnected) return false;
 
     HTTPClient http;
-    http.setTimeout(900);
+    http.setTimeout(MASTER_HTTP_TIMEOUT_MS);
+    http.setConnectTimeout(MASTER_HTTP_TIMEOUT_MS);
     if (!http.begin("http://192.168.4.1/api/p4State")) return false;
 
     int code = http.GET();
@@ -476,6 +485,14 @@ static bool fetch_master_state_http(void) {
         P4_LOG_PRINTF("[HTTP][STATE] parse error: %s\n", err.c_str());
         return false;
     }
+
+    // A 200 from the master proves it's reachable — keep the reconnect path's
+    // liveness signal now that the pattern grid is no longer fetched eagerly.
+    // Refresh lastMasterPacket too, otherwise the loop's timeout check would
+    // flip masterAlive straight back to false on the next iteration.
+    masterAlive = true;
+    p4.master_connected = true;
+    lastMasterPacket = millis();
 
     int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, 15);
     // Don't let a periodic state poll overwrite a just-made local pattern pick.
@@ -837,7 +854,10 @@ void udp_send_get_pattern(int pattern) {
     if (pendingPatternRetries < 255) pendingPatternRetries++;
     P4_LOG_PRINTF("[UDP][PAT] TX get_pattern idx=%d\n", pattern);
     sendJson(buf);
-    fetch_pattern_http(pattern);
+    // No synchronous HTTP fetch here: the master answers get_pattern over UDP
+    // in a few ms on the local link, which keeps the loop non-blocking and pad
+    // latency low. HTTP is only used as a fallback from the watchdog if the UDP
+    // reply doesn't arrive (see udp_handler_process()).
 }
 
 void udp_send_set_step(int track, int step, bool active) {
@@ -1788,10 +1808,19 @@ void udp_handler_process(void) {
     // at a controlled rate so UI/audio don't stay stuck on old steps.
     if (udpStarted && masterAlive && pendingPatternRequest >= 0) {
         if (now - pendingPatternLastTxMs >= 250 && pendingPatternRetries < 12) {
+            int target = pendingPatternRequest;
             if ((pendingPatternRetries % 3) == 0) {
-                udp_send_select_pattern(pendingPatternRequest);
+                udp_send_select_pattern(target);
             }
-            udp_send_get_pattern(pendingPatternRequest);
+            udp_send_get_pattern(target);
+            // UDP reply for the pending pattern is overdue (>=250 ms): fall back
+            // to a rate-limited, short-timeout HTTP fetch so the grid still
+            // loads if the UDP packet was dropped. fetch_pattern_http() clears
+            // the pending request on success.
+            if (now - lastPatternHttpMs >= PATTERN_HTTP_FALLBACK_MS) {
+                lastPatternHttpMs = now;
+                fetch_pattern_http(target);
+            }
         } else if (pendingPatternRetries >= 12) {
             P4_LOG_PRINTF("[UDP][PAT] timeout waiting pattern_sync idx=%d\n",
                           pendingPatternRequest);
