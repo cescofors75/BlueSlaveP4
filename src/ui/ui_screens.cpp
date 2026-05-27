@@ -207,7 +207,6 @@ static lv_obj_t* hdr_play_label = NULL;
 static lv_obj_t* hdr_pattern_minus_btn = NULL;
 static lv_obj_t* hdr_pattern_plus_btn = NULL;
 static lv_obj_t* hdr_wifi_label = NULL;
-static lv_obj_t* hdr_s3_label = NULL;
 static lv_obj_t* hdr_step_dots[16] = {};
 
 // Current active screen index + history for back navigation
@@ -280,7 +279,7 @@ static bool ui_master_link_display_on(void) {
     static bool pending = false;
     static uint32_t pending_since = 0;
 
-    bool raw = p4.wifi_connected || p4.master_connected;
+    bool raw = p4.master_connected;
     uint32_t now = millis();
     uint32_t settle_ms = raw ? 350UL : 2200UL;
 
@@ -466,7 +465,7 @@ void ui_create_header(lv_obj_t* parent) {
     hdr_bpm_label = NULL; hdr_pattern_label = NULL;
     hdr_play_btn = NULL; hdr_play_label = NULL;
     hdr_pattern_minus_btn = NULL; hdr_pattern_plus_btn = NULL;
-    hdr_wifi_label = NULL; hdr_s3_label = NULL;
+    hdr_wifi_label = NULL;
     for (int i = 0; i < 16; i++) hdr_step_dots[i] = NULL;
 
     // Small floating back button (top-left)
@@ -487,7 +486,7 @@ void ui_create_header(lv_obj_t* parent) {
 
 void ui_update_header(void) {
     static int prev_bpm = -1, prev_frac = -1, prev_pat = -1;
-    static bool prev_play = false, prev_wifi = false, prev_s3 = false;
+    static bool prev_play = false, prev_wifi = false;
 
     if (p4.bpm_int != prev_bpm || p4.bpm_frac != prev_frac) {
         prev_bpm = p4.bpm_int;
@@ -518,14 +517,6 @@ void ui_update_header(void) {
         }
     }
 
-    if (p4.s3_connected != prev_s3) {
-        prev_s3 = p4.s3_connected;
-        if (hdr_s3_label) {
-            lv_label_set_text(hdr_s3_label, p4.s3_connected ? "AUX ON" : "AUX OFF");
-            lv_obj_set_style_text_color(hdr_s3_label,
-                p4.s3_connected ? RED808_INFO : RED808_TEXT_DIM, 0);
-        }
-    }
 }
 
 // =============================================================================
@@ -586,8 +577,6 @@ static lv_obj_t* grid_16l_lbl = NULL;
 // Link status indicators (replaces the old "LIVE" badge)
 static lv_obj_t* grid_mstr_dot = NULL;  // Master (UDP to ESP32-C6 AP) link
 static lv_obj_t* grid_mstr_lbl = NULL;
-static lv_obj_t* grid_aux_dot  = NULL;  // Aux (UART to ESP32-S3) link
-static lv_obj_t* grid_aux_lbl  = NULL;
 static lv_obj_t* grid_vol_lbl = NULL;
 static lv_obj_t* grid_pad_prev_btn = NULL;
 static lv_obj_t* grid_pad_next_btn = NULL;
@@ -2329,7 +2318,7 @@ static void create_live_screen(void) {
     lv_obj_t* home_cell = create_info_cell(scr_live, COL_X(7), ROW_Y(0), CW, CH,
                                            "STATUS", "P01", RED808_WARNING, &grid_bpm_lbl);
     grid_home_vol_lbl = lv_label_create(home_cell);
-    lv_label_set_text(grid_home_vol_lbl, "MSTR --  AUX --");
+    lv_label_set_text(grid_home_vol_lbl, "NO LINK");
     lv_obj_set_style_text_font(grid_home_vol_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(grid_home_vol_lbl, RED808_CYAN, 0);
     lv_obj_align(grid_home_vol_lbl, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -2758,16 +2747,12 @@ static void update_live_screen(void) {
     }
 
     static int8_t gp_prev_mstr_top = -1;
-    static int8_t gp_prev_aux_top = -1;
     bool mstr_on = ui_master_link_display_on();
-    bool aux_on  = p4.s3_connected;
-    if (grid_home_vol_lbl && ((int8_t)mstr_on != gp_prev_mstr_top || (int8_t)aux_on != gp_prev_aux_top)) {
+    if (grid_home_vol_lbl && (int8_t)mstr_on != gp_prev_mstr_top) {
         gp_prev_mstr_top = (int8_t)mstr_on;
-        gp_prev_aux_top = (int8_t)aux_on;
-        lv_label_set_text_fmt(grid_home_vol_lbl, "MSTR %s  AUX %s",
-                              mstr_on ? "OK" : "--", aux_on ? "OK" : "--");
+        lv_label_set_text(grid_home_vol_lbl, mstr_on ? "MASTER OK" : "NO LINK");
         lv_obj_set_style_text_color(grid_home_vol_lbl,
-            (mstr_on && aux_on) ? RED808_SUCCESS : (mstr_on || aux_on) ? RED808_CYAN : RED808_TEXT_DIM, 0);
+            mstr_on ? RED808_SUCCESS : RED808_TEXT_DIM, 0);
     }
 
     // Dedicated HOME controls labels
@@ -8413,7 +8398,7 @@ static void ui_reload_themed_screens(void) {
     header_bar = NULL; hdr_bpm_label = NULL; hdr_pattern_label = NULL;
     hdr_play_btn = NULL; hdr_play_label = NULL;
     hdr_pattern_minus_btn = NULL; hdr_pattern_plus_btn = NULL;
-    hdr_wifi_label = NULL; hdr_s3_label = NULL;
+    hdr_wifi_label = NULL;
     for (int i = 0; i < 16; i++) hdr_step_dots[i] = NULL;
     for (int i = 0; i < 16; i++) {
         live_pad_btns[i] = NULL; live_pad_labels[i] = NULL;
@@ -8433,7 +8418,6 @@ static void ui_reload_themed_screens(void) {
     grid_nr_btn = NULL; grid_nr_lbl = NULL;
     grid_16l_btn = NULL; grid_16l_lbl = NULL;
     grid_mstr_dot = NULL; grid_mstr_lbl = NULL;
-    grid_aux_dot  = NULL; grid_aux_lbl  = NULL;
     grid_vol_lbl = NULL; grid_sync_btn = NULL;
     grid_home_vol_lbl = NULL;
     grid_pad_prev_btn = NULL;

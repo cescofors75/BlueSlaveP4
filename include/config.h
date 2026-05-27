@@ -119,7 +119,7 @@
 // When enabled, P4 acts as USB Host on OTG port — S3 appears as CDC-ACM device.
 // =============================================================================
 #ifndef P4_USB_CDC_ENABLED
-#define P4_USB_CDC_ENABLED 1
+#define P4_USB_CDC_ENABLED 0
 #endif
 
 // =============================================================================
