@@ -44,6 +44,11 @@ static bool sessionCleanSent = false;
 static unsigned long lastLocalMuteMs[16] = {};
 static unsigned long lastLocalSoloMs[16] = {};
 static unsigned long lastLocalTrackVolMs[16] = {};
+// Timestamp of the last LOCAL pattern selection. The master's periodic
+// state_sync (and the HTTP state poll) can still report the previous pattern
+// for a cycle or two after we switch, which would otherwise yank the user back
+// to the old pattern. Treat a recent local selection as authoritative.
+static unsigned long lastLocalPatternMs = 0;
 // Master broadcasts state_sync about every 2 s. Keep a slightly larger local
 // ownership window so near-race packets do not pull FX/track values back right
 // after a local touch interaction.
@@ -90,6 +95,10 @@ enum FxOwnershipIndex : int {
 static inline bool is_track_volume_owned_recent(int track, unsigned long nowMs) {
     if (track < 0 || track >= 16) return false;
     return (nowMs - lastLocalTrackVolMs[track]) < LOCAL_OWNERSHIP_MS;
+}
+
+static inline bool is_pattern_owned_recent(unsigned long nowMs) {
+    return lastLocalPatternMs != 0 && (nowMs - lastLocalPatternMs) < LOCAL_OWNERSHIP_MS;
 }
 
 static inline bool is_fx_owned_recent(FxOwnershipIndex idx, unsigned long nowMs) {
@@ -469,8 +478,11 @@ static bool fetch_master_state_http(void) {
     }
 
     int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, 15);
-    p4.current_pattern = pat;
-    uart_send_to_s3(MSG_SYSTEM, SYS_PATTERN, (uint8_t)pat);
+    // Don't let a periodic state poll overwrite a just-made local pattern pick.
+    if (!is_pattern_owned_recent(millis())) {
+        p4.current_pattern = pat;
+        uart_send_to_s3(MSG_SYSTEM, SYS_PATTERN, (uint8_t)pat);
+    }
 
     bool playing = doc["playing"] | p4.is_playing;
     p4.is_playing = playing;
@@ -807,6 +819,7 @@ void udp_send_tempo(float bpm) {
 }
 
 void udp_send_select_pattern(int index) {
+    lastLocalPatternMs = millis();
     char buf[64];
     snprintf(buf, sizeof(buf), "{\"cmd\":\"selectPattern\",\"index\":%d}", index);
     P4_LOG_PRINTF("[UDP][PAT] TX selectPattern idx=%d\n", index);
@@ -1196,14 +1209,19 @@ static void processJson(const char* json, int len) {
 
     if (strcmp(cmd, "state_sync") == 0) {
         int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, 15);
-        bool patternChanged = (pat != p4.current_pattern);
-        p4.current_pattern = pat;
-        uart_send_to_s3(MSG_SYSTEM, SYS_PATTERN, (uint8_t)pat);
-        // Only re-fetch grid when pattern actually changed. Re-fetching on
-        // every state_sync (every 2 s) caused full sequencer repaints and
-        // visible flicker that fought against local mute/solo edits.
-        if (patternChanged) {
-            udp_send_get_pattern(pat);
+        // Suppress a stale master pattern right after a local switch. The
+        // periodic state_sync can still carry the previous pattern for a cycle
+        // or two; applying it would snap the UI back to the old pattern.
+        if (!is_pattern_owned_recent(millis())) {
+            bool patternChanged = (pat != p4.current_pattern);
+            p4.current_pattern = pat;
+            uart_send_to_s3(MSG_SYSTEM, SYS_PATTERN, (uint8_t)pat);
+            // Only re-fetch grid when pattern actually changed. Re-fetching on
+            // every state_sync (every 2 s) caused full sequencer repaints and
+            // visible flicker that fought against local mute/solo edits.
+            if (patternChanged) {
+                udp_send_get_pattern(pat);
+            }
         }
 
         bool playing = doc["playing"] | p4.is_playing;
@@ -1322,10 +1340,15 @@ static void processJson(const char* json, int len) {
         bool requested_pattern = (pendingPatternRequest == pat);
         bool matches_current   = (pat == p4.current_pattern);
         bool active_hint       = doc["active"] | false;
+        // A just-made local pattern switch wins over an active_hint broadcast
+        // that still references the previous pattern (master lag), so we don't
+        // snap back to the old pattern right after the user changes it.
+        bool owned_stale = is_pattern_owned_recent(millis()) &&
+                           !requested_pattern && (pat != p4.current_pattern);
         // Accept the payload if (a) it matches our pending request, (b) it
         // matches the pattern we are currently displaying, or (c) the master
         // marked the broadcast as the new active pattern. Otherwise ignore.
-        if (!requested_pattern && !matches_current && !active_hint) {
+        if ((!requested_pattern && !matches_current && !active_hint) || owned_stale) {
             P4_LOG_PRINTF("[UDP][PAT] RX stale pattern_sync pat=%d cur=%d waiting=%d (ignored)\n",
                           pat, p4.current_pattern, pendingPatternRequest);
             return;
