@@ -6001,8 +6001,7 @@ static lv_obj_t* s_piano_glide_btn        = NULL;
 static lv_obj_t* s_piano_glide_lbl        = NULL;
 static lv_obj_t* s_piano_bend_btn         = NULL;
 static lv_obj_t* s_piano_bend_lbl         = NULL;
-static lv_obj_t* s_piano_range_btn        = NULL;
-static lv_obj_t* s_piano_range_lbl        = NULL;
+static lv_obj_t* s_piano_preset_lbl       = NULL;  // instrument preset selector
 static lv_obj_t* s_gtr_status_lbl         = NULL;
 
 static int       s_gtr_held_note          = -1;
@@ -6042,6 +6041,8 @@ static void piano_update_status_note(uint8_t midi_note);
 static void piano_update_expression_status(void);
 static void piano_update_expression_bar(void);
 static void piano_sync_active_engine_state(void);
+static void piano_preset_refresh_label(void);
+static void piano_sound_preset_step(int delta);
 
 static inline bool piano_pc_is_black(uint8_t pc) {
     return (pc == 1) || (pc == 3) || (pc == 6) || (pc == 8) || (pc == 10);
@@ -6181,13 +6182,6 @@ static void piano_refresh_gesture_controls(void) {
         lv_obj_set_style_border_width(s_piano_bend_btn, s_piano_bend_enabled ? 2 : 1, 0);
     }
 
-    if (s_piano_range_lbl) {
-        lv_label_set_text_fmt(s_piano_range_lbl, "RANGE ±%d", s_piano_bend_range_st);
-    }
-    if (s_piano_range_btn) {
-        lv_obj_set_style_border_color(s_piano_range_btn,
-            s_piano_bend_enabled ? lv_color_hex(0xFFE066) : RED808_BORDER, 0);
-    }
 }
 
 static bool piano_get_local_touch(int16_t* lx, int16_t* ly) {
@@ -6491,6 +6485,7 @@ static void piano_refresh_engine_chips(void) {
                               PIANO_ENGINE_LABELS[s_piano_engine_idx],
                               s_piano_octave, s_piano_assign_pad + 1);
     }
+    piano_preset_refresh_label();
 }
 
 static void piano_engine_btn_cb(lv_event_t* e) {
@@ -6563,18 +6558,9 @@ static void piano_bend_btn_cb(lv_event_t* e) {
     piano_refresh_gesture_controls();
 }
 
-static void piano_bend_range_btn_cb(lv_event_t* e) {
-    LV_UNUSED(e);
-    static const int ranges[3] = {2, 7, 12};
-    int next_idx = 0;
-    for (int i = 0; i < 3; i++) {
-        if (ranges[i] == s_piano_bend_range_st) {
-            next_idx = (i + 1) % 3;
-            break;
-        }
-    }
-    s_piano_bend_range_st = ranges[next_idx];
-    piano_refresh_gesture_controls();
+static void piano_sound_preset_cb(lv_event_t* e) {
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+    piano_sound_preset_step(delta ? delta : +1);
 }
 
 static void piano_rec_btn_cb(lv_event_t* e) {
@@ -7128,10 +7114,18 @@ static void create_piano_screen(void) {
     s_piano_bend_lbl = lv_obj_get_child(s_piano_bend_btn, 0);
     lv_obj_add_event_cb(s_piano_bend_btn, piano_bend_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    s_piano_range_btn = piano_make_chip(scr_piano, 936, row_y, 86, 36, "RANGE ±2");
-    s_piano_range_lbl = lv_obj_get_child(s_piano_range_btn, 0);
-    lv_obj_add_event_cb(s_piano_range_btn, piano_bend_range_btn_cb, LV_EVENT_CLICKED, NULL);
+    // Instrument preset selector. Tap to cycle the current engine's presets
+    // (mirrors the chips on the PARAMS screen, kept in sync via s_pp_preset_idx).
+    lv_obj_t* preset_btn = piano_make_chip(scr_piano, 936, row_y, 86, 36, "PRESET");
+    s_piano_preset_lbl = lv_obj_get_child(preset_btn, 0);
+    lv_obj_set_style_border_color(preset_btn, lv_color_hex(0x7CFFB2), 0);
+    if (s_piano_preset_lbl) {
+        lv_obj_set_style_text_font(s_piano_preset_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(s_piano_preset_lbl, lv_color_hex(0x7CFFB2), 0);
+    }
+    lv_obj_add_event_cb(preset_btn, piano_sound_preset_cb, LV_EVENT_CLICKED, (void*)(intptr_t)+1);
     piano_refresh_gesture_controls();
+    piano_preset_refresh_label();
 
     /* v2.8/v2.9 — compact melody row: pad assign + presets + transport */
     int row_y2 = 104;
@@ -7935,6 +7929,42 @@ static void pp_preset_cb(lv_event_t* e) {
         xtra_save_state();
         xtra_refresh_panel();
     }
+}
+
+// Piano-screen instrument-preset selector. Shares state with the PARAMS screen
+// (s_pp_preset_idx) so the two views stay in sync.
+static void piano_preset_refresh_label(void) {
+    if (!s_piano_preset_lbl) return;
+    int eng_idx = s_piano_engine_idx;
+    if (eng_idx < 0 || eng_idx >= SP_ENGINE_COUNT) {
+        lv_label_set_text(s_piano_preset_lbl, "PRESET");
+        return;
+    }
+    const SynthEngineDef* eng = &SP_ENGINES[eng_idx];
+    int idx = s_pp_preset_idx[eng_idx];
+    if (idx >= 0 && idx < eng->preset_count) {
+        lv_label_set_text(s_piano_preset_lbl, eng->presets[idx].name);
+    } else {
+        lv_label_set_text(s_piano_preset_lbl, "PRESET");
+    }
+}
+
+static void piano_sound_preset_step(int delta) {
+    int eng_idx = s_piano_engine_idx;
+    if (eng_idx < 0 || eng_idx >= SP_ENGINE_COUNT) return;
+    const SynthEngineDef* eng = &SP_ENGINES[eng_idx];
+    int n = eng->preset_count;
+    if (n <= 0) return;
+    int cur = s_pp_preset_idx[eng_idx];
+    int next = (cur < 0) ? 0 : (cur + delta);
+    next = ((next % n) + n) % n;
+    pp_apply_preset_local(eng_idx, next);
+    s_pp_preset_idx[eng_idx] = next;
+    if (ui_use_udp_transport()) {
+        piano_send_panic_melodic();
+        udp_send_synth_preset(eng->engine, (uint8_t)next);
+    }
+    piano_preset_refresh_label();
 }
 
 static void pp_init_cb(lv_event_t* e) {
