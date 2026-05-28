@@ -1726,15 +1726,25 @@ static bool pad_inst_commit_pending(uint8_t pad) {
     uint8_t inst = s_pad_inst_pending[pad];
     if (inst > 7) inst = 0;
     int8_t drum = pad_inst_drum_engine_idx(inst);
-    // Cambio de kit por pad. El envío a la Daisy se deduplica con el último
-    // kit aplicado al engine: solo se manda CMD_SYNTH_PRESET si difiere del
-    // último. (En tiempo real, ui_process_pad_queue también hace switch).
+    // Kit assignment is logically per-engine (the master only holds one kit
+    // per drum engine at a time), so propagate the choice to every other pad
+    // already routed to the same drum engine. Otherwise alternating pads with
+    // different stored kits would force a CMD_SYNTH_PRESET reload on every
+    // trigger — that "patrulla de caballos" of glitches + stacked voices.
     if (drum >= 0) {
         uint8_t kit = s_pad_kit_pending[pad];
         if (kit > 4) kit = 0;
         if (s_pad_kit_assigned[pad] != kit) {
             s_pad_kit_assigned[pad] = kit;
             changed = true;
+        }
+        for (uint8_t i = 0; i < 16; i++) {
+            if (i == pad) continue;
+            if (pad_inst_drum_engine_idx(s_pad_inst_sel[i]) == drum &&
+                s_pad_kit_assigned[i] != kit) {
+                s_pad_kit_assigned[i] = kit;
+                changed = true;
+            }
         }
         if (udp_wifi_connected() && s_engine_kit_last_applied[drum] != (int8_t)kit) {
             udp_send_synth_preset((uint8_t)drum, kit);
