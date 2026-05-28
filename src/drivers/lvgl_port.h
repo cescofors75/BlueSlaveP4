@@ -20,6 +20,12 @@ lv_indev_t* lvgl_port_get_touch_indev(void);
 // Returns 0 when no finger is currently active.
 uint8_t lvgl_port_get_touch_velocity(void);
 
+// Return the MIDI velocity (40..127) of the active touch point closest to (x,y)
+// within the given pixel radius. Lets per-key callbacks read the velocity of
+// the specific finger that pressed them instead of the global maximum.
+// Returns 0 when no touch is inside the radius.
+uint8_t lvgl_port_get_touch_velocity_at(lv_coord_t x, lv_coord_t y, lv_coord_t radius);
+
 // Thread safety — wrap LVGL API calls from outside the LVGL task
 bool lvgl_port_lock(int timeout_ms);
 void lvgl_port_unlock(void);
