@@ -357,3 +357,22 @@ uint8_t lvgl_port_get_touch_velocity(void) {
     }
     return best;
 }
+
+uint8_t lvgl_port_get_touch_velocity_at(lv_coord_t x, lv_coord_t y, lv_coord_t radius) {
+    int best_i = -1;
+    int32_t best_d2 = (int32_t)radius * (int32_t)radius;
+    for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
+        if (touch_data[i].state != LV_INDEV_STATE_PR) continue;
+        int32_t dx = (int32_t)touch_data[i].point.x - (int32_t)x;
+        int32_t dy = (int32_t)touch_data[i].point.y - (int32_t)y;
+        int32_t d2 = dx * dx + dy * dy;
+        if (d2 <= best_d2) {
+            best_d2 = d2;
+            best_i = i;
+        }
+    }
+    if (best_i < 0) return 0;
+    uint8_t a = touch_data[best_i].area;
+    uint8_t v = a ? (uint8_t)(40 + ((uint32_t)a * 87) / 255) : 100;
+    return v > 127 ? 127 : v;
+}

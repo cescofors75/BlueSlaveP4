@@ -6325,7 +6325,17 @@ static void piano_send_on(uint8_t midi_note, bool legato) {
     } else if (s_piano_held_note < 0) {
         legato = false;
     }
-    uint8_t attack_velocity = lvgl_port_get_touch_velocity();
+    // Per-finger velocity: prefer the touch closest to the finger that
+    // triggered this key event, so chords get independent attack levels
+    // instead of all notes sharing the global maximum.
+    uint8_t attack_velocity = 0;
+    lv_indev_t* act_indev = lv_indev_get_act();
+    if (act_indev) {
+        lv_point_t p;
+        lv_indev_get_point(act_indev, &p);
+        attack_velocity = lvgl_port_get_touch_velocity_at(p.x, p.y, 80);
+    }
+    if (attack_velocity == 0) attack_velocity = lvgl_port_get_touch_velocity();
     if (attack_velocity == 0) attack_velocity = s_piano_velocity;
 #if P4_ENABLE_DEBUG_LOG
     Serial.printf("[P4 piano] note=%u vel=%u rec=%d transport=%d legato=%d\n", midi_note, (unsigned)attack_velocity, (int)s_piano_rec_active, (int)ui_use_udp_transport(), (int)legato);
