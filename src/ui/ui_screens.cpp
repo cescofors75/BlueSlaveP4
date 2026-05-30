@@ -18,6 +18,8 @@
 #include <WiFi.h>
 #include <atomic>
 #include <math.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
 
 // ── IntelliSense fallbacks ───────────────────────────────────────────────────
 // The real values are provided via -D flags in platformio.ini and via
@@ -61,15 +63,25 @@ static const uint32_t SOLO_DEBOUNCE_GLOBAL_MS = 70;
 // Direct touch bypass: flag used by touch_task to early-out when not on LIVE
 static std::atomic<bool> g_live_screen_active{false};
 
+// The pad ring has a single consumer (Core 1 loop) but TWO producers, both on
+// Core 0: the GT911 touch task (prio 6) and LVGL event callbacks (prio 5, e.g.
+// pad-instrument assignment). Because the touch task can preempt the LVGL task
+// mid-enqueue, the head update is not safe as a plain SPSC store. Serialize the
+// producers with a spinlock; the consumer still needs no lock because head is
+// published (release) only after the slot is written.
+static portMUX_TYPE s_pad_q_mux = portMUX_INITIALIZER_UNLOCKED;
 static inline void enqueue_pad_event(uint8_t pad, uint8_t velocity) {
+    portENTER_CRITICAL(&s_pad_q_mux);
     uint8_t h = s_pad_qh.load(std::memory_order_relaxed);
     uint8_t t = s_pad_qt.load(std::memory_order_acquire);
     if ((uint8_t)(h - t) >= 32) {
         s_pad_q_drops.fetch_add(1, std::memory_order_relaxed);
+        portEXIT_CRITICAL(&s_pad_q_mux);
         return;
     }
     s_pad_q[h & 0x1F] = (uint16_t)((velocity << 8) | pad);
     s_pad_qh.store(h + 1, std::memory_order_release);
+    portEXIT_CRITICAL(&s_pad_q_mux);
 }
 
 static inline void enqueue_mute_control(uint8_t track, bool muted) {
@@ -353,6 +365,13 @@ static void ui_show_toast(const char* text, lv_color_t accent) {
     if (!parent) return;
 
     if (!s_ui_toast || lv_obj_get_parent(s_ui_toast) != parent) {
+        // Toast belongs to a different (still-alive) screen — delete it so we
+        // don't leave orphan toast+label objects behind on every navigation.
+        if (s_ui_toast) {
+            lv_obj_del(s_ui_toast);
+            s_ui_toast = NULL;
+            s_ui_toast_label = NULL;
+        }
         s_ui_toast = lv_obj_create(parent);
         lv_obj_set_size(s_ui_toast, 420, 62);
         lv_obj_align(s_ui_toast, LV_ALIGN_TOP_MID, 0, 54);
@@ -632,6 +651,23 @@ static int8_t s_engine_kit_last_applied[3] = {-1,-1,-1};
 static volatile uint8_t s_pad_inst_focus_pad = 0;
 static unsigned long s_pad_inst_local_ms[16] = {};
 static const unsigned long PAD_INST_OWNERSHIP_MS = 1800;
+
+// Number of synth engines exposed to the master (0..7: 808,909,505,303,WT,
+// SH101,FM2,GUITAR). Used for all-notes-off sweeps so they cover every engine.
+static constexpr int SYNTH_ENGINE_COUNT = 8;
+
+// Deferred master→UI track-engine sync. ui_pad_sound_sync_track_engines() runs
+// on Core 1 (UDP) and must NOT touch LVGL objects directly. It now only stages
+// the engine array here; the LVGL task applies it under the lock in
+// ui_update_current_screen(). Avoids a cross-core data race on the object tree.
+static int8_t s_pending_track_engines[16] = {};
+static std::atomic<bool> s_pending_track_engines_valid{false};
+
+// Deferred "leaving LIVE" all-notes-off. Set from the touch task (Core 0) and
+// drained on Core 1 in ui_process_pad_queue() so UDP is only ever sent from the
+// main loop, never from the 200 Hz touch task.
+static std::atomic<bool> s_pending_live_allnotesoff{false};
+
 static void pad_inst_modal_refresh(void);
 static bool pad_inst_unload_daisy_sample(uint8_t pad);
 static int pp_engine_idx_from_code(uint8_t engine);
@@ -1282,7 +1318,16 @@ static void pad_inst_apply_to_master(uint8_t pad) {
     }
 }
 
+// Core 1 (UDP) entry point: stage the engines and let the LVGL task apply them.
+// MUST NOT touch LVGL objects here — that would race with the render task.
 void ui_pad_sound_sync_track_engines(const int8_t engines[16]) {
+    if (!engines) return;
+    for (int i = 0; i < 16; i++) s_pending_track_engines[i] = engines[i];
+    s_pending_track_engines_valid.store(true, std::memory_order_release);
+}
+
+// Applied on the LVGL task (under lvgl_port_lock) from ui_update_current_screen.
+static void apply_pad_sound_track_engines(const int8_t engines[16]) {
     if (!engines) return;
     unsigned long nowMs = millis();
     bool anyChanged = false;
@@ -1696,14 +1741,17 @@ static void pad_inst_modal_inst_cb(lv_event_t* e) {
 }
 
 static bool pad_inst_unload_daisy_sample(uint8_t pad) {
+    // NOTE: this runs on the LVGL task under lvgl_mutex, so any blocking here
+    // freezes the whole UI and starves touch. Keep the timeouts tight; a missed
+    // unload is harmless (it just falls back to the previous sample).
     WiFiClient client;
-    if (!client.connect(IPAddress(192, 168, 4, 1), 80)) return false;
+    if (!client.connect(IPAddress(192, 168, 4, 1), 80, 400)) return false;
     client.printf("POST /api/unloadDaisy?pad=%d HTTP/1.1\r\n", pad);
     client.print("Host: 192.168.4.1\r\n");
     client.print("Content-Length: 0\r\n");
     client.print("Connection: close\r\n\r\n");
     uint32_t start = millis();
-    while (!client.available() && client.connected() && (millis() - start) < 2500) delay(10);
+    while (!client.available() && client.connected() && (millis() - start) < 400) delay(5);
     String statusLine = client.readStringUntil('\n');
     statusLine.trim();
     client.stop();
@@ -8398,6 +8446,12 @@ void ui_create_all_screens(void) {
 static void ui_reload_themed_screens(void) {
     int saved_screen = active_screen;
 
+    // Block the touch task from hit-testing live pads while we delete and
+    // recreate screens. Without this, touch_task (Core 0, no LVGL lock) can
+    // dereference live_pad_btns[] pointers that are freed below before they are
+    // nulled. ui_navigate_to() at the end restores this flag.
+    g_live_screen_active.store(false, std::memory_order_release);
+
     // Navigate to boot temporarily so we can safely delete active screens
     lv_scr_load(scr_boot);
 
@@ -8487,6 +8541,10 @@ static void ui_reload_themed_screens(void) {
         vol_strip_panels[i] = NULL;
     }
 
+    // Toast lives as a child of whatever screen was active — those are being
+    // deleted, so drop the pointers to avoid a use-after-free on the next toast.
+    s_ui_toast = NULL; s_ui_toast_label = NULL; s_ui_toast_until_ms = 0;
+
     // Clear SD screen widgets
     sd_left_panel = NULL; sd_right_panel = NULL; sd_status_lbl = NULL;
     sd_path_lbl = NULL; sd_file_list = NULL; sd_selected_lbl = NULL;
@@ -8570,7 +8628,7 @@ void ui_navigate_to(int screen_id) {
         // Before leaving most screens, stop active synths to prevent stuck notes.
         // Keep the local Melody preview alive while moving between PIANO and PARAMS.
         if (udp_wifi_connected() && !keep_piano_preview) {
-            for (int eng = 0; eng < 9; eng++) {
+            for (int eng = 0; eng < SYNTH_ENGINE_COUNT; eng++) {
                 udp_send_synth_note_off(eng, 0);  // engine, track=0
             }
         }
@@ -8673,6 +8731,16 @@ void ui_process_pad_queue(void) {
     }
     s_pad_qt.store(t, std::memory_order_relaxed);
 
+    // Deferred "leaving LIVE" all-notes-off, staged by the touch task. Sent here
+    // on Core 1 so UDP is never driven from the 200 Hz touch task.
+    if (s_pending_live_allnotesoff.exchange(false, std::memory_order_acquire)) {
+        if (udp_wifi_connected()) {
+            for (int eng = 0; eng < SYNTH_ENGINE_COUNT; eng++) {
+                udp_send_synth_note_off(eng, 0);
+            }
+        }
+    }
+
     // Drain pending melodic note-offs.
     for (int pad = 0; pad < 16; pad++) {
         if (!s_pad_noteoff_at[pad]) continue;
@@ -8769,14 +8837,12 @@ void ui_pad_frame_update(const bool pressed[16], const uint8_t velocity[16],
     }
 
     if (!g_live_screen_active.load(std::memory_order_acquire)) {
-        // Leaving LIVE screen: release all held pads to Master so they don't sustain
+        // Leaving LIVE screen: release all held pads to Master so they don't sustain.
         if (prev_live_active) {  // only on transition OUT of LIVE
-            // Send all-notes-off to Master
-            if (udp_wifi_connected()) {
-                for (int eng = 0; eng < 7; eng++) {
-                    udp_send_synth_note_off(eng, 0);
-                }
-            }
+            // This runs on the 200 Hz touch task (Core 0). Do NOT send UDP from
+            // here — defer the all-notes-off to Core 1 (ui_process_pad_queue),
+            // so the WiFiUDP socket is only ever driven from the main loop.
+            s_pending_live_allnotesoff.store(true, std::memory_order_release);
             prev_live_active = false;
         }
         
@@ -8877,6 +8943,23 @@ void ui_update_current_screen(void) {
     unsigned long now = millis();
     static unsigned long boot_enter_ms = 0;
     ui_toast_update();
+
+    // Apply deferred master→UI track-engine sync staged from Core 1 (UDP).
+    // Done here so the LVGL object writes happen on the render task under lock.
+    if (s_pending_track_engines_valid.exchange(false, std::memory_order_acquire)) {
+        apply_pad_sound_track_engines(s_pending_track_engines);
+    }
+
+    // Apply deferred melody state from S3/master (engine/octave/rec/pad). This
+    // path was previously dead — the pending flag was set but never consumed,
+    // so the P4 piano UI never reflected remote melody changes.
+    if (g_pending_melody_from_s3.pending) {
+        g_pending_melody_from_s3.pending = false;
+        piano_apply_melody_sync(g_pending_melody_from_s3.engine,
+                                g_pending_melody_from_s3.octave,
+                                g_pending_melody_from_s3.rec != 0,
+                                g_pending_melody_from_s3.pad);
+    }
 
     // Auto-navigate from boot to live when Master or optional S3 connects
     if (active_screen == 0) {
