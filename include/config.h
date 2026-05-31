@@ -173,7 +173,7 @@ namespace Config {
     constexpr int MAX_STEPS     = 16;
     constexpr int MAX_TRACKS    = 16;
     constexpr int TRACKS_PER_PAGE = 8;
-    constexpr int MAX_PATTERNS  = 16;
+    constexpr int MAX_PATTERNS  = 19;  // banco demo 19 temas (Daisy DSQ_PATTERNS=19)
     constexpr int MAX_SAMPLES   = 16;
     constexpr int MAX_VOLUME    = 150;
     constexpr int DEFAULT_BPM   = 120;
