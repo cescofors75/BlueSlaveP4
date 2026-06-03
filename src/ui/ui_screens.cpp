@@ -592,9 +592,9 @@ static void create_boot_screen(void) {
     lv_obj_clear_flag(scr_boot, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t* title = lv_label_create(scr_boot);
-    lv_label_set_text(title, "RED808 P4");
+    lv_label_set_text(title, "BLUE808 SLAVE P4");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_40, 0);
-    lv_obj_set_style_text_color(title, RED808_ACCENT, 0);
+    lv_obj_set_style_text_color(title, RED808_CYAN, 0);
     lv_obj_align(title, LV_ALIGN_CENTER, 0, -40);
 
     lv_obj_t* sub = lv_label_create(scr_boot);
@@ -4798,10 +4798,10 @@ static void create_volumes_screen(void) {
     }
 
     // Single row of 16 strips filling the full display width
-    int margin = 10;
-    int gap    = 4;
+    int margin  = 10;
+    int strip_gap = 4;
     int total_w = LW - 2 * margin;
-    int strip_w = (total_w - 15 * gap) / 16;   // ~56px each
+    int strip_w = (total_w - 15 * strip_gap) / 16;   // ~56px each
     int y_top   = 100;
     int y_bottom = LH - 8;
     int strip_h  = y_bottom - y_top;            // ~508px
@@ -4811,7 +4811,7 @@ static void create_volumes_screen(void) {
     int slider_h = strip_h - name_h - value_h - mute_h - 18;
 
     for (int i = 0; i < 16; i++) {
-        int x = margin + i * (strip_w + gap);
+        int x = margin + i * (strip_w + strip_gap);
         int cx = x + strip_w / 2;
         lv_color_t tc = lv_color_hex(theme_presets[currentTheme].track_colors[i]);
 

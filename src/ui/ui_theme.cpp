@@ -3,7 +3,7 @@
 // =============================================================================
 #include "ui_theme.h"
 
-VisualTheme currentTheme = THEME_RED808;
+VisualTheme currentTheme = THEME_OCEAN;
 
 const ThemeColors theme_presets[THEME_COUNT] = {
     // THEME_RED808
