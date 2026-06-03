@@ -305,6 +305,9 @@ size_t bake_wav(fs::FS& storage, const char* out_path,
 
     uint32_t data_bytes = region * ch * 2u;
 
+    // Ensure a clean file: on some cores FILE_WRITE appends, which would
+    // concatenate a second header+data onto a previous bake and corrupt it.
+    if (storage.exists(out_path)) storage.remove(out_path);
     File out = storage.open(out_path, FILE_WRITE);
     if (!out) return 0;
 

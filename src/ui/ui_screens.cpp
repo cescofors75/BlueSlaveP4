@@ -663,6 +663,7 @@ static int s_xtra_pending_slot = -1;
 // --- XTRA sampler editor (waveform + trim + fades) -------------------------
 static int        s_xtra_edit_slot       = 0;    // slot currently in the editor
 static int        s_xtra_loaded_slot      = -1;   // slot whose sample is in sample_edit
+static bool       s_xtra_applied[4]       = {false, false, false, false}; // baked+uploaded with current edits
 static lv_obj_t*  s_xtra_wave_panel       = NULL;
 static lv_obj_t*  s_xtra_wave_line        = NULL;
 static lv_obj_t*  s_xtra_trim_a_line      = NULL; // trim-start marker
@@ -5643,7 +5644,8 @@ static void sd_load_btn_cb(lv_event_t* e) {
         s.trim_start = 0.0f; s.trim_end = 1.0f;
         s.fade_in_ms = 0; s.fade_out_ms = 0;
         s.pad = xtra_backing_pad_for_slot(slot);
-        s_xtra_loaded_slot = -1;     // force reload in the editor
+        s_xtra_loaded_slot = -1;        // force reload in the editor
+        s_xtra_applied[slot] = false;   // not baked/uploaded yet
         s_xtra_pending_slot = -1;
         s_sd_for_xtra = false;
         xtra_save_state();
@@ -8414,8 +8416,13 @@ static void xtra_pad_select_cb(lv_event_t* e) {
     int slot = (int)(intptr_t)lv_event_get_user_data(e);
     if (slot < 0 || slot >= 4) return;
     xtra_editor_select(slot);
-    if (s_xtra_slots[slot].used && s_xtra_slots[slot].src_path[0] && ui_use_udp_transport())
+    // Tap triggers the sample only once it's been applied to the Master; while
+    // it has unbaked edits, point the user at PLAY (which bakes + uploads).
+    if (!s_xtra_slots[slot].src_path[0]) return;
+    if (s_xtra_applied[slot] && udp_wifi_connected())
         udp_send_trigger(s_xtra_slots[slot].pad, 110);
+    else if (!s_xtra_applied[slot])
+        ui_show_toast("Pulsa PLAY para oir los cambios", theme_warning());
 }
 
 static void xtra_load_cb(lv_event_t* e) {
@@ -8436,27 +8443,22 @@ static void xtra_edit_adj_cb(lv_event_t* e) {
         case 2: { int v = (int)s.fade_in_ms  + dir * 10; v = constrain(v, 0, 2000); s.fade_in_ms  = (uint16_t)v; } break;
         case 3: { int v = (int)s.fade_out_ms + dir * 10; v = constrain(v, 0, 2000); s.fade_out_ms = (uint16_t)v; } break;
     }
+    s_xtra_applied[s_xtra_edit_slot] = false;   // Master no longer matches the editor
     xtra_save_state();
     xtra_editor_render();
 }
 
-static void xtra_play_cb(lv_event_t* e) {
-    LV_UNUSED(e);
-    XtraPadSlot& s = s_xtra_slots[s_xtra_edit_slot];
-    if (s.used && s.src_path[0] && ui_use_udp_transport()) udp_send_trigger(s.pad, 110);
-    else ui_show_toast("Aplica el sample primero", theme_warning());
-}
-
-static void xtra_apply_cb(lv_event_t* e) {
-    LV_UNUSED(e);
+// Bake the current edits and upload to the slot's backing pad. Returns true on
+// success (and clears the dirty flag). Shows its own busy overlay / error toast.
+static bool xtra_apply_current(void) {
     int slot = s_xtra_edit_slot;
     XtraPadSlot& s = s_xtra_slots[slot];
-    if (!s.src_path[0]) { ui_show_toast("Slot vacio", theme_warning()); return; }
+    if (!s.src_path[0]) { ui_show_toast("Slot vacio", theme_warning()); return false; }
     if (s_xtra_loaded_slot != slot) {
         ui_busy_show("Leyendo sample...");
         bool ok = sample_edit::load(SD_MMC, s.src_path);
         ui_busy_hide();
-        if (!ok) { ui_show_toast("No se pudo leer el sample", RED808_WARNING); return; }
+        if (!ok) { ui_show_toast("No se pudo leer el sample", RED808_WARNING); return false; }
         s_xtra_loaded_slot = slot;
     }
     char outp[40];
@@ -8464,19 +8466,43 @@ static void xtra_apply_cb(lv_event_t* e) {
     ui_busy_show("Procesando y subiendo...\nEspera, no cambies de pantalla.");
     size_t n = sample_edit::bake_wav(SD_MMC, outp, s.trim_start, s.trim_end,
                                      s.fade_in_ms, s.fade_out_ms);
-    if (n == 0) { ui_busy_hide(); ui_show_toast("Error al procesar el sample", RED808_WARNING); return; }
+    if (n == 0) { ui_busy_hide(); ui_show_toast("Error al procesar el sample", RED808_WARNING); return false; }
     char postname[40];
     snprintf(postname, sizeof(postname), "%s.wav", s.name[0] ? s.name : "xtra");
     bool ok = xtra_http_upload_path(outp, postname, s.pad);
     ui_busy_hide();
-    if (ok) {
-        s.used = true;
-        xtra_save_state();
-        xtra_refresh_panel();
-        if (ui_use_udp_transport()) udp_send_trigger(s.pad, 110);
-        ui_show_toast("Sample aplicado y subido", RED808_SUCCESS);
-    } else {
-        ui_show_toast("Subida fallida (Master?)", RED808_WARNING);
+    if (!ok) { ui_show_toast("Subida fallida (Master?)", RED808_WARNING); return false; }
+    s.used = true;
+    s_xtra_applied[slot] = true;
+    xtra_save_state();
+    xtra_refresh_panel();
+    return true;
+}
+
+// PLAY / PREVIEW: there is no local audio on the P4, so to preview the trim and
+// fades we (re)bake + upload whenever the slot's edits aren't on the Master yet,
+// then trigger.
+static void xtra_play_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    XtraPadSlot& s = s_xtra_slots[s_xtra_edit_slot];
+    if (!s.src_path[0]) { ui_show_toast("Slot vacio — pulsa LOAD", theme_warning()); return; }
+    if (!s_xtra_applied[s_xtra_edit_slot]) {
+        if (!xtra_apply_current()) return;   // upload failed; error already shown
+        delay(120);
+    }
+    if (udp_wifi_connected()) udp_send_trigger(s.pad, 110);
+    else ui_show_toast("Master no conectado", RED808_WARNING);
+}
+
+static void xtra_apply_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (xtra_apply_current()) {
+        int pad = s_xtra_slots[s_xtra_edit_slot].pad;
+        delay(120);   // let the Master finish ingesting before we trigger
+        if (udp_wifi_connected()) udp_send_trigger(pad, 110);
+        char msg[48];
+        snprintf(msg, sizeof(msg), "Subido y disparado · pad %d", pad);
+        ui_show_toast(msg, RED808_SUCCESS);
     }
 }
 
