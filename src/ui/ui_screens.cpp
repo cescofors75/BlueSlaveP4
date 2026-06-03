@@ -10,6 +10,7 @@
 #include "../uart_handler.h"
 #include "../dsp_task.h"
 #include "../mem_midi_loader.h"
+#include "../sample_edit.h"
 #include "config.h"
 #include "../../../shared/synth_params.h"
 #include <Arduino.h>
@@ -658,6 +659,20 @@ static lv_obj_t* grid_xtra_delete_btns[4] = {};
 static lv_obj_t* grid_xtra_meta_lbls[4] = {};
 static lv_obj_t* grid_xtra_slot_lbls[4] = {};
 static int s_xtra_pending_slot = -1;
+
+// --- XTRA sampler editor (waveform + trim + fades) -------------------------
+static int        s_xtra_edit_slot       = 0;    // slot currently in the editor
+static int        s_xtra_loaded_slot      = -1;   // slot whose sample is in sample_edit
+static lv_obj_t*  s_xtra_wave_panel       = NULL;
+static lv_obj_t*  s_xtra_wave_line        = NULL;
+static lv_obj_t*  s_xtra_trim_a_line      = NULL; // trim-start marker
+static lv_obj_t*  s_xtra_trim_b_line      = NULL; // trim-end marker
+static lv_obj_t*  s_xtra_info_lbl         = NULL; // filename / sr / dur
+static lv_obj_t*  s_xtra_trim_lbl         = NULL; // "TRIM 12%..88%"
+static lv_obj_t*  s_xtra_fade_lbl         = NULL; // "FADE IN 20ms  OUT 50ms"
+static constexpr int XTRA_WAVE_COLS = 120;
+static lv_point_t s_xtra_wave_pts[XTRA_WAVE_COLS * 2 + 2];
+static float      s_xtra_env[XTRA_WAVE_COLS];
 static lv_obj_t* s_pad_inst_modal = NULL;
 static lv_obj_t* s_pad_inst_modal_pad_lbl = NULL;
 static lv_obj_t* s_pad_inst_modal_inst_lbl = NULL;
@@ -701,6 +716,13 @@ struct XtraPadSlot {
     uint8_t synth_engine_idx;
     uint8_t preset_idx;
     bool synth_mode;
+    // Sampler editor (v: XTRA sampler-only). src_path is the WAV/MP3 on SD that
+    // the slot was loaded from; trim_*/fade_* are baked into the uploaded WAV.
+    char     src_path[128];
+    float    trim_start;     // 0..1
+    float    trim_end;       // 0..1
+    uint16_t fade_in_ms;
+    uint16_t fade_out_ms;
 };
 
 static XtraPadSlot s_xtra_slots[4] = {};
@@ -894,16 +916,20 @@ static const char* xtra_slot_mode_label(int slot) {
 }
 
 static void xtra_apply_default_slots(void) {
+    // XTRA is now sampler-only: start with empty pads ready to load a WAV/MP3.
     for (int i = 0; i < 4; i++) {
-        s_xtra_slots[i].used = true;
+        s_xtra_slots[i] = XtraPadSlot{};
+        s_xtra_slots[i].used = false;
         s_xtra_slots[i].pad = xtra_backing_pad_for_slot(i);
-        s_xtra_slots[i].synth_mode = true;
-        s_xtra_slots[i].synth_engine_idx = (uint8_t)i;
+        s_xtra_slots[i].synth_mode = false;
+        s_xtra_slots[i].synth_engine_idx = 0;
         s_xtra_slots[i].preset_idx = 0;
-        snprintf(s_xtra_slots[i].name, sizeof(s_xtra_slots[i].name), "%s %s",
-                 XTRA_SYNTH_ENGINE_NAMES[s_xtra_slots[i].synth_engine_idx],
-                 XTRA_PRESET_LABELS[s_xtra_slots[i].preset_idx]);
-        xtra_reset_slot_params(i);
+        s_xtra_slots[i].src_path[0] = '\0';
+        s_xtra_slots[i].trim_start = 0.0f;
+        s_xtra_slots[i].trim_end = 1.0f;
+        s_xtra_slots[i].fade_in_ms = 0;
+        s_xtra_slots[i].fade_out_ms = 0;
+        s_xtra_slots[i].name[0] = '\0';
     }
 }
 
@@ -1115,6 +1141,7 @@ static void xtra_pad_touch_cb(lv_event_t* e) {
 
 static void xtra_refresh_panel(void);
 static void xtra_edit_cb(lv_event_t* e);
+static void xtra_editor_select(int slot);   // sampler editor: load+show a slot
 
 static uint8_t xtra_backing_pad_for_slot(int slot) {
     if (slot < 0) slot = 0;
@@ -1148,8 +1175,13 @@ static void xtra_save_state(void) {
     if (!f) return;
     for (int i = 0; i < 4; i++) {
         const XtraPadSlot& s = s_xtra_slots[i];
-        f.printf("%d,%u,%s,%u,%u,%u\n", s.used ? 1 : 0, (unsigned)s.pad, s.name,
-                 s.synth_mode ? 1U : 0U, (unsigned)s.synth_engine_idx, (unsigned)s.preset_idx);
+        // Legacy 6 fields + sampler editor fields (src_path,trim,fade). The name
+        // and path never contain commas (filenames), so CSV stays unambiguous.
+        f.printf("%d,%u,%s,%u,%u,%u,%s,%.4f,%.4f,%u,%u\n",
+                 s.used ? 1 : 0, (unsigned)s.pad, s.name[0] ? s.name : "-",
+                 s.synth_mode ? 1U : 0U, (unsigned)s.synth_engine_idx, (unsigned)s.preset_idx,
+                 s.src_path[0] ? s.src_path : "-",
+                 s.trim_start, s.trim_end, (unsigned)s.fade_in_ms, (unsigned)s.fade_out_ms);
     }
     f.close();
     xtra_save_param_state();
@@ -1171,21 +1203,36 @@ static void xtra_load_state(void) {
         int used = 0;
         unsigned pad = 0;
         char name[24] = {0};
-        unsigned synth_mode = 1, synth_engine_idx = (unsigned)idx, preset_idx = 0;
-        int parsed = sscanf(line.c_str(), "%d,%u,%23[^,],%u,%u,%u", &used, &pad, name, &synth_mode, &synth_engine_idx, &preset_idx);
+        char src[128] = {0};
+        unsigned synth_mode = 0, synth_engine_idx = 0, preset_idx = 0;
+        float trim_a = 0.0f, trim_b = 1.0f;
+        unsigned fin = 0, fout = 0;
+        int parsed = sscanf(line.c_str(),
+                            "%d,%u,%23[^,],%u,%u,%u,%127[^,],%f,%f,%u,%u",
+                            &used, &pad, name, &synth_mode, &synth_engine_idx, &preset_idx,
+                            src, &trim_a, &trim_b, &fin, &fout);
         if (parsed >= 2) {
             s_xtra_slots[idx].used = (used != 0);
             // Enforce fixed XTRA backing slots (16..19) regardless of legacy file values.
             s_xtra_slots[idx].pad = xtra_backing_pad_for_slot(idx);
-            s_xtra_slots[idx].synth_mode = (parsed >= 4) ? (synth_mode != 0) : true;
-            s_xtra_slots[idx].synth_engine_idx = (uint8_t)constrain((int)synth_engine_idx, 0, 7);
-            s_xtra_slots[idx].preset_idx = (uint8_t)constrain((int)preset_idx, 0, 2);
-            if (parsed >= 3) {
+            // Sampler-only now: ignore any legacy synth flags from old files.
+            s_xtra_slots[idx].synth_mode = false;
+            s_xtra_slots[idx].synth_engine_idx = 0;
+            s_xtra_slots[idx].preset_idx = 0;
+            if (parsed >= 3 && strcmp(name, "-") != 0) {
                 strncpy(s_xtra_slots[idx].name, name, sizeof(s_xtra_slots[idx].name) - 1);
                 s_xtra_slots[idx].name[sizeof(s_xtra_slots[idx].name) - 1] = '\0';
                 trim_wav_extension(s_xtra_slots[idx].name);
             }
-            xtra_slot_refresh_name(idx);
+            if (parsed >= 7 && strcmp(src, "-") != 0) {
+                strncpy(s_xtra_slots[idx].src_path, src, sizeof(s_xtra_slots[idx].src_path) - 1);
+                s_xtra_slots[idx].src_path[sizeof(s_xtra_slots[idx].src_path) - 1] = '\0';
+            }
+            s_xtra_slots[idx].trim_start  = (parsed >= 8)  ? constrain(trim_a, 0.0f, 1.0f) : 0.0f;
+            s_xtra_slots[idx].trim_end    = (parsed >= 9)  ? constrain(trim_b, 0.0f, 1.0f) : 1.0f;
+            if (s_xtra_slots[idx].trim_end <= s_xtra_slots[idx].trim_start) s_xtra_slots[idx].trim_end = 1.0f;
+            s_xtra_slots[idx].fade_in_ms  = (parsed >= 10) ? (uint16_t)fin  : 0;
+            s_xtra_slots[idx].fade_out_ms = (parsed >= 11) ? (uint16_t)fout : 0;
         }
         idx++;
     }
@@ -1197,43 +1244,27 @@ static void xtra_refresh_panel(void) {
     for (int i = 0; i < 4; i++) {
         if (!grid_xtra_btns[i] || !grid_xtra_lbls[i]) continue;
         lv_color_t accent = xtra_slot_color(i);
-        if (s_xtra_slots[i].used) {
-            xtra_slot_refresh_name(i);
+        bool selected = (i == s_xtra_edit_slot);
+        if (s_xtra_slots[i].used && s_xtra_slots[i].src_path[0]) {
             lv_obj_set_style_bg_color(grid_xtra_btns[i], accent, 0);
-            lv_obj_set_style_border_color(grid_xtra_btns[i], theme_accent2(), 0);
-            lv_obj_set_style_bg_opa(grid_xtra_btns[i], LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_opa(grid_xtra_btns[i], selected ? LV_OPA_COVER : LV_OPA_80, 0);
             lv_label_set_text(grid_xtra_lbls[i],
                               s_xtra_slots[i].name[0] ? s_xtra_slots[i].name : "XTRA");
-            if (grid_xtra_meta_lbls[i]) {
-                if (s_xtra_slots[i].synth_mode) {
-                    lv_label_set_text_fmt(grid_xtra_meta_lbls[i], "PRESET %s  ·  XY %s",
-                                          XTRA_PRESET_LABELS[s_xtra_slots[i].preset_idx % 3],
-                                          xtra_slot_is_drum(i) ? "TRIG" : "NOTE");
-                } else {
-                    lv_label_set_text(grid_xtra_meta_lbls[i], "SAMPLER WAV  ·  TAP TRIG");
-                }
-            }
+            if (grid_xtra_meta_lbls[i]) lv_label_set_text(grid_xtra_meta_lbls[i], "SAMPLER  ·  TAP = TRIG");
         } else {
             lv_obj_set_style_bg_color(grid_xtra_btns[i], theme_surface(), 0);
-            lv_obj_set_style_border_color(grid_xtra_btns[i], theme_border(), 0);
             lv_obj_set_style_bg_opa(grid_xtra_btns[i], LV_OPA_80, 0);
-            lv_label_set_text(grid_xtra_lbls[i], "+ ADD");
-            if (grid_xtra_meta_lbls[i]) lv_label_set_text(grid_xtra_meta_lbls[i], "ENGINE SLOT");
+            lv_label_set_text(grid_xtra_lbls[i], "+ LOAD");
+            if (grid_xtra_meta_lbls[i]) lv_label_set_text(grid_xtra_meta_lbls[i], "WAV / MP3");
         }
-        xtra_apply_visual_state(i, false, 0, 0);
+        // The selected slot gets a bright border so the editor target is clear.
+        lv_obj_set_style_border_color(grid_xtra_btns[i], selected ? theme_accent2() : theme_border(), 0);
+        lv_obj_set_style_border_width(grid_xtra_btns[i], selected ? 3 : 2, 0);
         if (grid_xtra_slot_lbls[i]) lv_label_set_text_fmt(grid_xtra_slot_lbls[i], "S%02d", i + 1);
-        if (grid_xtra_change_btns[i]) {
-            lv_obj_set_style_border_color(grid_xtra_change_btns[i], accent, 0);
-            lv_obj_t* lbl = lv_obj_get_child(grid_xtra_change_btns[i], 0);
-            if (lbl) lv_label_set_text_fmt(lbl, "MODE\n%s", xtra_slot_mode_label(i));
-        }
         if (grid_xtra_delete_btns[i]) {
             lv_obj_set_style_border_color(grid_xtra_delete_btns[i], accent, 0);
             lv_obj_t* lbl = lv_obj_get_child(grid_xtra_delete_btns[i], 0);
-            if (lbl) {
-                if (s_xtra_slots[i].synth_mode) lv_label_set_text_fmt(lbl, "PRESET\n%s", XTRA_PRESET_LABELS[s_xtra_slots[i].preset_idx % 3]);
-                else lv_label_set_text(lbl, "LOAD\nWAV");
-            }
+            if (lbl) lv_label_set_text(lbl, "LOAD");
         }
     }
 }
@@ -5594,6 +5625,33 @@ static void sd_preview_btn_cb(lv_event_t* e) {
 
 static void sd_load_btn_cb(lv_event_t* e) {
     LV_UNUSED(e);
+    // XTRA sampler flow: don't upload the raw file. Remember the source path and
+    // open the editor — trim/fade get baked in and uploaded on APPLY.
+    if (s_sd_for_xtra && s_xtra_pending_slot >= 0 && s_xtra_pending_slot < 4 &&
+        p4sd.selected_file[0] != '\0' && !p4sd.selected_is_midi) {
+        int slot = s_xtra_pending_slot;
+        XtraPadSlot& s = s_xtra_slots[slot];
+        if (strcmp(p4sd.path, "/") == 0)
+            snprintf(s.src_path, sizeof(s.src_path), "/%s", p4sd.selected_file);
+        else
+            snprintf(s.src_path, sizeof(s.src_path), "%s/%s", p4sd.path, p4sd.selected_file);
+        strncpy(s.name, p4sd.selected_file, sizeof(s.name) - 1);
+        s.name[sizeof(s.name) - 1] = '\0';
+        trim_wav_extension(s.name);
+        s.used = true;
+        s.synth_mode = false;
+        s.trim_start = 0.0f; s.trim_end = 1.0f;
+        s.fade_in_ms = 0; s.fade_out_ms = 0;
+        s.pad = xtra_backing_pad_for_slot(slot);
+        s_xtra_loaded_slot = -1;     // force reload in the editor
+        s_xtra_pending_slot = -1;
+        s_sd_for_xtra = false;
+        xtra_save_state();
+        ui_navigate_to(6);
+        xtra_editor_select(slot);
+        ui_show_toast("Sample cargado: ajusta y pulsa APPLY", RED808_SUCCESS);
+        return;
+    }
     (void)sd_upload_selected_wav(true, false);
 }
 
@@ -8235,6 +8293,208 @@ static void create_piano_params_screen(void) {
 // =============================================================================
 // PERFORMANCE SCREEN (placeholder)
 // =============================================================================
+// --- XTRA sampler editor: waveform render + controls ----------------------
+static void xtra_editor_render(void) {
+    if (s_xtra_edit_slot < 0 || s_xtra_edit_slot >= 4) return;
+    XtraPadSlot& s = s_xtra_slots[s_xtra_edit_slot];
+    const sample_edit::SampleInfo& si = sample_edit::info();
+    bool have = si.loaded && (s_xtra_loaded_slot == s_xtra_edit_slot) && si.frames > 0;
+
+    if (s_xtra_wave_line) {
+        if (have) sample_edit::envelope(s_xtra_env, XTRA_WAVE_COLS);
+        else for (int c = 0; c < XTRA_WAVE_COLS; c++) s_xtra_env[c] = 0.f;
+        int w = lv_obj_get_width(s_xtra_wave_line);
+        int h = lv_obj_get_height(s_xtra_wave_line);
+        if (w < 10) w = 960; if (h < 10) h = 146;
+        int mid = h / 2;
+        for (int c = 0; c < XTRA_WAVE_COLS; c++) {
+            int x = c * w / XTRA_WAVE_COLS;
+            int amp = (int)(s_xtra_env[c] * (mid - 2));
+            s_xtra_wave_pts[c].x = x;                     s_xtra_wave_pts[c].y = mid - amp;
+            s_xtra_wave_pts[XTRA_WAVE_COLS * 2 - 1 - c].x = x;
+            s_xtra_wave_pts[XTRA_WAVE_COLS * 2 - 1 - c].y = mid + amp;
+        }
+        lv_line_set_points(s_xtra_wave_line, s_xtra_wave_pts, XTRA_WAVE_COLS * 2);
+        if (s_xtra_trim_a_line) lv_obj_set_x(s_xtra_trim_a_line, (int)(s.trim_start * w));
+        if (s_xtra_trim_b_line) lv_obj_set_x(s_xtra_trim_b_line, (int)(s.trim_end * w) - 2);
+    }
+
+    if (s_xtra_info_lbl) {
+        if (!s.src_path[0]) {
+            lv_label_set_text(s_xtra_info_lbl, "Slot vacio — pulsa LOAD para elegir un WAV/MP3");
+        } else if (!have) {
+            lv_label_set_text_fmt(s_xtra_info_lbl, "%s — no se pudo leer la onda", s.name);
+        } else {
+            float dur = (float)si.frames / (float)(si.sample_rate ? si.sample_rate : 1);
+            lv_label_set_text_fmt(s_xtra_info_lbl, "S%02d  %s  ·  %s %luHz %dch  ·  %.2fs%s",
+                s_xtra_edit_slot + 1, s.name, si.is_mp3 ? "MP3" : "WAV",
+                (unsigned long)si.sample_rate, (int)si.channels, dur,
+                si.truncated ? "  (recortado)" : "");
+        }
+    }
+    if (s_xtra_trim_lbl)
+        lv_label_set_text_fmt(s_xtra_trim_lbl, "TRIM  %d%% .. %d%%",
+            (int)(s.trim_start * 100), (int)(s.trim_end * 100));
+    if (s_xtra_fade_lbl)
+        lv_label_set_text_fmt(s_xtra_fade_lbl, "FADE IN %ums   OUT %ums",
+            (unsigned)s.fade_in_ms, (unsigned)s.fade_out_ms);
+}
+
+static void xtra_editor_select(int slot) {
+    if (slot < 0 || slot >= 4) return;
+    s_xtra_edit_slot = slot;
+    XtraPadSlot& s = s_xtra_slots[slot];
+    if (s.src_path[0] && s_xtra_loaded_slot != slot) {
+        ui_busy_show("Leyendo sample...");
+        bool ok = sample_edit::load(SD_MMC, s.src_path);
+        ui_busy_hide();
+        s_xtra_loaded_slot = ok ? slot : -1;
+    } else if (!s.src_path[0]) {
+        s_xtra_loaded_slot = -1;
+        sample_edit::unload();
+    }
+    xtra_refresh_panel();
+    xtra_editor_render();
+}
+
+// HTTP upload of an already-baked WAV file on SD to a Master pad.
+static bool xtra_http_upload_path(const char* sd_path, const char* postname, int pad) {
+    File sample = SD_MMC.open(sd_path, FILE_READ);
+    if (!sample) return false;
+    size_t sample_size = sample.size();
+    if (sample_size == 0) { sample.close(); return false; }
+
+    WiFiClient client;
+    client.setTimeout(10000);
+    if (!client.connect(IPAddress(192, 168, 4, 1), 80)) { sample.close(); return false; }
+
+    const char* boundary = "----RED808P4Upload";
+    char file_head[192];
+    snprintf(file_head, sizeof(file_head),
+             "--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\nContent-Type: audio/wav\r\n\r\n",
+             boundary, postname);
+    char file_tail[40];
+    snprintf(file_tail, sizeof(file_tail), "\r\n--%s--\r\n", boundary);
+    size_t content_len = strlen(file_head) + sample_size + strlen(file_tail);
+
+    client.printf("POST /api/uploadDaisy?pad=%d HTTP/1.1\r\n", pad);
+    client.print("Host: 192.168.4.1\r\n");
+    client.print("Connection: close\r\n");
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary);
+    client.printf("Content-Length: %u\r\n\r\n", (unsigned)content_len);
+    client.print(file_head);
+
+    uint8_t buf[2048];
+    bool write_ok = true;
+    while (sample.available()) {
+        size_t n = sample.read(buf, sizeof(buf));
+        if (n == 0) break;
+        if (client.write(buf, n) != n) { write_ok = false; break; }
+        yield();
+    }
+    sample.close();
+    if (write_ok) client.print(file_tail);
+
+    int status = 0;
+    unsigned long t0 = millis();
+    while (millis() - t0 < 5000) {
+        if (client.available()) {
+            String line = client.readStringUntil('\n');
+            if (line.startsWith("HTTP/1.1 ")) status = line.substring(9, 12).toInt();
+            break;
+        }
+        if (!client.connected()) break;
+        delay(2);
+    }
+    client.stop();
+    return write_ok && status == 200;
+}
+
+static void xtra_pad_select_cb(lv_event_t* e) {
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (slot < 0 || slot >= 4) return;
+    xtra_editor_select(slot);
+    if (s_xtra_slots[slot].used && s_xtra_slots[slot].src_path[0] && ui_use_udp_transport())
+        udp_send_trigger(s_xtra_slots[slot].pad, 110);
+}
+
+static void xtra_load_cb(lv_event_t* e) {
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (slot < 0 || slot >= 4) return;
+    s_xtra_edit_slot = slot;
+    xtra_begin_load_for_slot(slot);   // → SD browser; LOAD there assigns the file
+}
+
+static void xtra_edit_adj_cb(lv_event_t* e) {
+    int code = (int)(intptr_t)lv_event_get_user_data(e);
+    int ctrl = code / 2;
+    int dir  = (code % 2) ? +1 : -1;
+    XtraPadSlot& s = s_xtra_slots[s_xtra_edit_slot];
+    switch (ctrl) {
+        case 0: s.trim_start = constrain(s.trim_start + dir * 0.02f, 0.0f, s.trim_end - 0.02f); break;
+        case 1: s.trim_end   = constrain(s.trim_end   + dir * 0.02f, s.trim_start + 0.02f, 1.0f); break;
+        case 2: { int v = (int)s.fade_in_ms  + dir * 10; v = constrain(v, 0, 2000); s.fade_in_ms  = (uint16_t)v; } break;
+        case 3: { int v = (int)s.fade_out_ms + dir * 10; v = constrain(v, 0, 2000); s.fade_out_ms = (uint16_t)v; } break;
+    }
+    xtra_save_state();
+    xtra_editor_render();
+}
+
+static void xtra_play_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    XtraPadSlot& s = s_xtra_slots[s_xtra_edit_slot];
+    if (s.used && s.src_path[0] && ui_use_udp_transport()) udp_send_trigger(s.pad, 110);
+    else ui_show_toast("Aplica el sample primero", theme_warning());
+}
+
+static void xtra_apply_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    int slot = s_xtra_edit_slot;
+    XtraPadSlot& s = s_xtra_slots[slot];
+    if (!s.src_path[0]) { ui_show_toast("Slot vacio", theme_warning()); return; }
+    if (s_xtra_loaded_slot != slot) {
+        ui_busy_show("Leyendo sample...");
+        bool ok = sample_edit::load(SD_MMC, s.src_path);
+        ui_busy_hide();
+        if (!ok) { ui_show_toast("No se pudo leer el sample", RED808_WARNING); return; }
+        s_xtra_loaded_slot = slot;
+    }
+    char outp[40];
+    snprintf(outp, sizeof(outp), "/xtra_bake_%d.wav", slot);
+    ui_busy_show("Procesando y subiendo...\nEspera, no cambies de pantalla.");
+    size_t n = sample_edit::bake_wav(SD_MMC, outp, s.trim_start, s.trim_end,
+                                     s.fade_in_ms, s.fade_out_ms);
+    if (n == 0) { ui_busy_hide(); ui_show_toast("Error al procesar el sample", RED808_WARNING); return; }
+    char postname[40];
+    snprintf(postname, sizeof(postname), "%s.wav", s.name[0] ? s.name : "xtra");
+    bool ok = xtra_http_upload_path(outp, postname, s.pad);
+    ui_busy_hide();
+    if (ok) {
+        s.used = true;
+        xtra_save_state();
+        xtra_refresh_panel();
+        if (ui_use_udp_transport()) udp_send_trigger(s.pad, 110);
+        ui_show_toast("Sample aplicado y subido", RED808_SUCCESS);
+    } else {
+        ui_show_toast("Subida fallida (Master?)", RED808_WARNING);
+    }
+}
+
+static lv_obj_t* xtra_make_btn(lv_obj_t* par, int x, int y, int w, int h,
+                               const char* txt, lv_color_t col,
+                               lv_event_cb_t cb, int code) {
+    lv_obj_t* b = lv_btn_create(par);
+    lv_obj_set_size(b, w, h);
+    lv_obj_set_pos(b, x, y);
+    apply_control_button_style(b, col, false, 8);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+    lv_obj_center(l);
+    if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, (void*)(intptr_t)code);
+    return b;
+}
+
 static void create_performance_screen(void) {
     scr_performance = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_performance, RED808_BG, 0);
@@ -8244,95 +8504,130 @@ static void create_performance_screen(void) {
     int W = ui_layout_w();
 
     lv_obj_t* title = lv_label_create(scr_performance);
-    lv_label_set_text(title, "XTRA PADS");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_32, 0);
+    lv_label_set_text(title, "XTRA SAMPLER");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, theme_accent2(), 0);
-    lv_obj_set_pos(title, 20, 72);
+    lv_obj_set_pos(title, 64, 12);
 
     lv_obj_t* sub = lv_label_create(scr_performance);
-    lv_label_set_text(sub, "Banco local por P4 (sin asignacion a los 16 pads)");
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_16, 0);
+    lv_label_set_text(sub, "Carga WAV/MP3 · onda · trim · fade in/out · APPLY sube al Master");
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(sub, theme_text_dim(), 0);
-    lv_obj_set_pos(sub, 20, 114);
+    lv_obj_set_pos(sub, 280, 20);
 
-    lv_obj_t* hint = lv_label_create(scr_performance);
-    lv_label_set_text(hint, "MODE tap. Hold MODE = editor. Hold pad = XY sensible + glow.");
-    lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(hint, theme_warning(), 0);
-    lv_obj_set_pos(hint, 20, 142);
-
-    const int start_x = 20;
-    const int start_y = 180;
-    const int pad_w = (W - 20 * 2 - 16) / 2;
-    const int pad_h = 150;
+    // --- 4 sampler pads (tap = select + trigger) + per-pad LOAD ------------
+    const int x0 = 20, gap = 12, py = 64, ch = 92;
+    const int cw = (W - 2 * x0 - 3 * gap) / 4;
+    grid_xtra_change_btns[0] = grid_xtra_change_btns[1] = NULL;
+    grid_xtra_change_btns[2] = grid_xtra_change_btns[3] = NULL;
     for (int i = 0; i < 4; i++) {
-        int col = i % 2;
-        int row = i / 2;
+        int x = x0 + i * (cw + gap);
         grid_xtra_btns[i] = lv_btn_create(scr_performance);
-        int main_w = pad_w - 96;
-        if (main_w < 120) main_w = 120;
-        lv_obj_set_size(grid_xtra_btns[i], main_w, pad_h);
-        lv_obj_set_pos(grid_xtra_btns[i], start_x + col * (pad_w + 16), start_y + row * (pad_h + 14));
+        lv_obj_set_size(grid_xtra_btns[i], cw, ch);
+        lv_obj_set_pos(grid_xtra_btns[i], x, py);
         lv_obj_set_style_radius(grid_xtra_btns[i], 12, 0);
         lv_obj_set_style_border_width(grid_xtra_btns[i], 2, 0);
         lv_obj_set_style_bg_opa(grid_xtra_btns[i], LV_OPA_80, 0);
-        lv_obj_add_event_cb(grid_xtra_btns[i], xtra_slot_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-        lv_obj_add_event_cb(grid_xtra_btns[i], xtra_pad_touch_cb, LV_EVENT_PRESSED, (void*)(intptr_t)i);
-        lv_obj_add_event_cb(grid_xtra_btns[i], xtra_pad_touch_cb, LV_EVENT_PRESSING, (void*)(intptr_t)i);
-        lv_obj_add_event_cb(grid_xtra_btns[i], xtra_pad_touch_cb, LV_EVENT_RELEASED, (void*)(intptr_t)i);
-        lv_obj_add_event_cb(grid_xtra_btns[i], xtra_pad_touch_cb, LV_EVENT_PRESS_LOST, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(grid_xtra_btns[i], xtra_pad_select_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
 
         grid_xtra_lbls[i] = lv_label_create(grid_xtra_btns[i]);
-        lv_label_set_text(grid_xtra_lbls[i], "808 A");
-        lv_obj_set_width(grid_xtra_lbls[i], main_w - 14);
-        lv_obj_set_style_text_font(grid_xtra_lbls[i], &lv_font_montserrat_24, 0);
+        lv_label_set_text(grid_xtra_lbls[i], "+ LOAD");
+        lv_obj_set_width(grid_xtra_lbls[i], cw - 14);
+        lv_obj_set_style_text_font(grid_xtra_lbls[i], &lv_font_montserrat_20, 0);
         lv_obj_set_style_text_align(grid_xtra_lbls[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(grid_xtra_lbls[i], LV_ALIGN_CENTER, 0, -18);
+        lv_obj_align(grid_xtra_lbls[i], LV_ALIGN_CENTER, 0, -8);
 
         grid_xtra_slot_lbls[i] = lv_label_create(grid_xtra_btns[i]);
         lv_label_set_text_fmt(grid_xtra_slot_lbls[i], "S%02d", i + 1);
         lv_obj_set_style_text_font(grid_xtra_slot_lbls[i], &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(grid_xtra_slot_lbls[i], theme_text_dim(), 0);
-        lv_obj_align(grid_xtra_slot_lbls[i], LV_ALIGN_TOP_LEFT, 10, 8);
+        lv_obj_align(grid_xtra_slot_lbls[i], LV_ALIGN_TOP_LEFT, 8, 6);
 
         grid_xtra_meta_lbls[i] = lv_label_create(grid_xtra_btns[i]);
-        lv_label_set_text(grid_xtra_meta_lbls[i], "PRESET A · XY NOTE");
-        lv_obj_set_width(grid_xtra_meta_lbls[i], main_w - 20);
+        lv_label_set_text(grid_xtra_meta_lbls[i], "WAV / MP3");
         lv_obj_set_style_text_font(grid_xtra_meta_lbls[i], &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(grid_xtra_meta_lbls[i], theme_text(), 0);
-        lv_obj_set_style_text_align(grid_xtra_meta_lbls[i], LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_align(grid_xtra_meta_lbls[i], LV_ALIGN_BOTTOM_MID, 0, -12);
+        lv_obj_align(grid_xtra_meta_lbls[i], LV_ALIGN_BOTTOM_MID, 0, -8);
 
-        int card_x = start_x + col * (pad_w + 16);
-        int card_y = start_y + row * (pad_h + 14);
-        int side_x = card_x + main_w + 8;
-
-        grid_xtra_change_btns[i] = lv_btn_create(scr_performance);
-        lv_obj_set_size(grid_xtra_change_btns[i], 88, 68);
-        lv_obj_set_pos(grid_xtra_change_btns[i], side_x, card_y);
-        apply_control_button_style(grid_xtra_change_btns[i], theme_accent2(), false, 8);
-        lv_obj_add_event_cb(grid_xtra_change_btns[i], xtra_change_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-        lv_obj_add_event_cb(grid_xtra_change_btns[i], xtra_edit_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)i);
-        lv_obj_t* ch_lbl = lv_label_create(grid_xtra_change_btns[i]);
-        lv_label_set_text(ch_lbl, "ENG\n808");
-        lv_obj_set_style_text_font(ch_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_align(ch_lbl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_center(ch_lbl);
-
-        grid_xtra_delete_btns[i] = lv_btn_create(scr_performance);
-        lv_obj_set_size(grid_xtra_delete_btns[i], 88, 68);
-        lv_obj_set_pos(grid_xtra_delete_btns[i], side_x, card_y + pad_h - 68);
-        apply_control_button_style(grid_xtra_delete_btns[i], theme_warning(), false, 8);
-        lv_obj_add_event_cb(grid_xtra_delete_btns[i], xtra_delete_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-        lv_obj_t* del_lbl = lv_label_create(grid_xtra_delete_btns[i]);
-        lv_label_set_text(del_lbl, "PRESET\nA");
-        lv_obj_set_style_text_font(del_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_align(del_lbl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_center(del_lbl);
+        grid_xtra_delete_btns[i] = xtra_make_btn(scr_performance, x, py + ch + 4, cw, 30,
+                                                 "LOAD", theme_warning(), xtra_load_cb, i);
     }
 
+    // --- Waveform panel ----------------------------------------------------
+    const int wy = py + ch + 44;          // ~200
+    const int wpw = W - 2 * x0;           // ~984
+    const int wph = 150;
+    s_xtra_wave_panel = lv_obj_create(scr_performance);
+    lv_obj_set_size(s_xtra_wave_panel, wpw, wph);
+    lv_obj_set_pos(s_xtra_wave_panel, x0, wy);
+    lv_obj_set_style_radius(s_xtra_wave_panel, 10, 0);
+    lv_obj_set_style_bg_color(s_xtra_wave_panel, RED808_PANEL, 0);
+    lv_obj_set_style_bg_opa(s_xtra_wave_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_xtra_wave_panel, 1, 0);
+    lv_obj_set_style_border_color(s_xtra_wave_panel, RED808_BORDER, 0);
+    lv_obj_set_style_pad_all(s_xtra_wave_panel, 0, 0);
+    lv_obj_clear_flag(s_xtra_wave_panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_xtra_trim_a_line = lv_obj_create(s_xtra_wave_panel);
+    lv_obj_set_size(s_xtra_trim_a_line, 2, wph - 4);
+    lv_obj_set_pos(s_xtra_trim_a_line, 0, 2);
+    lv_obj_set_style_bg_color(s_xtra_trim_a_line, RED808_SUCCESS, 0);
+    lv_obj_set_style_border_width(s_xtra_trim_a_line, 0, 0);
+    lv_obj_clear_flag(s_xtra_trim_a_line, LV_OBJ_FLAG_CLICKABLE);
+
+    s_xtra_trim_b_line = lv_obj_create(s_xtra_wave_panel);
+    lv_obj_set_size(s_xtra_trim_b_line, 2, wph - 4);
+    lv_obj_set_pos(s_xtra_trim_b_line, wpw - 6, 2);
+    lv_obj_set_style_bg_color(s_xtra_trim_b_line, RED808_WARNING, 0);
+    lv_obj_set_style_border_width(s_xtra_trim_b_line, 0, 0);
+    lv_obj_clear_flag(s_xtra_trim_b_line, LV_OBJ_FLAG_CLICKABLE);
+
+    s_xtra_wave_line = lv_line_create(s_xtra_wave_panel);
+    lv_obj_set_size(s_xtra_wave_line, wpw - 4, wph - 4);
+    lv_obj_align(s_xtra_wave_line, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_line_color(s_xtra_wave_line, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_line_width(s_xtra_wave_line, 2, 0);
+    lv_obj_set_style_line_rounded(s_xtra_wave_line, true, 0);
+
+    // --- Info + controls ---------------------------------------------------
+    s_xtra_info_lbl = lv_label_create(scr_performance);
+    lv_label_set_text(s_xtra_info_lbl, "Slot vacio");
+    lv_obj_set_style_text_font(s_xtra_info_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_xtra_info_lbl, theme_text_dim(), 0);
+    lv_obj_set_pos(s_xtra_info_lbl, x0, wy + wph + 6);
+
+    int ty = wy + wph + 30;               // trim controls row
+    xtra_make_btn(scr_performance, x0,        ty, 64, 38, "S " LV_SYMBOL_MINUS, RED808_SUCCESS, xtra_edit_adj_cb, 0);
+    xtra_make_btn(scr_performance, x0 + 68,   ty, 64, 38, "S " LV_SYMBOL_PLUS,  RED808_SUCCESS, xtra_edit_adj_cb, 1);
+    s_xtra_trim_lbl = lv_label_create(scr_performance);
+    lv_label_set_text(s_xtra_trim_lbl, "TRIM 0% .. 100%");
+    lv_obj_set_style_text_font(s_xtra_trim_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_xtra_trim_lbl, RED808_TEXT, 0);
+    lv_obj_set_pos(s_xtra_trim_lbl, x0 + 150, ty + 8);
+    xtra_make_btn(scr_performance, x0 + 360,  ty, 64, 38, "E " LV_SYMBOL_MINUS, RED808_WARNING, xtra_edit_adj_cb, 2);
+    xtra_make_btn(scr_performance, x0 + 428,  ty, 64, 38, "E " LV_SYMBOL_PLUS,  RED808_WARNING, xtra_edit_adj_cb, 3);
+
+    int fy = ty + 48;                     // fade controls row
+    xtra_make_btn(scr_performance, x0,        fy, 64, 38, "IN " LV_SYMBOL_MINUS,  RED808_CYAN, xtra_edit_adj_cb, 4);
+    xtra_make_btn(scr_performance, x0 + 68,   fy, 64, 38, "IN " LV_SYMBOL_PLUS,   RED808_CYAN, xtra_edit_adj_cb, 5);
+    s_xtra_fade_lbl = lv_label_create(scr_performance);
+    lv_label_set_text(s_xtra_fade_lbl, "FADE IN 0ms   OUT 0ms");
+    lv_obj_set_style_text_font(s_xtra_fade_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_xtra_fade_lbl, RED808_TEXT, 0);
+    lv_obj_set_pos(s_xtra_fade_lbl, x0 + 150, fy + 8);
+    xtra_make_btn(scr_performance, x0 + 360,  fy, 70, 38, "OUT " LV_SYMBOL_MINUS, RED808_CYAN, xtra_edit_adj_cb, 6);
+    xtra_make_btn(scr_performance, x0 + 434,  fy, 70, 38, "OUT " LV_SYMBOL_PLUS,  RED808_CYAN, xtra_edit_adj_cb, 7);
+
+    int ay = fy + 50;                     // action row
+    xtra_make_btn(scr_performance, x0,        ay, 300, 52, LV_SYMBOL_PLAY "  PLAY",   RED808_CYAN,    xtra_play_cb,  0);
+    xtra_make_btn(scr_performance, x0 + 320,  ay, W - 2 * x0 - 320, 52, LV_SYMBOL_UPLOAD "  APPLY + SUBIR",
+                  theme_accent2(), xtra_apply_cb, 0);
+
     xtra_load_state();
+    s_xtra_edit_slot = 0;
+    s_xtra_loaded_slot = -1;
     xtra_refresh_panel();
+    xtra_editor_render();
 }
 
 // =============================================================================
@@ -8372,6 +8667,10 @@ static void ui_reload_themed_screens(void) {
     if (scr_performance) { lv_obj_del(scr_performance); scr_performance = NULL; }
 
     // Clear widget pointers (prevent stale access in update functions)
+    s_xtra_wave_panel = NULL; s_xtra_wave_line = NULL;
+    s_xtra_trim_a_line = NULL; s_xtra_trim_b_line = NULL;
+    s_xtra_info_lbl = NULL; s_xtra_trim_lbl = NULL; s_xtra_fade_lbl = NULL;
+    for (int i = 0; i < 4; i++) { grid_xtra_btns[i] = NULL; grid_xtra_delete_btns[i] = NULL; }
     header_bar = NULL; hdr_bpm_label = NULL; hdr_pattern_label = NULL;
     hdr_play_btn = NULL; hdr_play_label = NULL;
     hdr_pattern_minus_btn = NULL; hdr_pattern_plus_btn = NULL;
