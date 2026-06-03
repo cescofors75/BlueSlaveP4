@@ -336,6 +336,14 @@ static lv_obj_t* s_ui_toast = NULL;
 static lv_obj_t* s_ui_toast_label = NULL;
 static uint32_t s_ui_toast_until_ms = 0;
 
+// Full-screen busy overlay used to give feedback during a blocking operation
+// (e.g. uploading a WAV to the Master, which runs synchronously on the UI
+// thread). It also blocks navigation so the user can't wander off mid-upload
+// and lose the result toast.
+static lv_obj_t* s_busy_overlay = NULL;
+static lv_obj_t* s_busy_lbl     = NULL;
+static bool      s_ui_busy      = false;
+
 static void ui_toast_hide(void) {
     if (s_ui_toast) lv_obj_add_flag(s_ui_toast, LV_OBJ_FLAG_HIDDEN);
     s_ui_toast_until_ms = 0;
@@ -348,7 +356,10 @@ static void ui_toast_update(void) {
 }
 
 static void ui_show_toast(const char* text, lv_color_t accent) {
-    lv_obj_t* parent = lv_scr_act();
+    // Parent to the top layer (shared across all screens) so a toast raised
+    // just before — or during — a screen change still shows instead of being
+    // destroyed with the previous screen.
+    lv_obj_t* parent = lv_layer_top();
     if (!parent) return;
 
     if (!s_ui_toast || lv_obj_get_parent(s_ui_toast) != parent) {
@@ -379,6 +390,50 @@ static void ui_show_toast(const char* text, lv_color_t accent) {
     lv_obj_move_foreground(s_ui_toast);
     lv_obj_clear_flag(s_ui_toast, LV_OBJ_FLAG_HIDDEN);
     s_ui_toast_until_ms = millis() + 1800U;
+}
+
+// Show a modal "busy" overlay and paint it immediately. Because the work that
+// follows blocks the LVGL thread, we force one synchronous redraw here so the
+// message is actually on screen before we freeze.
+static void ui_busy_show(const char* text) {
+    lv_obj_t* top = lv_layer_top();
+    if (!top) return;
+    if (!s_busy_overlay) {
+        s_busy_overlay = lv_obj_create(top);
+        lv_obj_remove_style_all(s_busy_overlay);
+        lv_obj_set_size(s_busy_overlay, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_style_bg_color(s_busy_overlay, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(s_busy_overlay, LV_OPA_70, 0);
+        lv_obj_add_flag(s_busy_overlay, LV_OBJ_FLAG_CLICKABLE);  // eat touches
+        lv_obj_clear_flag(s_busy_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* card = lv_obj_create(s_busy_overlay);
+        lv_obj_set_size(card, 480, 130);
+        lv_obj_center(card);
+        lv_obj_set_style_bg_color(card, RED808_PANEL, 0);
+        lv_obj_set_style_border_color(card, RED808_CYAN, 0);
+        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_radius(card, 10, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        s_busy_lbl = lv_label_create(card);
+        lv_obj_set_width(s_busy_lbl, 440);
+        lv_label_set_long_mode(s_busy_lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(s_busy_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(s_busy_lbl, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(s_busy_lbl, RED808_TEXT, 0);
+        lv_obj_center(s_busy_lbl);
+    }
+    if (s_busy_lbl) lv_label_set_text(s_busy_lbl, text);
+    lv_obj_clear_flag(s_busy_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_busy_overlay);
+    s_ui_busy = true;
+    lv_refr_now(NULL);   // paint before the caller blocks the UI thread
+}
+
+static void ui_busy_hide(void) {
+    s_ui_busy = false;
+    if (s_busy_overlay) lv_obj_add_flag(s_busy_overlay, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void seq_pattern_modal_show(int pattern);
@@ -575,6 +630,7 @@ static lv_obj_t* grid_play_btn = NULL;
 static lv_obj_t* grid_play_lbl = NULL;
 static lv_obj_t* grid_bpm_lbl = NULL;
 static lv_obj_t* grid_home_vol_lbl = NULL;
+static lv_obj_t* grid_home_status_cell = NULL;  // STATUS cell — tinted by master link
 static lv_obj_t* grid_pat_lbl = NULL;
 static lv_obj_t* grid_step_lbl = NULL;
 static lv_obj_t* grid_step_dots[16] = {};
@@ -768,7 +824,12 @@ static void xtra_send_slot_param_snapshot(int slot) {
     if (eng_idx < 0 || eng_idx >= SP_ENGINE_COUNT) return;
     if (!s_xtra_param_valid[slot]) xtra_reset_slot_params(slot);
     const SynthEngineDef* eng = &SP_ENGINES[eng_idx];
-    udp_send_synth_preset(eng->engine, s_xtra_slots[slot].preset_idx % 3);
+    // Map the A/B/C slot index into the engine's real preset range — sending an
+    // index the engine doesn't have leaves it with no preset loaded (= silent).
+    uint8_t preset = (eng->preset_count > 0)
+                     ? (uint8_t)(s_xtra_slots[slot].preset_idx % eng->preset_count)
+                     : 0;
+    udp_send_synth_preset(eng->engine, preset);
     for (uint8_t i = 0; i < eng->param_count && i < XTRA_PARAM_MAX; i++) {
         udp_send_synth_param(eng->engine, 0, eng->params[i].param_id, s_xtra_param_values[slot][i]);
     }
@@ -871,7 +932,18 @@ static void xtra_slot_refresh_name(int slot) {
 static void xtra_apply_preset(int slot) {
     if (slot < 0 || slot >= 4 || !ui_use_udp_transport() || !s_xtra_slots[slot].synth_mode) return;
     uint8_t engine = xtra_slot_engine_code(slot);
-    udp_send_synth_preset(engine, s_xtra_slots[slot].preset_idx % 3);
+    uint8_t preset = s_xtra_slots[slot].preset_idx % 3;
+    // Drum engines (808/909/505) always expose 3 kits; melodic engines may have
+    // fewer presets — clamp into the real range so we never send a phantom
+    // index that the synth ignores (a common "preset doesn't sound" cause).
+    if (!xtra_slot_is_drum(slot)) {
+        int eng_idx = xtra_slot_pp_engine_idx(slot);
+        if (eng_idx >= 0 && eng_idx < SP_ENGINE_COUNT) {
+            int pc = (int)SP_ENGINES[eng_idx].preset_count;
+            if (pc > 0) preset = (uint8_t)(preset % pc);
+        }
+    }
+    udp_send_synth_preset(engine, preset);
 }
 
 static void xtra_send_note_on(int slot, int note, uint8_t velocity) {
@@ -2327,6 +2399,19 @@ static void create_live_screen(void) {
     // [7,0] Home status cell — pattern + link health
     lv_obj_t* home_cell = create_info_cell(scr_live, COL_X(7), ROW_Y(0), CW, CH,
                                            "STATUS", "P01", RED808_WARNING, &grid_bpm_lbl);
+    grid_home_status_cell = home_cell;
+    {
+        // Initial subtle link tint so the cell is correct on first paint and
+        // after a theme reload (the per-frame updater only re-tints on change).
+        lv_color_t sc0 = ui_master_link_display_on() ? RED808_SUCCESS : RED808_WARNING;
+        lv_obj_set_style_bg_color(home_cell, sc0, 0);
+        lv_obj_set_style_bg_grad_color(home_cell, RED808_SURFACE, 0);
+        lv_obj_set_style_bg_grad_dir(home_cell, LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_bg_opa(home_cell, LV_OPA_30, 0);
+        lv_obj_set_style_border_color(home_cell, sc0, 0);
+        lv_obj_set_style_border_opa(home_cell, LV_OPA_60, 0);
+        lv_obj_set_style_border_width(home_cell, 2, 0);
+    }
     grid_home_vol_lbl = lv_label_create(home_cell);
     lv_label_set_text(grid_home_vol_lbl, "MSTR --  AUX --");
     lv_obj_set_style_text_font(grid_home_vol_lbl, &lv_font_montserrat_14, 0);
@@ -2767,6 +2852,19 @@ static void update_live_screen(void) {
                               mstr_on ? "OK" : "--", aux_on ? "OK" : "--");
         lv_obj_set_style_text_color(grid_home_vol_lbl,
             (mstr_on && aux_on) ? RED808_SUCCESS : (mstr_on || aux_on) ? RED808_CYAN : RED808_TEXT_DIM, 0);
+
+        // Subtle, theme-matched background wash on the STATUS cell: green when
+        // the Master link is up, orange when it's down.
+        if (grid_home_status_cell) {
+            lv_color_t sc = mstr_on ? RED808_SUCCESS : RED808_WARNING;
+            lv_obj_set_style_bg_color(grid_home_status_cell, sc, 0);
+            lv_obj_set_style_bg_grad_color(grid_home_status_cell, RED808_SURFACE, 0);
+            lv_obj_set_style_bg_grad_dir(grid_home_status_cell, LV_GRAD_DIR_VER, 0);
+            lv_obj_set_style_bg_opa(grid_home_status_cell, LV_OPA_30, 0);
+            lv_obj_set_style_border_color(grid_home_status_cell, sc, 0);
+            lv_obj_set_style_border_opa(grid_home_status_cell, LV_OPA_60, 0);
+            lv_obj_set_style_border_width(grid_home_status_cell, 2, 0);
+        }
     }
 
     // Dedicated HOME controls labels
@@ -4595,54 +4693,75 @@ static void create_volumes_screen(void) {
     const int LW = LCD_H_RES;   // 1024 — full display width
     const int LH = LCD_V_RES;   // 600  — full display height
 
+    // --- Header bar: prominent title + grouped MAIN / BPM controls ----------
     lv_obj_t* title = lv_label_create(scr_volumes);
     lv_label_set_text(title, LV_SYMBOL_VOLUME_MAX "  MIXER");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(title, RED808_TEXT_DIM, 0);
-    lv_obj_set_pos(title, 60, 10);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, RED808_ACCENT, 0);
+    lv_obj_set_pos(title, 62, 12);
 
-    // Global controls row (focused): MAIN + BPM only
-    const int global_y = 30;
-    const int slider_w = 320;
-    const int slider_gap = 80;
-    const int label_w = 110;
-    const int block_w = label_w + slider_w + 70;
-    const int global_x = (LCD_H_RES - (2 * block_w + slider_gap)) / 2;
-    struct GlobalCtl { const char* name; int value; int max; lv_obj_t** slider; lv_obj_t** label; };
+    // Global controls: MAIN + BPM only, each grouped inside its own panel so
+    // the header reads as a coherent strip instead of bare floating sliders.
+    const int global_y = 26;
+    const int slider_w = 250;
+    const int label_w  = 64;
+    const int value_w  = 46;
+    const int block_w  = label_w + slider_w + value_w + 16;   // ~376
+    const int gap      = 30;
+    const int global_x = 210;   // leaves room for the title on the left
+    // Two blocks: 210 .. 210+376=586 (block1), 616 .. 992 (block2) — fits 1024.
+    struct GlobalCtl { const char* name; int value; int max; lv_color_t color; lv_obj_t** slider; lv_obj_t** label; };
     GlobalCtl globals[] = {
-        {"MAIN", p4.master_volume, Config::MAX_VOLUME, &mix_master_slider, &mix_master_lbl},
-        {"BPM",  p4.bpm_int,       240,                &mix_bpm_slider,    &mix_bpm_lbl},
+        {"MAIN", p4.master_volume, Config::MAX_VOLUME, RED808_CYAN,   &mix_master_slider, &mix_master_lbl},
+        {"BPM",  p4.bpm_int,       240,                RED808_ACCENT, &mix_bpm_slider,    &mix_bpm_lbl},
     };
     mix_seq_slider = NULL;
     mix_seq_lbl = NULL;
     mix_live_slider = NULL;
     mix_live_lbl = NULL;
     for (int i = 0; i < 2; i++) {
-        int x = global_x + i * (block_w + slider_gap);
+        int x = global_x + i * (block_w + gap);
+
+        // Grouping panel (behind the controls)
+        lv_obj_t* panel = lv_obj_create(scr_volumes);
+        lv_obj_set_size(panel, block_w + 8, 56);
+        lv_obj_set_pos(panel, x - 10, global_y - 8);
+        lv_obj_set_style_radius(panel, 10, 0);
+        lv_obj_set_style_bg_color(panel, RED808_SURFACE, 0);
+        lv_obj_set_style_bg_grad_color(panel, RED808_PANEL, 0);
+        lv_obj_set_style_bg_grad_dir(panel, LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_bg_opa(panel, LV_OPA_50, 0);
+        lv_obj_set_style_border_width(panel, 1, 0);
+        lv_obj_set_style_border_color(panel, globals[i].color, 0);
+        lv_obj_set_style_border_opa(panel, LV_OPA_50, 0);
+        lv_obj_set_style_pad_all(panel, 0, 0);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+
         lv_obj_t* name = lv_label_create(scr_volumes);
         lv_label_set_text(name, globals[i].name);
-        lv_obj_set_style_text_font(name, &lv_font_montserrat_24, 0);
-        lv_obj_set_style_text_color(name, i == 1 ? RED808_ACCENT : RED808_CYAN, 0);
-        lv_obj_set_pos(name, x, global_y);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(name, globals[i].color, 0);
+        lv_obj_set_pos(name, x, global_y + 12);
 
         *globals[i].label = lv_label_create(scr_volumes);
         lv_label_set_text_fmt(*globals[i].label, "%d", globals[i].value);
-        lv_obj_set_style_text_font(*globals[i].label, &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_font(*globals[i].label, &lv_font_montserrat_24, 0);
         lv_obj_set_style_text_color(*globals[i].label, RED808_TEXT, 0);
-        lv_obj_set_pos(*globals[i].label, x + label_w + slider_w + 10, global_y + 10);
+        lv_obj_set_pos(*globals[i].label, x + label_w + slider_w + 10, global_y + 8);
 
         *globals[i].slider = lv_slider_create(scr_volumes);
-        lv_obj_set_size(*globals[i].slider, slider_w, 18);
+        lv_obj_set_size(*globals[i].slider, slider_w, 16);
         lv_obj_set_pos(*globals[i].slider, x + label_w, global_y + 16);
         lv_slider_set_range(*globals[i].slider, i == 1 ? 40 : 0, globals[i].max);
         lv_slider_set_value(*globals[i].slider, globals[i].value, LV_ANIM_OFF);
         lv_obj_set_style_bg_color(*globals[i].slider, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
         lv_obj_set_style_bg_opa(*globals[i].slider, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(*globals[i].slider, i == 1 ? RED808_ACCENT : RED808_CYAN, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(*globals[i].slider, globals[i].color, LV_PART_INDICATOR);
         lv_obj_set_style_bg_opa(*globals[i].slider, LV_OPA_COVER, LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(*globals[i].slider, lv_color_white(), LV_PART_KNOB);
         lv_obj_set_style_bg_opa(*globals[i].slider, LV_OPA_COVER, LV_PART_KNOB);
-        lv_obj_set_style_pad_all(*globals[i].slider, 10, LV_PART_KNOB);
+        lv_obj_set_style_pad_all(*globals[i].slider, 9, LV_PART_KNOB);
         lv_obj_set_style_radius(*globals[i].slider, LV_RADIUS_CIRCLE, LV_PART_KNOB);
         lv_obj_add_event_cb(*globals[i].slider, mix_global_slider_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)(i == 0 ? 0 : 3));
     }
@@ -5182,6 +5301,23 @@ static void show_midi_load_summary(const char* title, int slot,
     lv_obj_set_style_text_font(l1, &lv_font_montserrat_18, 0);
     lv_obj_align(l1, LV_ALIGN_TOP_LEFT, 20, 96);
 
+    // If STD import found no drum track and fell back to mapping every channel
+    // onto the drum pads, the grid is only an approximation — say so plainly so
+    // the result doesn't look like it was "invented".
+    if (mem_midi::last_load_used_channel_fallback()) {
+        lv_obj_set_style_border_color(card, RED808_WARNING, 0);
+        lv_label_set_text(t, LV_SYMBOL_WARNING "  MIDI Loaded (approx)");
+        lv_obj_set_style_text_color(t, RED808_WARNING, 0);
+        lv_obj_t* warn = lv_label_create(card);
+        lv_label_set_text(warn,
+            LV_SYMBOL_WARNING "  Sin pista de bateria (canal 10):\n"
+            "se han mapeado las notas melodicas a los pads.");
+        lv_obj_set_style_text_color(warn, RED808_WARNING, 0);
+        lv_obj_set_style_text_font(warn, &lv_font_montserrat_16, 0);
+        lv_obj_align(warn, LV_ALIGN_TOP_LEFT, 20, 200);
+        ui_show_toast("MIDI sin bateria: mapeo aproximado", RED808_WARNING);
+    }
+
     lv_obj_t* ok = lv_btn_create(card);
     lv_obj_set_size(ok, 240, 56);
     lv_obj_align(ok, LV_ALIGN_BOTTOM_MID, 0, -18);
@@ -5310,6 +5446,7 @@ static void sd_midi_load_btn_cb(lv_event_t* e) {
 
 static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUpload) {
     if (p4sd.selected_file[0] == '\0' || p4sd.selected_is_midi) return false;
+    if (s_ui_busy) return false;   // an upload is already running
 
     int xtraSlot = -1;
     if (s_xtra_pending_slot >= 0 && s_xtra_pending_slot < 4) {
@@ -5324,12 +5461,16 @@ static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUplo
         lv_obj_set_style_text_color(sd_status_lbl, RED808_CYAN, 0);
     }
 
+    ui_busy_show(triggerAfterUpload ? "Preparando preview en el Master..."
+                                    : "Subiendo WAV al Master...\nEspera, no cambies de pantalla.");
+
     char path[192];
     if (strcmp(p4sd.path, "/") == 0) snprintf(path, sizeof(path), "/%s", p4sd.selected_file);
     else snprintf(path, sizeof(path), "%s/%s", p4sd.path, p4sd.selected_file);
 
     File sample = SD_MMC.open(path, FILE_READ);
     if (!sample) {
+        ui_busy_hide();
         ui_show_toast("No se puede abrir el WAV", RED808_WARNING);
         if (sd_status_lbl) lv_label_set_text(sd_status_lbl, "OPEN FAILED");
         return false;
@@ -5338,6 +5479,7 @@ static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUplo
     size_t sample_size = sample.size();
     if (sample_size == 0 || sample_size > 4U * 1024U * 1024U) {
         sample.close();
+        ui_busy_hide();
         ui_show_toast("WAV no valido o demasiado grande", RED808_WARNING);
         if (sd_status_lbl) lv_label_set_text(sd_status_lbl, "WAV INVALID");
         return false;
@@ -5347,6 +5489,7 @@ static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUplo
     client.setTimeout(10000);
     if (!client.connect(IPAddress(192, 168, 4, 1), 80)) {
         sample.close();
+        ui_busy_hide();
         ui_show_toast("Master no conectado", RED808_WARNING);
         if (sd_status_lbl) lv_label_set_text(sd_status_lbl, "MASTER OFFLINE");
         return false;
@@ -5396,6 +5539,7 @@ static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUplo
     client.stop();
 
     if (!(write_ok && status == 200)) {
+        ui_busy_hide();
         char msg[64];
         if (!write_ok) snprintf(msg, sizeof(msg), "Upload cortado");
         else snprintf(msg, sizeof(msg), "Upload fallido HTTP %d", status);
@@ -5406,6 +5550,8 @@ static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUplo
         }
         return false;
     }
+
+    ui_busy_hide();
 
     if (triggerAfterUpload && udp_wifi_connected()) {
         udp_send_trigger(p4sd.selected_pad, 110);
@@ -8251,7 +8397,7 @@ static void ui_reload_themed_screens(void) {
     grid_mstr_dot = NULL; grid_mstr_lbl = NULL;
     grid_aux_dot  = NULL; grid_aux_lbl  = NULL;
     grid_vol_lbl = NULL; grid_sync_btn = NULL;
-    grid_home_vol_lbl = NULL;
+    grid_home_vol_lbl = NULL; grid_home_status_cell = NULL;
     grid_pad_prev_btn = NULL;
     grid_pad_next_btn = NULL;
     grid_pad_lbl = NULL;
@@ -8350,6 +8496,10 @@ static void ui_reload_themed_screens(void) {
 }
 
 void ui_navigate_to(int screen_id) {
+    // Don't let the user leave the screen while a blocking op (e.g. WAV upload)
+    // is running — the result toast would otherwise land on the wrong screen.
+    if (s_ui_busy) return;
+
     lv_obj_t* targets[] = {
         scr_boot, NULL, scr_live, scr_sequencer, NULL,
         NULL, scr_performance, scr_volumes, scr_fx, scr_sdcard,

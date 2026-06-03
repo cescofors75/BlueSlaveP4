@@ -104,6 +104,10 @@ struct RawEvt { uint32_t tick; uint8_t trk; };
 static RawEvt* s_evbuf = nullptr;
 static int     s_evcount = 0;
 static bool    s_evbuf_overflow = false;
+// Set when an STD-mode (channel 9 only) load found no drum track and had to
+// reparse every channel, mapping melodic notes onto drum pads. The UI surfaces
+// this so the user knows the imported grid is an approximation, not 1:1.
+static bool    s_used_ch_fallback = false;
 
 static bool ensure_evbuf() {
     if (s_evbuf) return true;
@@ -399,13 +403,16 @@ bool load_pattern_raw(const char* path,
     // Mode 1 (STD): only GM channel 9 (drum kit). If that yields zero
     //               events, fall back to all-channels so the user still
     //               gets something audible.
+    s_used_ch_fallback = false;
     int primary_filter = (mode == 1) ? 9 : -2;
     uint16_t tpq = parseFile(SPIFFS, path, primary_filter, &tempo_us);
     if (tpq == 0) return false;
     if (s_evcount == 0) {
         s_evcount = 0;
         s_evbuf_overflow = false;
-        // Fallback: -1 (legacy any-channel, same path as load_pattern)
+        // Fallback: -1 (legacy any-channel, same path as load_pattern). Only a
+        // real "approximation" in STD mode — PRO mode already merges channels.
+        if (mode == 1) s_used_ch_fallback = true;
         tpq = parseFile(SPIFFS, path, -1, &tempo_us);
         if (tpq == 0) return false;
     }
@@ -460,12 +467,14 @@ bool load_pattern_raw_from_fs(fs::FS& storage,
         return false;
     }
 
+    s_used_ch_fallback = false;
     int primary_filter = (mode == 1) ? 9 : -2;
     uint16_t tpq = parseFile(storage, path, primary_filter, &tempo_us);
     if (tpq == 0) return false;
     if (s_evcount == 0) {
         s_evcount = 0;
         s_evbuf_overflow = false;
+        if (mode == 1) s_used_ch_fallback = true;
         tpq = parseFile(storage, path, -1, &tempo_us);
         if (tpq == 0) return false;
     }
@@ -531,6 +540,10 @@ int list_midi_files_from_fs(fs::FS& storage, const char* dir, char names[][48], 
         f = d.openNextFile();
     }
     return count;
+}
+
+bool last_load_used_channel_fallback() {
+    return s_used_ch_fallback;
 }
 
 }  // namespace mem_midi

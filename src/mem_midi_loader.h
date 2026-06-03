@@ -68,4 +68,9 @@ bool load_pattern_raw(const char* path,
 // no extension) truncated to 47 chars. Returns the count written (<= cap).
 int list_midi_files(const char* dir, char names[][48], int cap);
 
+// True if the most recent load_pattern_raw* call had to fall back from the
+// requested drum channel to an all-channel parse (STD mode only), meaning the
+// resulting grid is an approximation mapping melodic notes onto drum pads.
+bool last_load_used_channel_fallback();
+
 }  // namespace mem_midi
