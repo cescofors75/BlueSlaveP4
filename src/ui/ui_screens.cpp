@@ -603,7 +603,8 @@ static void create_boot_screen(void) {
     lv_obj_set_style_text_color(sub, RED808_TEXT_DIM, 0);
     lv_obj_align(sub, LV_ALIGN_CENTER, 0, 20);
 
-    lv_obj_t* spinner = lv_spinner_create(scr_boot, 1000, 60);
+    lv_obj_t* spinner = lv_spinner_create(scr_boot);
+    lv_spinner_set_anim_params(spinner, 1000, 60);
     lv_obj_set_size(spinner, 60, 60);
     lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 80);
 }
@@ -672,7 +673,7 @@ static lv_obj_t*  s_xtra_info_lbl         = NULL; // filename / sr / dur
 static lv_obj_t*  s_xtra_trim_lbl         = NULL; // "TRIM 12%..88%"
 static lv_obj_t*  s_xtra_fade_lbl         = NULL; // "FADE IN 20ms  OUT 50ms"
 static constexpr int XTRA_WAVE_COLS = 120;
-static lv_point_t s_xtra_wave_pts[XTRA_WAVE_COLS * 2 + 2];
+static lv_point_precise_t s_xtra_wave_pts[XTRA_WAVE_COLS * 2 + 2];
 static float      s_xtra_env[XTRA_WAVE_COLS];
 static lv_obj_t* s_pad_inst_modal = NULL;
 static lv_obj_t* s_pad_inst_modal_pad_lbl = NULL;
@@ -3819,7 +3820,8 @@ static void seq_pattern_modal_show(int pattern) {
     lv_obj_clear_flag(seq_pattern_modal, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(seq_pattern_modal, LV_OBJ_FLAG_CLICKABLE);
 
-    seq_pattern_modal_spin = lv_spinner_create(seq_pattern_modal, 1000, 60);
+    seq_pattern_modal_spin = lv_spinner_create(seq_pattern_modal);
+    lv_spinner_set_anim_params(seq_pattern_modal_spin, 1000, 60);
     lv_obj_set_size(seq_pattern_modal_spin, 32, 32);
     lv_obj_align(seq_pattern_modal_spin, LV_ALIGN_LEFT_MID, 6, 0);
     lv_obj_set_style_arc_color(seq_pattern_modal_spin, RED808_CYAN, LV_PART_INDICATOR);
@@ -7426,7 +7428,7 @@ static lv_obj_t* s_pp_title_lbl = NULL;
 static lv_obj_t* s_pp_wave_card = NULL;
 static lv_obj_t* s_pp_wave_line = NULL;
 static lv_obj_t* s_pp_wave_lbl = NULL;
-static lv_point_t s_pp_wave_points[96] = {};
+static lv_point_precise_t s_pp_wave_points[96] = {};
 static bool      s_pp_from_xtra = false;
 static int       s_pp_xtra_slot = -1;
 
