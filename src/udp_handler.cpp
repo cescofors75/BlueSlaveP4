@@ -398,7 +398,10 @@ static bool fetch_pattern_http(int pattern) {
     snprintf(url, sizeof(url), "http://192.168.4.1/api/getPattern?index=%d", pattern);
 
     HTTPClient http;
-    http.setTimeout(900);
+    // Keep the timeout short: these fetches run inline on the Core 1 main loop,
+    // so a long stall here freezes pad/UART/step-clock handling. The UDP
+    // get_pattern/state path is authoritative; HTTP is only a best-effort assist.
+    http.setTimeout(150);
     if (!http.begin(url)) return false;
 
     int code = http.GET();
@@ -449,7 +452,10 @@ static bool fetch_master_state_http(void) {
     if (!wifiConnected) return false;
 
     HTTPClient http;
-    http.setTimeout(900);
+    // Keep the timeout short: these fetches run inline on the Core 1 main loop,
+    // so a long stall here freezes pad/UART/step-clock handling. The UDP
+    // get_pattern/state path is authoritative; HTTP is only a best-effort assist.
+    http.setTimeout(150);
     if (!http.begin("http://192.168.4.1/api/p4State")) return false;
 
     int code = http.GET();
@@ -1574,7 +1580,9 @@ static void processJson(const char* json, int len) {
     else if (strcmp(cmd, "setSampleRate") == 0) {
         unsigned long nowMs = millis();
         if (!is_fx_owned_recent(FX_OWN_SAMPLE_RATE, nowMs)) {
-            p4.sample_rate_hz = clamp_int(doc["value"] | 44100, 1000, 44100);
+            // Match the rest of the FX pipeline: 0 = bypass/off, else 9000..32000.
+            int sr = doc["value"] | p4.sample_rate_hz;
+            p4.sample_rate_hz = (sr <= 0) ? 0 : clamp_int(sr, 9000, 32000);
             forward_fx_samplerate_to_s3(p4.sample_rate_hz);
         }
     }
@@ -1703,10 +1711,16 @@ static void run_local_step_clock(unsigned long now) {
     uint32_t stepIntervalUs = (uint32_t)(60000000.0f / bpm / 4.0f); // 16ths
     uint32_t nowUs = micros();
     if ((uint32_t)(nowUs - lastStepUs) >= stepIntervalUs) {
+        // Bounded catch-up: after a long stall (e.g. a transient network hiccup)
+        // nowUs-lastStepUs can be huge. Cap the advance to one bar (16 steps) so
+        // we never spin thousands of iterations or burst SYS_STEP packets.
+        int guard = 16;
         do {
             lastStepUs += stepIntervalUs;
             p4.current_step = (p4.current_step + 1) % 16;
-        } while ((uint32_t)(nowUs - lastStepUs) >= stepIntervalUs);
+        } while (--guard > 0 && (uint32_t)(nowUs - lastStepUs) >= stepIntervalUs);
+        // If still behind after the cap, snap the phase to now.
+        if ((uint32_t)(nowUs - lastStepUs) >= stepIntervalUs) lastStepUs = nowUs;
         uart_send_to_s3(MSG_SYSTEM, SYS_STEP, (uint8_t)p4.current_step);
     }
 }
