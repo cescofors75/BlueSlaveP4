@@ -47,16 +47,26 @@
 
 // =============================================================================
 // PERFORMANCE / MONITORS
+// FPS/CPU overlay is opt-in via -DP4_PERF_OVERLAY (set in the diag env) so the
+// production UI stays clean. Use it to measure before/after PPA work.
 // =============================================================================
-#define LV_USE_SYSMON         0
-#define LV_USE_PERF_MONITOR   0
-#define LV_USE_MEM_MONITOR    0
+#ifdef P4_PERF_OVERLAY
+    #define LV_USE_SYSMON         1
+    #define LV_USE_PERF_MONITOR   1
+    #define LV_USE_MEM_MONITOR    1
+#else
+    #define LV_USE_SYSMON         0
+    #define LV_USE_PERF_MONITOR   0
+    #define LV_USE_MEM_MONITOR    0
+#endif
 
 // =============================================================================
-// DRAW — enable radial/conical gradients (used for the boot halo and knobs).
-// Costs some CPU on the software renderer; fine for our static/low-rate usage.
+// DRAW — radial/conical gradients (boot halo + FX knob faces). 3 stops lets a
+// conical sweep be symmetric (dark->colour->dark) without a hard seam.
 // =============================================================================
 #define LV_USE_DRAW_SW_COMPLEX_GRADIENTS  1
+#define LV_GRADIENT_MAX_STOPS             3
+#define LV_USE_SCALE                      1
 
 // =============================================================================
 // FONTS

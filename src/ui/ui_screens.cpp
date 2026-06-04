@@ -3198,6 +3198,9 @@ static int fx_view_mode = 0;
 
 static lv_obj_t* fx_cards[FX_CARD_COUNT]       = {};
 static lv_obj_t* fx_arcs[FX_CARD_COUNT]        = {};
+// Conical-gradient knob faces (one descriptor per FX card; kept at file scope
+// because LVGL stores a pointer to it, not a copy).
+static lv_grad_dsc_t s_fx_knob_grad[FX_CARD_COUNT];
 static lv_obj_t* fx_value_labels[FX_CARD_COUNT]= {};
 static lv_obj_t* fx_name_labels[FX_CARD_COUNT] = {};
 static lv_obj_t* fx_src_labels[FX_CARD_COUNT]  = {};
@@ -3656,6 +3659,37 @@ static void create_fx_screen(void) {
         lv_obj_set_width(fx_src_labels[cell], 320);
         lv_obj_set_style_text_align(fx_src_labels[cell], LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_align(fx_src_labels[cell], LV_ALIGN_TOP_MID, 0, 42);
+
+        // ── Conical-gradient knob face (rotary look) — sits inside the arc ──
+        // Symmetric dark→colour→dark sweep (3 stops) so there's no hard seam;
+        // the bright lobe peaks at the top (270° in LVGL's angle convention).
+        {
+            lv_grad_dsc_t& kg = s_fx_knob_grad[cell];
+            lv_color_t fxc = lv_color_hex(fx_colors[cell]);
+            const int KD = 152;                 // knob-face diameter
+            kg.dir = LV_GRAD_DIR_CONICAL;
+            kg.extend = LV_GRAD_EXTEND_PAD;
+            kg.stops_count = 3;
+            kg.stops[0].color = RED808_SURFACE; kg.stops[0].opa = LV_OPA_COVER; kg.stops[0].frac = 0;
+            kg.stops[1].color = fxc;            kg.stops[1].opa = LV_OPA_COVER; kg.stops[1].frac = 191; // ~270°→top
+            kg.stops[2].color = RED808_SURFACE; kg.stops[2].opa = LV_OPA_COVER; kg.stops[2].frac = 255;
+            kg.params.conical.center.x = KD / 2;
+            kg.params.conical.center.y = KD / 2;
+            kg.params.conical.start_angle = 0;
+            kg.params.conical.end_angle   = 3600;   // full sweep (0.1° units)
+
+            lv_obj_t* knob_face = lv_obj_create(card);
+            lv_obj_remove_style_all(knob_face);
+            lv_obj_set_size(knob_face, KD, KD);
+            lv_obj_align(knob_face, LV_ALIGN_CENTER, 0, -18);   // concentric with the arc
+            lv_obj_set_style_radius(knob_face, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_opa(knob_face, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_grad(knob_face, &kg, 0);
+            lv_obj_set_style_border_width(knob_face, 2, 0);
+            lv_obj_set_style_border_color(knob_face, RED808_BG, 0);
+            lv_obj_clear_flag(knob_face, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(knob_face, LV_OBJ_FLAG_CLICKABLE);
+        }
 
         // ── BIG ARC (neon circle indicator) ──
         fx_arcs[cell] = lv_arc_create(card);
