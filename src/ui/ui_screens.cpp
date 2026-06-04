@@ -7320,7 +7320,7 @@ static lv_obj_t* s_pp_title_lbl = NULL;
 static lv_obj_t* s_pp_wave_card = NULL;
 static lv_obj_t* s_pp_wave_line = NULL;
 static lv_obj_t* s_pp_wave_lbl = NULL;
-static lv_point_t s_pp_wave_points[96] = {};
+static lv_point_precise_t s_pp_wave_points[96] = {};
 static bool      s_pp_from_xtra = false;
 static int       s_pp_xtra_slot = -1;
 
