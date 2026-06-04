@@ -586,10 +586,50 @@ void ui_update_header(void) {
 // =============================================================================
 // BOOT SCREEN
 // =============================================================================
+// Radial gradient descriptor for the boot halo. Must outlive the object since
+// LVGL stores a pointer to it (not a copy), so keep it at file scope.
+static lv_grad_dsc_t s_boot_halo_grad;
+
 static void create_boot_screen(void) {
     scr_boot = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_boot, RED808_BG, 0);
     lv_obj_clear_flag(scr_boot, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ── Radial glow halo behind the logo (LVGL 9 radial gradient + additive
+    // blend). Bright cyan at the centre fading to transparent at the edge; the
+    // additive blend makes it read as emitted light over the dark background.
+    {
+        const int R = 190;  // halo radius (object is 2R x 2R)
+        s_boot_halo_grad.dir = LV_GRAD_DIR_RADIAL;
+        s_boot_halo_grad.extend = LV_GRAD_EXTEND_PAD;
+        s_boot_halo_grad.stops_count = 2;
+        s_boot_halo_grad.stops[0].color = RED808_CYAN;
+        s_boot_halo_grad.stops[0].opa   = LV_OPA_70;  // soft centre keeps title readable
+        s_boot_halo_grad.stops[0].frac  = 0;     // centre: brightest
+        s_boot_halo_grad.stops[1].color = RED808_CYAN;
+        s_boot_halo_grad.stops[1].opa   = LV_OPA_TRANSP;
+        s_boot_halo_grad.stops[1].frac  = 255;   // edge: transparent
+        // Concentric radial: focal circle radius 0 at centre, end circle radius R.
+        s_boot_halo_grad.params.radial.focal.x = R;
+        s_boot_halo_grad.params.radial.focal.y = R;
+        s_boot_halo_grad.params.radial.focal_extent.x = R;
+        s_boot_halo_grad.params.radial.focal_extent.y = R;
+        s_boot_halo_grad.params.radial.end.x = R;
+        s_boot_halo_grad.params.radial.end.y = R;
+        s_boot_halo_grad.params.radial.end_extent.x = 2 * R;  // distance R from centre
+        s_boot_halo_grad.params.radial.end_extent.y = R;
+
+        lv_obj_t* halo = lv_obj_create(scr_boot);
+        lv_obj_remove_style_all(halo);
+        lv_obj_set_size(halo, 2 * R, 2 * R);
+        lv_obj_align(halo, LV_ALIGN_CENTER, 0, -10);
+        lv_obj_set_style_radius(halo, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(halo, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_grad(halo, &s_boot_halo_grad, 0);
+        lv_obj_set_style_blend_mode(halo, LV_BLEND_MODE_ADDITIVE, 0);
+        lv_obj_clear_flag(halo, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(halo, LV_OBJ_FLAG_CLICKABLE);
+    }
 
     lv_obj_t* title = lv_label_create(scr_boot);
     lv_label_set_text(title, "BLUE808 SLAVE P4");
@@ -618,6 +658,7 @@ static lv_obj_t* live_pad_num_labels[16] = {};
 static lv_obj_t* live_pad_state_labels[16] = {};
 static lv_obj_t* live_pad_inst_labels[16] = {};
 static lv_obj_t* live_pad_accent_strips[16] = {};
+static lv_obj_t* live_pad_glow[16] = {};       // additive-blend glow overlay per pad
 static lv_obj_t* live_spectrum_bars[16] = {};  // spectrum bar per pad (bottom of pad)
 static lv_obj_t* live_home_panels[24] = {};
 static int       live_home_panel_count = 0;
@@ -2218,6 +2259,10 @@ static void apply_pad_layout(int mode) {
             int c = i % cols, r = i / cols;
             lv_obj_set_size(live_pad_btns[i], pw, ph);
             lv_obj_set_pos(live_pad_btns[i], M + c*(pw+G), M + r*(ph+G));
+            if (live_pad_glow[i]) {
+                lv_obj_set_size(live_pad_glow[i], pw, ph);  // keep glow full-pad
+                lv_obj_center(live_pad_glow[i]);
+            }
             lv_obj_clear_flag(live_pad_btns[i], LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(live_pad_btns[i]);
         } else {
@@ -2351,6 +2396,20 @@ static void create_live_screen(void) {
         lv_obj_set_style_pad_all(live_pad_btns[i], 0, 0);
         lv_obj_clear_flag(live_pad_btns[i], LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(live_pad_btns[i], pad_touch_cb, LV_EVENT_PRESSED, (void*)(intptr_t)i);
+
+        // Additive-blend glow overlay — bottom-most child so labels stay on top.
+        // Idle = transparent; update_live_screen drives its opacity from the
+        // pad's velocity "band" so a hit makes the pad emit light toward white.
+        live_pad_glow[i] = lv_obj_create(live_pad_btns[i]);
+        lv_obj_remove_style_all(live_pad_glow[i]);
+        lv_obj_set_size(live_pad_glow[i], CW, CH);
+        lv_obj_center(live_pad_glow[i]);
+        lv_obj_set_style_radius(live_pad_glow[i], 12, 0);
+        lv_obj_set_style_bg_color(live_pad_glow[i], tc, 0);
+        lv_obj_set_style_bg_opa(live_pad_glow[i], LV_OPA_TRANSP, 0);
+        lv_obj_set_style_blend_mode(live_pad_glow[i], LV_BLEND_MODE_ADDITIVE, 0);
+        lv_obj_clear_flag(live_pad_glow[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(live_pad_glow[i], LV_OBJ_FLAG_CLICKABLE);
 
         live_pad_accent_strips[i] = lv_obj_create(live_pad_btns[i]);
         lv_obj_set_size(live_pad_accent_strips[i], 6, CH - 24);
@@ -2758,6 +2817,15 @@ static void update_live_screen(void) {
         pad_prev_band[i] = band;
 
         lv_color_t tc = ui_track_color(i);
+
+        // Additive glow overlay tracks the band: brighter hit = stronger glow.
+        if (live_pad_glow[i]) {
+            lv_opa_t g = (muted || band == 0)
+                             ? LV_OPA_TRANSP
+                             : (lv_opa_t)(40 + (band * 215) / 7);  // band7 → 255
+            if (!muted) lv_obj_set_style_bg_color(live_pad_glow[i], tc, 0);
+            lv_obj_set_style_bg_opa(live_pad_glow[i], g, 0);
+        }
 
         if (muted) {
             lv_obj_set_style_bg_color(live_pad_btns[i], RED808_SURFACE, 0);

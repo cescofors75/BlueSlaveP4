@@ -53,6 +53,12 @@
 #define LV_USE_MEM_MONITOR    0
 
 // =============================================================================
+// DRAW — enable radial/conical gradients (used for the boot halo and knobs).
+// Costs some CPU on the software renderer; fine for our static/low-rate usage.
+// =============================================================================
+#define LV_USE_DRAW_SW_COMPLEX_GRADIENTS  1
+
+// =============================================================================
 // FONTS
 // =============================================================================
 #define LV_FONT_MONTSERRAT_10  1
