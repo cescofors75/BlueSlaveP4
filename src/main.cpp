@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <SPIFFS.h>
+#include <lvgl.h>
 #include "../include/config.h"
 #include "drivers/display_init.h"
 #include "drivers/lvgl_port.h"
@@ -23,6 +24,10 @@
 void setup() {
     // 1. Debug serial (only waits if debug logging is enabled)
     Serial.begin(115200);
+    // Unconditional boot banner — prints regardless of debug flags so you can
+    // confirm which firmware is actually running and that LVGL 9 is live.
+    Serial.printf("\n=== BlueSlaveP4 boot | LVGL %d.%d.%d ===\n",
+                  LVGL_VERSION_MAJOR, LVGL_VERSION_MINOR, LVGL_VERSION_PATCH);
 #if P4_ENABLE_DEBUG_LOG
     delay(500);
     Serial.println("\n=== RED808 P4 — Visual Beast ===");
