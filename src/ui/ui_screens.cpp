@@ -548,7 +548,8 @@ static void create_boot_screen(void) {
     lv_obj_set_style_text_color(sub, RED808_TEXT_DIM, 0);
     lv_obj_align(sub, LV_ALIGN_CENTER, 0, 20);
 
-    lv_obj_t* spinner = lv_spinner_create(scr_boot, 1000, 60);
+    lv_obj_t* spinner = lv_spinner_create(scr_boot);
+    lv_spinner_set_anim_params(spinner, 1000, 60);
     lv_obj_set_size(spinner, 60, 60);
     lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 80);
 }
@@ -3690,7 +3691,8 @@ static void seq_pattern_modal_show(int pattern) {
     lv_obj_clear_flag(seq_pattern_modal, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(seq_pattern_modal, LV_OBJ_FLAG_CLICKABLE);
 
-    seq_pattern_modal_spin = lv_spinner_create(seq_pattern_modal, 1000, 60);
+    seq_pattern_modal_spin = lv_spinner_create(seq_pattern_modal);
+    lv_spinner_set_anim_params(seq_pattern_modal_spin, 1000, 60);
     lv_obj_set_size(seq_pattern_modal_spin, 32, 32);
     lv_obj_align(seq_pattern_modal_spin, LV_ALIGN_LEFT_MID, 6, 0);
     lv_obj_set_style_arc_color(seq_pattern_modal_spin, RED808_CYAN, LV_PART_INDICATOR);
