@@ -4821,6 +4821,7 @@ static lv_obj_t* vol_labels[16] = {};
 static lv_obj_t* vol_name_labels[16] = {};
 static lv_obj_t* vol_mute_dots[16] = {};
 static lv_obj_t* vol_strip_panels[16] = {};
+static lv_obj_t* vol_vu_bars[16] = {};   // per-channel VU meter (driven by dsp spectrum)
 static lv_obj_t* mix_master_slider = NULL;
 static lv_obj_t* mix_seq_slider = NULL;
 static lv_obj_t* mix_live_slider = NULL;
@@ -5015,6 +5016,23 @@ static void create_volumes_screen(void) {
         lv_obj_set_style_border_width(vol_sliders[i], 2, LV_PART_KNOB);
         lv_obj_add_event_cb(vol_sliders[i], vol_slider_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)i);
 
+        // VU meter — thin vertical bar just right of the fader. Driven by the
+        // dsp spectrum (synthetic today; real once audio FFT lands). lv_bar is
+        // vertical automatically because height > width, and fills bottom-up.
+        vol_vu_bars[i] = lv_bar_create(scr_volumes);
+        lv_obj_set_size(vol_vu_bars[i], 6, slider_h);
+        lv_obj_set_pos(vol_vu_bars[i], cx + 10, y_sl);
+        lv_bar_set_range(vol_vu_bars[i], 0, 255);
+        lv_bar_set_value(vol_vu_bars[i], 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(vol_vu_bars[i], lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(vol_vu_bars[i], LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(vol_vu_bars[i], 2, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(vol_vu_bars[i], RED808_SUCCESS, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(vol_vu_bars[i], LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(vol_vu_bars[i], 2, LV_PART_INDICATOR);
+        lv_obj_clear_flag(vol_vu_bars[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(vol_vu_bars[i], LV_OBJ_FLAG_SCROLLABLE);
+
         // Color bar at bottom of slider
         lv_obj_t* color_bar = lv_obj_create(scr_volumes);
         lv_obj_set_size(color_bar, strip_w - 6, 3);
@@ -5067,6 +5085,24 @@ static void update_volumes_screen(void) {
         prev_bpm = p4.bpm_int;
         lv_slider_set_value(mix_bpm_slider, p4.bpm_int, LV_ANIM_OFF);
         if (mix_bpm_lbl) lv_label_set_text_fmt(mix_bpm_lbl, "%d", p4.bpm_int);
+    }
+
+    // VU meters — push the current dsp spectrum level into each channel bar,
+    // green normally and red when it's hot. Only repaint a bar when its level
+    // actually changes, keeping partial refresh cheap.
+    {
+        static uint8_t prev_vu[16] = {};
+        SpectrumData sp;
+        dsp_get_spectrum(&sp);
+        for (int i = 0; i < 16; i++) {
+            if (!vol_vu_bars[i]) continue;
+            uint8_t lvl = p4.track_muted[i] ? 0 : sp.bars[i];
+            if (lvl == prev_vu[i]) continue;
+            prev_vu[i] = lvl;
+            lv_bar_set_value(vol_vu_bars[i], lvl, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(vol_vu_bars[i],
+                (lvl > 210) ? RED808_ERROR : RED808_SUCCESS, LV_PART_INDICATOR);
+        }
     }
 
     for (int i = 0; i < 16; i++) {
