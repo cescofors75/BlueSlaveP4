@@ -8,7 +8,12 @@
 #ifndef LV_CONF_H
 #define LV_CONF_H
 
+// LVGL 9 pulls lv_conf.h into its .S assembly files (via lv_conf_internal.h).
+// The assembler can't parse C headers, so keep <stdint.h> out of that path.
+// The .S files define __ASSEMBLY__ before including; guard accordingly.
+#ifndef __ASSEMBLY__
 #include <stdint.h>
+#endif
 
 // =============================================================================
 // COLOR
