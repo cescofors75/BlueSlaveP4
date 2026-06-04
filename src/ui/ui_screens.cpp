@@ -3198,6 +3198,9 @@ static int fx_view_mode = 0;
 
 static lv_obj_t* fx_cards[FX_CARD_COUNT]       = {};
 static lv_obj_t* fx_arcs[FX_CARD_COUNT]        = {};
+// Conical-gradient knob faces (one descriptor per FX card; kept at file scope
+// because LVGL stores a pointer to it, not a copy).
+static lv_grad_dsc_t s_fx_knob_grad[FX_CARD_COUNT];
 static lv_obj_t* fx_value_labels[FX_CARD_COUNT]= {};
 static lv_obj_t* fx_name_labels[FX_CARD_COUNT] = {};
 static lv_obj_t* fx_src_labels[FX_CARD_COUNT]  = {};
@@ -3656,6 +3659,37 @@ static void create_fx_screen(void) {
         lv_obj_set_width(fx_src_labels[cell], 320);
         lv_obj_set_style_text_align(fx_src_labels[cell], LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_align(fx_src_labels[cell], LV_ALIGN_TOP_MID, 0, 42);
+
+        // ── Conical-gradient knob face (rotary look) — sits inside the arc ──
+        // Symmetric dark→colour→dark sweep (3 stops) so there's no hard seam;
+        // the bright lobe peaks at the top (270° in LVGL's angle convention).
+        {
+            lv_grad_dsc_t& kg = s_fx_knob_grad[cell];
+            lv_color_t fxc = lv_color_hex(fx_colors[cell]);
+            const int KD = 152;                 // knob-face diameter
+            kg.dir = LV_GRAD_DIR_CONICAL;
+            kg.extend = LV_GRAD_EXTEND_PAD;
+            kg.stops_count = 3;
+            kg.stops[0].color = RED808_SURFACE; kg.stops[0].opa = LV_OPA_COVER; kg.stops[0].frac = 0;
+            kg.stops[1].color = fxc;            kg.stops[1].opa = LV_OPA_COVER; kg.stops[1].frac = 191; // ~270°→top
+            kg.stops[2].color = RED808_SURFACE; kg.stops[2].opa = LV_OPA_COVER; kg.stops[2].frac = 255;
+            kg.params.conical.center.x = KD / 2;
+            kg.params.conical.center.y = KD / 2;
+            kg.params.conical.start_angle = 0;
+            kg.params.conical.end_angle   = 3600;   // full sweep (0.1° units)
+
+            lv_obj_t* knob_face = lv_obj_create(card);
+            lv_obj_remove_style_all(knob_face);
+            lv_obj_set_size(knob_face, KD, KD);
+            lv_obj_align(knob_face, LV_ALIGN_CENTER, 0, -18);   // concentric with the arc
+            lv_obj_set_style_radius(knob_face, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_opa(knob_face, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_grad(knob_face, &kg, 0);
+            lv_obj_set_style_border_width(knob_face, 2, 0);
+            lv_obj_set_style_border_color(knob_face, RED808_BG, 0);
+            lv_obj_clear_flag(knob_face, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(knob_face, LV_OBJ_FLAG_CLICKABLE);
+        }
 
         // ── BIG ARC (neon circle indicator) ──
         fx_arcs[cell] = lv_arc_create(card);
@@ -4787,6 +4821,7 @@ static lv_obj_t* vol_labels[16] = {};
 static lv_obj_t* vol_name_labels[16] = {};
 static lv_obj_t* vol_mute_dots[16] = {};
 static lv_obj_t* vol_strip_panels[16] = {};
+static lv_obj_t* vol_vu_bars[16] = {};   // per-channel VU meter (driven by dsp spectrum)
 static lv_obj_t* mix_master_slider = NULL;
 static lv_obj_t* mix_seq_slider = NULL;
 static lv_obj_t* mix_live_slider = NULL;
@@ -4981,6 +5016,23 @@ static void create_volumes_screen(void) {
         lv_obj_set_style_border_width(vol_sliders[i], 2, LV_PART_KNOB);
         lv_obj_add_event_cb(vol_sliders[i], vol_slider_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)i);
 
+        // VU meter — thin vertical bar just right of the fader. Driven by the
+        // dsp spectrum (synthetic today; real once audio FFT lands). lv_bar is
+        // vertical automatically because height > width, and fills bottom-up.
+        vol_vu_bars[i] = lv_bar_create(scr_volumes);
+        lv_obj_set_size(vol_vu_bars[i], 6, slider_h);
+        lv_obj_set_pos(vol_vu_bars[i], cx + 10, y_sl);
+        lv_bar_set_range(vol_vu_bars[i], 0, 255);
+        lv_bar_set_value(vol_vu_bars[i], 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(vol_vu_bars[i], lv_color_hex(0x1E1E1E), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(vol_vu_bars[i], LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(vol_vu_bars[i], 2, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(vol_vu_bars[i], RED808_SUCCESS, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(vol_vu_bars[i], LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(vol_vu_bars[i], 2, LV_PART_INDICATOR);
+        lv_obj_clear_flag(vol_vu_bars[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(vol_vu_bars[i], LV_OBJ_FLAG_SCROLLABLE);
+
         // Color bar at bottom of slider
         lv_obj_t* color_bar = lv_obj_create(scr_volumes);
         lv_obj_set_size(color_bar, strip_w - 6, 3);
@@ -5033,6 +5085,24 @@ static void update_volumes_screen(void) {
         prev_bpm = p4.bpm_int;
         lv_slider_set_value(mix_bpm_slider, p4.bpm_int, LV_ANIM_OFF);
         if (mix_bpm_lbl) lv_label_set_text_fmt(mix_bpm_lbl, "%d", p4.bpm_int);
+    }
+
+    // VU meters — push the current dsp spectrum level into each channel bar,
+    // green normally and red when it's hot. Only repaint a bar when its level
+    // actually changes, keeping partial refresh cheap.
+    {
+        static uint8_t prev_vu[16] = {};
+        SpectrumData sp;
+        dsp_get_spectrum(&sp);
+        for (int i = 0; i < 16; i++) {
+            if (!vol_vu_bars[i]) continue;
+            uint8_t lvl = p4.track_muted[i] ? 0 : sp.bars[i];
+            if (lvl == prev_vu[i]) continue;
+            prev_vu[i] = lvl;
+            lv_bar_set_value(vol_vu_bars[i], lvl, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(vol_vu_bars[i],
+                (lvl > 210) ? RED808_ERROR : RED808_SUCCESS, LV_PART_INDICATOR);
+        }
     }
 
     for (int i = 0; i < 16; i++) {
