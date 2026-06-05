@@ -734,6 +734,8 @@ static unsigned long s_xtra_play_start_ms = 0;    // 0 = not playing
 static unsigned long s_xtra_play_dur_ms   = 0;    // trimmed length in ms
 static float      s_xtra_play_a           = 0.f;  // playhead sweep start (0..1 of waveform)
 static float      s_xtra_play_b           = 1.f;  // playhead sweep end
+static bool       s_xtra_loop_on          = false;// re-trigger the sample at the end of each pass
+static lv_obj_t*  s_xtra_loop_btn         = NULL;
 static lv_obj_t*  s_xtra_info_lbl         = NULL; // filename / sr / dur
 static lv_obj_t*  s_xtra_trim_lbl         = NULL; // "TRIM 12%..88%"
 static lv_obj_t*  s_xtra_fade_lbl         = NULL; // "FADE IN 20ms  OUT 50ms"
@@ -4834,6 +4836,7 @@ static lv_obj_t* vol_name_labels[16] = {};
 static lv_obj_t* vol_mute_dots[16] = {};
 static lv_obj_t* vol_strip_panels[16] = {};
 static lv_obj_t* vol_vu_bars[16] = {};   // per-channel VU meter (driven by dsp spectrum)
+static lv_obj_t* vol_vu_caps[16] = {};   // peak-hold cap per VU meter
 static lv_obj_t* mix_master_slider = NULL;
 static lv_obj_t* mix_seq_slider = NULL;
 static lv_obj_t* mix_live_slider = NULL;
@@ -5045,6 +5048,19 @@ static void create_volumes_screen(void) {
         lv_obj_clear_flag(vol_vu_bars[i], LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(vol_vu_bars[i], LV_OBJ_FLAG_SCROLLABLE);
 
+        // Peak-hold cap — thin mark that holds the loudest recent level and
+        // falls slowly (classic VU). Positioned each frame by update_volumes_screen.
+        vol_vu_caps[i] = lv_obj_create(scr_volumes);
+        lv_obj_set_size(vol_vu_caps[i], 6, 2);
+        lv_obj_set_pos(vol_vu_caps[i], cx + 10, y_sl + slider_h - 2);
+        lv_obj_set_style_bg_color(vol_vu_caps[i], lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(vol_vu_caps[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(vol_vu_caps[i], 0, 0);
+        lv_obj_set_style_radius(vol_vu_caps[i], 0, 0);
+        lv_obj_clear_flag(vol_vu_caps[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(vol_vu_caps[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(vol_vu_caps[i], LV_OBJ_FLAG_HIDDEN);
+
         // Color bar at bottom of slider
         lv_obj_t* color_bar = lv_obj_create(scr_volumes);
         lv_obj_set_size(color_bar, strip_w - 6, 3);
@@ -5099,21 +5115,45 @@ static void update_volumes_screen(void) {
         if (mix_bpm_lbl) lv_label_set_text_fmt(mix_bpm_lbl, "%d", p4.bpm_int);
     }
 
-    // VU meters — push the current dsp spectrum level into each channel bar,
-    // green normally and red when it's hot. Only repaint a bar when its level
-    // actually changes, keeping partial refresh cheap.
+    // VU meters — driven by the dsp spectrum. 3 colour zones (green/amber/red),
+    // plus a peak-hold cap that catches the loudest recent level and falls slow.
+    // Bar value/colour only repaint on change; the cap follows the peak.
     {
         static uint8_t prev_vu[16] = {};
+        static uint8_t vu_peak[16] = {};
         SpectrumData sp;
         dsp_get_spectrum(&sp);
         for (int i = 0; i < 16; i++) {
             if (!vol_vu_bars[i]) continue;
             uint8_t lvl = p4.track_muted[i] ? 0 : sp.bars[i];
-            if (lvl == prev_vu[i]) continue;
-            prev_vu[i] = lvl;
-            lv_bar_set_value(vol_vu_bars[i], lvl, LV_ANIM_OFF);
-            lv_obj_set_style_bg_color(vol_vu_bars[i],
-                (lvl > 210) ? RED808_ERROR : RED808_SUCCESS, LV_PART_INDICATOR);
+
+            // Peak hold with slow fall.
+            if (lvl > vu_peak[i])      vu_peak[i] = lvl;
+            else if (vu_peak[i] >= 3)  vu_peak[i] -= 3;
+            else                       vu_peak[i] = 0;
+
+            if (lvl != prev_vu[i]) {
+                prev_vu[i] = lvl;
+                lv_bar_set_value(vol_vu_bars[i], lvl, LV_ANIM_OFF);
+                lv_obj_set_style_bg_color(vol_vu_bars[i],
+                    (lvl > 210) ? RED808_ERROR : (lvl > 140) ? RED808_WARNING : RED808_SUCCESS,
+                    LV_PART_INDICATOR);
+            }
+
+            if (vol_vu_caps[i]) {
+                if (vu_peak[i] == 0) {
+                    lv_obj_add_flag(vol_vu_caps[i], LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    int by = lv_obj_get_y(vol_vu_bars[i]);
+                    int bh = lv_obj_get_height(vol_vu_bars[i]);
+                    int cy = by + bh - (vu_peak[i] * bh) / 255 - 2;
+                    if (cy < by) cy = by;
+                    lv_obj_clear_flag(vol_vu_caps[i], LV_OBJ_FLAG_HIDDEN);
+                    lv_obj_set_y(vol_vu_caps[i], cy);
+                    lv_obj_set_style_bg_color(vol_vu_caps[i],
+                        (vu_peak[i] > 210) ? RED808_ERROR : (vu_peak[i] > 140) ? RED808_WARNING : lv_color_white(), 0);
+                }
+            }
         }
     }
 
@@ -8719,6 +8759,7 @@ static void xtra_play_cb(lv_event_t* e) {
         if (b < a) { float t = a; a = b; b = t; }
         float total = (float)psi.frames / (float)psi.sample_rate;     // seconds
         unsigned long dur = (unsigned long)((b - a) * total * 1000.0f);
+        if (dur < 120) dur = 120;   // floor so LOOP can't flood the Master with re-triggers
         if (dur > 0) {
             s_xtra_play_a = a;
             s_xtra_play_b = b;
@@ -8738,9 +8779,16 @@ static void update_xtra_playhead(void) {
     }
     unsigned long el = millis() - s_xtra_play_start_ms;
     if (el >= s_xtra_play_dur_ms) {
-        s_xtra_play_start_ms = 0;
-        lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
-        return;
+        if (s_xtra_loop_on && udp_wifi_connected() &&
+            s_xtra_edit_slot >= 0 && s_xtra_edit_slot < 4) {
+            udp_send_trigger(s_xtra_slots[s_xtra_edit_slot].pad, 110);  // LOOP: re-fire the sample
+            s_xtra_play_start_ms = millis();
+            el = 0;
+        } else {
+            s_xtra_play_start_ms = 0;
+            lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
     }
     float prog = (float)el / (float)s_xtra_play_dur_ms;              // 0..1
     float pos  = s_xtra_play_a + prog * (s_xtra_play_b - s_xtra_play_a);
@@ -8748,6 +8796,22 @@ static void update_xtra_playhead(void) {
     if (w < 10) w = 960;
     lv_obj_clear_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_x(s_xtra_playhead_line, (int)(pos * w));
+}
+
+static void xtra_refresh_loop_btn(void) {
+    if (!s_xtra_loop_btn) return;
+    lv_obj_t* l = lv_obj_get_child(s_xtra_loop_btn, 0);
+    if (l) {
+        lv_label_set_text(l, s_xtra_loop_on ? LV_SYMBOL_LOOP " ON" : LV_SYMBOL_LOOP " OFF");
+        lv_obj_set_style_text_color(l, s_xtra_loop_on ? theme_success() : theme_text(), 0);
+    }
+}
+
+static void xtra_loop_cb(lv_event_t* e) {
+    (void)e;
+    s_xtra_loop_on = !s_xtra_loop_on;
+    if (s_xtra_loop_on) xtra_play_cb(NULL);   // start now; update_xtra_playhead keeps re-firing
+    xtra_refresh_loop_btn();
 }
 
 static void xtra_apply_cb(lv_event_t* e) {
@@ -9046,10 +9110,13 @@ static void create_performance_screen(void) {
     xtra_make_btn(scr_performance, x0 + 360,  fy, 70, 38, "OUT " LV_SYMBOL_MINUS, RED808_CYAN, xtra_edit_adj_cb, 6);
     xtra_make_btn(scr_performance, x0 + 434,  fy, 70, 38, "OUT " LV_SYMBOL_PLUS,  RED808_CYAN, xtra_edit_adj_cb, 7);
 
-    int ay = fy + 50;                     // action row — kept in the LEFT column so
-                                          // it no longer runs under the DRONE panel
-    xtra_make_btn(scr_performance, x0,        ay, 230, 52, LV_SYMBOL_PLAY "  PLAY",  RED808_CYAN,  xtra_play_cb,  0);
-    xtra_make_btn(scr_performance, x0 + 250,  ay, 260, 52, LV_SYMBOL_UPLOAD "  APPLY", theme_accent2(), xtra_apply_cb, 0);
+    int ay = fy + 50;                     // action row — LEFT column: PLAY / LOOP / APPLY
+                                          // (so it doesn't run under the DRONE panel)
+    xtra_make_btn(scr_performance, x0,        ay, 140, 52, LV_SYMBOL_PLAY "  PLAY", RED808_CYAN, xtra_play_cb, 0);
+    s_xtra_loop_btn = xtra_make_btn(scr_performance, x0 + 150, ay, 100, 52,
+                                    LV_SYMBOL_LOOP " OFF", theme_text(), xtra_loop_cb, 0);
+    xtra_make_btn(scr_performance, x0 + 260,  ay, 250, 52, LV_SYMBOL_UPLOAD "  APPLY", theme_accent2(), xtra_apply_cb, 0);
+    xtra_refresh_loop_btn();
 
     // --- DRONE panel (right half, below the waveform; trim/fade live on left) -
     {
@@ -9152,6 +9219,7 @@ static void ui_reload_themed_screens(void) {
     s_xtra_wave_panel = NULL; s_xtra_wave_line = NULL;
     s_xtra_trim_a_line = NULL; s_xtra_trim_b_line = NULL;
     s_xtra_playhead_line = NULL; s_xtra_play_start_ms = 0;
+    s_xtra_loop_btn = NULL; s_xtra_loop_on = false;
     s_xtra_info_lbl = NULL; s_xtra_trim_lbl = NULL; s_xtra_fade_lbl = NULL;
     for (int i = 0; i < 4; i++) { grid_xtra_btns[i] = NULL; grid_xtra_delete_btns[i] = NULL; }
     header_bar = NULL; hdr_bpm_label = NULL; hdr_pattern_label = NULL;
@@ -9228,7 +9296,7 @@ static void ui_reload_themed_screens(void) {
     for (int i = 0; i < 16; i++) {
         vol_sliders[i] = NULL; vol_labels[i] = NULL;
         vol_name_labels[i] = NULL; vol_mute_dots[i] = NULL;
-        vol_strip_panels[i] = NULL; vol_vu_bars[i] = NULL;
+        vol_strip_panels[i] = NULL; vol_vu_bars[i] = NULL; vol_vu_caps[i] = NULL;
     }
 
     // Toast lives as a child of whatever screen was active — those are being
@@ -9337,6 +9405,7 @@ void ui_navigate_to(int screen_id) {
         // and stop/hide the playhead so it doesn't freeze mid-sweep.
         if (active_screen == 6 && screen_id != 6) {
             if (s_drone_on) drone_force_off();
+            s_xtra_loop_on = false; xtra_refresh_loop_btn();
             s_xtra_play_start_ms = 0;
             if (s_xtra_playhead_line) lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
         }
