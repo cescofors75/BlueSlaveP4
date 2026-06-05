@@ -8982,7 +8982,7 @@ static void ui_reload_themed_screens(void) {
     for (int i = 0; i < 16; i++) {
         vol_sliders[i] = NULL; vol_labels[i] = NULL;
         vol_name_labels[i] = NULL; vol_mute_dots[i] = NULL;
-        vol_strip_panels[i] = NULL;
+        vol_strip_panels[i] = NULL; vol_vu_bars[i] = NULL;
     }
 
     // Toast lives as a child of whatever screen was active — those are being
@@ -8999,14 +8999,13 @@ static void ui_reload_themed_screens(void) {
     for (int i = 0; i < 6; i++) sd_midi_pat_btns[i] = NULL;
     sd_is_midi_mode = false;
 
-    // Recreate with new theme colors
-    create_live_screen();
-    create_sequencer_screen();
-    create_fx_screen();
-    create_volumes_screen();
-    create_sdcard_screen();
-    create_performance_screen();
-    /* v2.6 — also recreate piano on theme reload */
+    // Lazy theme reload: DON'T recreate every screen here (that rebuilt ~8 full
+    // screens and was the visible lag on theme change). We only delete + null
+    // them above; the active screen is rebuilt by the ui_navigate_to() at the
+    // end, and the rest are recreated on demand by ui_ensure_screen() the first
+    // time they're opened.
+    /* piano + piano-params are deleted/nulled here too so they get a fresh,
+       on-demand rebuild with the new theme colours. */
     if (scr_piano) { lv_obj_del(scr_piano); scr_piano = NULL; }
     s_piano_keys_container = NULL; s_piano_octave_lbl = NULL;
     s_piano_keys24_btn = NULL; s_piano_keys24_lbl = NULL; s_piano_status_lbl = NULL;
@@ -9014,8 +9013,6 @@ static void ui_reload_themed_screens(void) {
     s_piano_rec_btn = NULL; s_piano_rec_lbl = NULL;
     s_piano_eng_preset_btn = NULL; s_piano_eng_preset_lbl = NULL;
     for (int i = 0; i < PIANO_ENGINE_COUNT; i++) s_piano_engine_btns[i] = NULL;
-    create_piano_screen();
-    /* v2.7 — also recreate piano params on theme reload */
     if (scr_piano_params) { lv_obj_del(scr_piano_params); scr_piano_params = NULL; }
     s_pp_param_panel = NULL; s_pp_title_lbl = NULL;
     for (int i = 0; i < SP_ENGINE_COUNT; i++) s_pp_engine_btns[i] = NULL;
@@ -9023,7 +9020,6 @@ static void ui_reload_themed_screens(void) {
     for (int i = 0; i < PP_MAX_PARAMS_P4; i++) {
         s_pp_sliders[i] = NULL; s_pp_val_lbls[i] = NULL;
     }
-    create_piano_params_screen();
 
     // Restore navigation (go to live if was on unknown screen)
     int nav_to = (saved_screen == 9) ? 9 : 2;  // stay in sdcard if we were there
@@ -9035,10 +9031,31 @@ static void ui_reload_themed_screens(void) {
     ui_navigate_to(nav_to);
 }
 
+// Lazily (re)create a themed screen if it was torn down — e.g. after a theme
+// change, which now rebuilds only the active screen and defers the rest to the
+// first time they're navigated to. A no-op in normal operation (all screens are
+// built eagerly at boot), so it only does work right after a theme switch.
+static void ui_ensure_screen(int screen_id) {
+    switch (screen_id) {
+        case 2:  if (!scr_live)         create_live_screen();         break;
+        case 3:  if (!scr_sequencer)    create_sequencer_screen();    break;
+        case 6:  if (!scr_performance)  create_performance_screen();  break;
+        case 7:  if (!scr_volumes)      create_volumes_screen();      break;
+        case 8:  if (!scr_fx)           create_fx_screen();           break;
+        case 9:  if (!scr_sdcard)       create_sdcard_screen();       break;
+        case 10: if (!scr_piano)        create_piano_screen();        break;
+        case 11: if (!scr_piano_params) create_piano_params_screen(); break;
+        default: break;
+    }
+}
+
 void ui_navigate_to(int screen_id) {
     // Don't let the user leave the screen while a blocking op (e.g. WAV upload)
     // is running — the result toast would otherwise land on the wrong screen.
     if (s_ui_busy) return;
+
+    // Build the target screen on demand if a theme reload deferred it.
+    ui_ensure_screen(screen_id);
 
     lv_obj_t* targets[] = {
         scr_boot, NULL, scr_live, scr_sequencer, NULL,
