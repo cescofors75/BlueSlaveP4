@@ -2445,17 +2445,21 @@ static void create_live_screen(void) {
         lv_obj_clear_flag(live_pad_btns[i], LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(live_pad_btns[i], pad_touch_cb, LV_EVENT_PRESSED, (void*)(intptr_t)i);
 
-        // Additive-blend glow overlay — bottom-most child so labels stay on top.
-        // Idle = transparent; update_live_screen drives its opacity from the
-        // pad's velocity "band" so a hit makes the pad emit light toward white.
+        // Hit-flash overlay — bottom-most child so labels stay on top.
+        // NOTE: this used LV_BLEND_MODE_ADDITIVE, but any non-NORMAL blend mode
+        // makes LVGL render the object into a temporary layer and composite it
+        // (lv_obj_style.c: layer_type SIMPLE). With 16 pads repainting while
+        // hammering, that collapsed the render to ~8-12 FPS. Using NORMAL blend
+        // with a WHITE overlay keeps the "incandescent" flash on hits with no
+        // layer cost — update_live_screen drives the opacity from the band.
         live_pad_glow[i] = lv_obj_create(live_pad_btns[i]);
         lv_obj_remove_style_all(live_pad_glow[i]);
         lv_obj_set_size(live_pad_glow[i], CW, CH);
         lv_obj_center(live_pad_glow[i]);
         lv_obj_set_style_radius(live_pad_glow[i], 12, 0);
-        lv_obj_set_style_bg_color(live_pad_glow[i], tc, 0);
+        lv_obj_set_style_bg_color(live_pad_glow[i], lv_color_white(), 0);
         lv_obj_set_style_bg_opa(live_pad_glow[i], LV_OPA_TRANSP, 0);
-        lv_obj_set_style_blend_mode(live_pad_glow[i], LV_BLEND_MODE_ADDITIVE, 0);
+        lv_obj_set_style_blend_mode(live_pad_glow[i], LV_BLEND_MODE_NORMAL, 0);
         lv_obj_clear_flag(live_pad_glow[i], LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(live_pad_glow[i], LV_OBJ_FLAG_CLICKABLE);
 
@@ -2866,12 +2870,13 @@ static void update_live_screen(void) {
 
         lv_color_t tc = ui_track_color(i);
 
-        // Additive glow overlay tracks the band: brighter hit = stronger glow.
+        // White hit-flash overlay tracks the band: harder hit = brighter flash.
+        // Capped well below full opacity so the pad brightens without washing
+        // out the labels. Stays white (set at creation) — NORMAL blend, no layer.
         if (live_pad_glow[i]) {
             lv_opa_t g = (muted || band == 0)
                              ? LV_OPA_TRANSP
-                             : (lv_opa_t)(40 + (band * 215) / 7);  // band7 → 255
-            if (!muted) lv_obj_set_style_bg_color(live_pad_glow[i], tc, 0);
+                             : (lv_opa_t)(25 + (band * 130) / 7);  // band7 → ~155
             lv_obj_set_style_bg_opa(live_pad_glow[i], g, 0);
         }
 
