@@ -729,6 +729,11 @@ static lv_obj_t*  s_xtra_wave_panel       = NULL;
 static lv_obj_t*  s_xtra_wave_line        = NULL;
 static lv_obj_t*  s_xtra_trim_a_line      = NULL; // trim-start marker
 static lv_obj_t*  s_xtra_trim_b_line      = NULL; // trim-end marker
+static lv_obj_t*  s_xtra_playhead_line    = NULL; // moving playback cursor over the waveform
+static unsigned long s_xtra_play_start_ms = 0;    // 0 = not playing
+static unsigned long s_xtra_play_dur_ms   = 0;    // trimmed length in ms
+static float      s_xtra_play_a           = 0.f;  // playhead sweep start (0..1 of waveform)
+static float      s_xtra_play_b           = 1.f;  // playhead sweep end
 static lv_obj_t*  s_xtra_info_lbl         = NULL; // filename / sr / dur
 static lv_obj_t*  s_xtra_trim_lbl         = NULL; // "TRIM 12%..88%"
 static lv_obj_t*  s_xtra_fade_lbl         = NULL; // "FADE IN 20ms  OUT 50ms"
@@ -8704,6 +8709,45 @@ static void xtra_play_cb(lv_event_t* e) {
     }
     if (udp_wifi_connected()) udp_send_trigger(s.pad, 110);
     else ui_show_toast("Master no conectado", RED808_WARNING);
+
+    // Kick off the estimated playhead over the waveform (timed from the sample's
+    // trimmed length — the P4 has no real position feedback from the Master).
+    s_xtra_play_start_ms = 0;
+    const sample_edit::SampleInfo& psi = sample_edit::info();
+    if (psi.loaded && s_xtra_loaded_slot == s_xtra_edit_slot && psi.frames > 0 && psi.sample_rate > 0) {
+        float a = s.trim_start, b = s.trim_end;
+        if (b < a) { float t = a; a = b; b = t; }
+        float total = (float)psi.frames / (float)psi.sample_rate;     // seconds
+        unsigned long dur = (unsigned long)((b - a) * total * 1000.0f);
+        if (dur > 0) {
+            s_xtra_play_a = a;
+            s_xtra_play_b = b;
+            s_xtra_play_dur_ms = dur;
+            s_xtra_play_start_ms = millis();
+        }
+    }
+}
+
+// Move the playback cursor over the waveform. Called each frame while the XTRA
+// screen is active; sweeps s_xtra_play_a→s_xtra_play_b over s_xtra_play_dur_ms.
+static void update_xtra_playhead(void) {
+    if (!s_xtra_playhead_line) return;
+    if (s_xtra_play_start_ms == 0) {
+        lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    unsigned long el = millis() - s_xtra_play_start_ms;
+    if (el >= s_xtra_play_dur_ms) {
+        s_xtra_play_start_ms = 0;
+        lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    float prog = (float)el / (float)s_xtra_play_dur_ms;              // 0..1
+    float pos  = s_xtra_play_a + prog * (s_xtra_play_b - s_xtra_play_a);
+    int w = s_xtra_wave_line ? lv_obj_get_width(s_xtra_wave_line) : 960;
+    if (w < 10) w = 960;
+    lv_obj_clear_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(s_xtra_playhead_line, (int)(pos * w));
 }
 
 static void xtra_apply_cb(lv_event_t* e) {
@@ -8731,6 +8775,132 @@ static lv_obj_t* xtra_make_btn(lv_obj_t* par, int x, int y, int w, int h,
     lv_obj_center(l);
     if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, (void*)(intptr_t)code);
     return b;
+}
+
+// =============================================================================
+// DRONE LAYER — sustained tuned note(s) held under the XTRA sampler to reframe
+// a dry sample emotionally (Fred again.. style: "same words, different meaning"
+// just by changing the harmonic bed). Pure control: holds notes on a Master
+// synth engine over UDP (no local audio). Lives on the XTRA screen; trigger the
+// XTRA sample pads on top and ride the root to reframe it live.
+// =============================================================================
+static const uint8_t DRONE_ENGINES[]      = {4, 5, 6, 3};   // WT, SH101, FM2, 303 (sustaining)
+static const char*   DRONE_ENGINE_NAMES[] = {"WT", "SH101", "FM2", "303"};
+static constexpr int DRONE_ENGINE_COUNT   = 4;
+static const char*   DRONE_MODE_NAMES[]   = {"ROOT", "+5th", "OCT", "TRIAD"};
+static constexpr int DRONE_MODE_COUNT     = 4;
+
+static bool    s_drone_on       = false;
+static int     s_drone_eng_idx  = 0;
+static int     s_drone_root     = 48;    // C3
+static int     s_drone_mode     = 0;
+static uint8_t s_drone_level    = 90;    // note velocity
+static uint8_t s_drone_notes[3] = {0};
+static int     s_drone_note_cnt = 0;
+
+static lv_obj_t* s_drone_toggle_btn = NULL;
+static lv_obj_t* s_drone_status_lbl = NULL;
+
+static void drone_note_name(int note, char* out, int n) {
+    static const char* NN[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+    if (note < 0) note = 0;
+    if (note > 127) note = 127;
+    lv_snprintf(out, n, "%s%d", NN[note % 12], note / 12 - 1);
+}
+
+static int drone_build_notes(int root, int mode, int* out) {
+    switch (mode) {
+        case 1: out[0] = root; out[1] = root + 7;                 return 2;  // +5th
+        case 2: out[0] = root; out[1] = root + 12;                return 2;  // +octave
+        case 3: out[0] = root; out[1] = root + 4; out[2] = root + 7; return 3;  // major triad
+        default: out[0] = root;                                   return 1;  // root only
+    }
+}
+
+static void drone_all_off(void) {
+    if (ui_use_udp_transport()) {
+        uint8_t eng = DRONE_ENGINES[s_drone_eng_idx];
+        for (int i = 0; i < s_drone_note_cnt; i++)
+            udp_send_synth_note_off_ex(eng, 0, s_drone_notes[i]);
+    }
+    s_drone_note_cnt = 0;
+}
+
+static void drone_refresh_ui(void) {
+    if (s_drone_toggle_btn) {
+        lv_obj_t* l = lv_obj_get_child(s_drone_toggle_btn, 0);
+        if (l) lv_label_set_text(l, s_drone_on ? "DRONE ON" : "DRONE OFF");
+    }
+    if (s_drone_status_lbl) {
+        char nm[8];
+        drone_note_name(s_drone_root, nm, sizeof(nm));
+        lv_label_set_text_fmt(s_drone_status_lbl, "%s   %s   %s   vel %d",
+                              nm, DRONE_ENGINE_NAMES[s_drone_eng_idx],
+                              DRONE_MODE_NAMES[s_drone_mode], s_drone_level);
+        lv_obj_set_style_text_color(s_drone_status_lbl,
+                                    s_drone_on ? theme_accent2() : theme_text_dim(), 0);
+    }
+}
+
+static void drone_revoice(void) {
+    drone_all_off();
+    if (s_drone_on && ui_use_udp_transport()) {
+        uint8_t eng = DRONE_ENGINES[s_drone_eng_idx];
+        int notes[3];
+        int n = drone_build_notes(s_drone_root, s_drone_mode, notes);
+        for (int i = 0; i < n; i++) {
+            int v = notes[i];
+            if (v < 0) v = 0;
+            if (v > 127) v = 127;
+            udp_send_synth_note_on_ex(eng, (uint8_t)v, s_drone_level, false, false);
+            s_drone_notes[i] = (uint8_t)v;
+        }
+        s_drone_note_cnt = n;
+    }
+    drone_refresh_ui();
+}
+
+static void drone_force_off(void) {
+    drone_all_off();
+    s_drone_on = false;
+    drone_refresh_ui();
+}
+
+static void drone_toggle_cb(lv_event_t* e) {
+    (void)e;
+    s_drone_on = !s_drone_on;
+    drone_revoice();
+}
+
+static void drone_root_cb(lv_event_t* e) {
+    int code = (int)(intptr_t)lv_event_get_user_data(e);   // 0:-1  1:+1  2:-12  3:+12
+    int d = (code == 0) ? -1 : (code == 1) ? +1 : (code == 2) ? -12 : +12;
+    s_drone_root += d;
+    if (s_drone_root < 12)  s_drone_root = 12;
+    if (s_drone_root > 108) s_drone_root = 108;
+    drone_revoice();
+}
+
+static void drone_engine_cb(lv_event_t* e) {
+    (void)e;
+    drone_all_off();   // release notes on the OLD engine before switching
+    s_drone_eng_idx = (s_drone_eng_idx + 1) % DRONE_ENGINE_COUNT;
+    drone_revoice();
+}
+
+static void drone_mode_cb(lv_event_t* e) {
+    (void)e;
+    s_drone_mode = (s_drone_mode + 1) % DRONE_MODE_COUNT;
+    drone_revoice();
+}
+
+static void drone_level_cb(lv_event_t* e) {
+    int code = (int)(intptr_t)lv_event_get_user_data(e);   // 0:- 1:+
+    int v = (int)s_drone_level + (code ? +8 : -8);
+    if (v < 24)  v = 24;
+    if (v > 127) v = 127;
+    s_drone_level = (uint8_t)v;
+    drone_revoice();   // retrigger at the new velocity
 }
 
 static void create_performance_screen(void) {
@@ -8827,6 +8997,19 @@ static void create_performance_screen(void) {
     lv_obj_set_style_line_width(s_xtra_wave_line, 2, 0);
     lv_obj_set_style_line_rounded(s_xtra_wave_line, true, 0);
 
+    // Playback cursor — moves left→right over the waveform while a sample plays.
+    // Created last so it sits ON TOP of the wave line. The P4 doesn't get real
+    // position from the Master, so update_xtra_playhead() sweeps it by time over
+    // the sample's trimmed length. Hidden until PLAY.
+    s_xtra_playhead_line = lv_obj_create(s_xtra_wave_panel);
+    lv_obj_set_size(s_xtra_playhead_line, 2, wph - 4);
+    lv_obj_set_pos(s_xtra_playhead_line, 0, 2);
+    lv_obj_set_style_bg_color(s_xtra_playhead_line, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_xtra_playhead_line, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_xtra_playhead_line, 0, 0);
+    lv_obj_clear_flag(s_xtra_playhead_line, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+
     // --- Info + controls ---------------------------------------------------
     s_xtra_info_lbl = lv_label_create(scr_performance);
     lv_label_set_text(s_xtra_info_lbl, "Slot vacio");
@@ -8861,6 +9044,49 @@ static void create_performance_screen(void) {
     xtra_make_btn(scr_performance, x0 + 320,  ay, W - 2 * x0 - 320, 52, LV_SYMBOL_UPLOAD "  APPLY + SUBIR",
                   theme_accent2(), xtra_apply_cb, 0);
 
+    // --- DRONE panel (right half, below the waveform; trim/fade live on left) -
+    {
+        const int bx = 540, by = 358;
+        lv_obj_t* dp = lv_obj_create(scr_performance);
+        lv_obj_set_size(dp, W - bx - x0, 182);
+        lv_obj_set_pos(dp, bx, by);
+        lv_obj_set_style_radius(dp, 10, 0);
+        lv_obj_set_style_bg_color(dp, RED808_PANEL, 0);
+        lv_obj_set_style_bg_opa(dp, LV_OPA_40, 0);
+        lv_obj_set_style_border_width(dp, 1, 0);
+        lv_obj_set_style_border_color(dp, theme_accent2(), 0);
+        lv_obj_set_style_border_opa(dp, LV_OPA_50, 0);
+        lv_obj_set_style_pad_all(dp, 0, 0);
+        lv_obj_clear_flag(dp, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* dt = lv_label_create(scr_performance);
+        lv_label_set_text(dt, LV_SYMBOL_AUDIO "  DRONE");
+        lv_obj_set_style_text_font(dt, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(dt, theme_accent2(), 0);
+        lv_obj_set_pos(dt, bx + 14, by + 12);
+
+        s_drone_toggle_btn = xtra_make_btn(scr_performance, bx + 300, by + 8, 130, 36,
+                                           "DRONE OFF", theme_accent2(), drone_toggle_cb, 0);
+
+        s_drone_status_lbl = lv_label_create(scr_performance);
+        lv_obj_set_style_text_font(s_drone_status_lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(s_drone_status_lbl, bx + 14, by + 50);
+
+        int ry = by + 78;    // root / octave / velocity row
+        xtra_make_btn(scr_performance, bx + 14,  ry, 60, 34, LV_SYMBOL_LEFT,  RED808_SUCCESS, drone_root_cb, 0);
+        xtra_make_btn(scr_performance, bx + 80,  ry, 60, 34, LV_SYMBOL_RIGHT, RED808_SUCCESS, drone_root_cb, 1);
+        xtra_make_btn(scr_performance, bx + 150, ry, 70, 34, "OCT-", RED808_CYAN,    drone_root_cb,  2);
+        xtra_make_btn(scr_performance, bx + 226, ry, 70, 34, "OCT+", RED808_CYAN,    drone_root_cb,  3);
+        xtra_make_btn(scr_performance, bx + 320, ry, 56, 34, "VEL-", RED808_WARNING, drone_level_cb, 0);
+        xtra_make_btn(scr_performance, bx + 380, ry, 56, 34, "VEL+", RED808_WARNING, drone_level_cb, 1);
+
+        int ey = by + 120;   // engine / mode row
+        xtra_make_btn(scr_performance, bx + 14,  ey, 200, 36, "ENGINE", theme_text(), drone_engine_cb, 0);
+        xtra_make_btn(scr_performance, bx + 226, ey, 210, 36, "MODE",   theme_text(), drone_mode_cb,   0);
+
+        drone_refresh_ui();
+    }
+
     xtra_load_state();
     s_xtra_edit_slot = 0;
     s_xtra_loaded_slot = -1;
@@ -8893,6 +9119,10 @@ void ui_create_all_screens(void) {
 static void ui_reload_themed_screens(void) {
     int saved_screen = active_screen;
 
+    // Stop the drone before its panel (on scr_performance) is torn down.
+    drone_all_off();
+    s_drone_on = false;
+
     // Block the touch task from hit-testing live pads while we delete and
     // recreate screens. Without this, touch_task (Core 0, no LVGL lock) can
     // dereference live_pad_btns[] pointers that are freed below before they are
@@ -8911,8 +9141,10 @@ static void ui_reload_themed_screens(void) {
     if (scr_performance) { lv_obj_del(scr_performance); scr_performance = NULL; }
 
     // Clear widget pointers (prevent stale access in update functions)
+    s_drone_toggle_btn = NULL; s_drone_status_lbl = NULL;
     s_xtra_wave_panel = NULL; s_xtra_wave_line = NULL;
     s_xtra_trim_a_line = NULL; s_xtra_trim_b_line = NULL;
+    s_xtra_playhead_line = NULL; s_xtra_play_start_ms = 0;
     s_xtra_info_lbl = NULL; s_xtra_trim_lbl = NULL; s_xtra_fade_lbl = NULL;
     for (int i = 0; i < 4; i++) { grid_xtra_btns[i] = NULL; grid_xtra_delete_btns[i] = NULL; }
     header_bar = NULL; hdr_bpm_label = NULL; hdr_pattern_label = NULL;
@@ -9093,6 +9325,14 @@ void ui_navigate_to(int screen_id) {
             piano_sync_active_engine_state();
         }
         if (screen_id != 9) s_sd_for_xtra = false;
+        // Leaving the XTRA screen: drop the drone so it doesn't get stuck (the
+        // synth all-notes-off below would silence it anyway; keep state in sync)
+        // and stop/hide the playhead so it doesn't freeze mid-sweep.
+        if (active_screen == 6 && screen_id != 6) {
+            if (s_drone_on) drone_force_off();
+            s_xtra_play_start_ms = 0;
+            if (s_xtra_playhead_line) lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+        }
         bool keep_piano_preview = s_piano_play_active &&
             ((active_screen == 10 && screen_id == 11) || (active_screen == 11 && screen_id == 10));
         // Before leaving most screens, stop active synths to prevent stuck notes.
@@ -9496,6 +9736,7 @@ void ui_update_current_screen(void) {
     else if (active == scr_sequencer) update_sequencer_screen();
     else if (active == scr_fx) update_fx_screen();
     else if (active == scr_volumes) update_volumes_screen();
+    else if (active == scr_performance) update_xtra_playhead();
     else if (active == scr_piano || active == scr_piano_params) update_piano_screen();
     else if (active == scr_sdcard && p4sd.needs_refresh) {
         p4sd.needs_refresh = false;
