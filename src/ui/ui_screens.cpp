@@ -729,6 +729,11 @@ static lv_obj_t*  s_xtra_wave_panel       = NULL;
 static lv_obj_t*  s_xtra_wave_line        = NULL;
 static lv_obj_t*  s_xtra_trim_a_line      = NULL; // trim-start marker
 static lv_obj_t*  s_xtra_trim_b_line      = NULL; // trim-end marker
+static lv_obj_t*  s_xtra_playhead_line    = NULL; // moving playback cursor over the waveform
+static unsigned long s_xtra_play_start_ms = 0;    // 0 = not playing
+static unsigned long s_xtra_play_dur_ms   = 0;    // trimmed length in ms
+static float      s_xtra_play_a           = 0.f;  // playhead sweep start (0..1 of waveform)
+static float      s_xtra_play_b           = 1.f;  // playhead sweep end
 static lv_obj_t*  s_xtra_info_lbl         = NULL; // filename / sr / dur
 static lv_obj_t*  s_xtra_trim_lbl         = NULL; // "TRIM 12%..88%"
 static lv_obj_t*  s_xtra_fade_lbl         = NULL; // "FADE IN 20ms  OUT 50ms"
@@ -8704,6 +8709,45 @@ static void xtra_play_cb(lv_event_t* e) {
     }
     if (udp_wifi_connected()) udp_send_trigger(s.pad, 110);
     else ui_show_toast("Master no conectado", RED808_WARNING);
+
+    // Kick off the estimated playhead over the waveform (timed from the sample's
+    // trimmed length — the P4 has no real position feedback from the Master).
+    s_xtra_play_start_ms = 0;
+    const sample_edit::SampleInfo& psi = sample_edit::info();
+    if (psi.loaded && s_xtra_loaded_slot == s_xtra_edit_slot && psi.frames > 0 && psi.sample_rate > 0) {
+        float a = s.trim_start, b = s.trim_end;
+        if (b < a) { float t = a; a = b; b = t; }
+        float total = (float)psi.frames / (float)psi.sample_rate;     // seconds
+        unsigned long dur = (unsigned long)((b - a) * total * 1000.0f);
+        if (dur > 0) {
+            s_xtra_play_a = a;
+            s_xtra_play_b = b;
+            s_xtra_play_dur_ms = dur;
+            s_xtra_play_start_ms = millis();
+        }
+    }
+}
+
+// Move the playback cursor over the waveform. Called each frame while the XTRA
+// screen is active; sweeps s_xtra_play_a→s_xtra_play_b over s_xtra_play_dur_ms.
+static void update_xtra_playhead(void) {
+    if (!s_xtra_playhead_line) return;
+    if (s_xtra_play_start_ms == 0) {
+        lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    unsigned long el = millis() - s_xtra_play_start_ms;
+    if (el >= s_xtra_play_dur_ms) {
+        s_xtra_play_start_ms = 0;
+        lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    float prog = (float)el / (float)s_xtra_play_dur_ms;              // 0..1
+    float pos  = s_xtra_play_a + prog * (s_xtra_play_b - s_xtra_play_a);
+    int w = s_xtra_wave_line ? lv_obj_get_width(s_xtra_wave_line) : 960;
+    if (w < 10) w = 960;
+    lv_obj_clear_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(s_xtra_playhead_line, (int)(pos * w));
 }
 
 static void xtra_apply_cb(lv_event_t* e) {
@@ -8953,6 +8997,19 @@ static void create_performance_screen(void) {
     lv_obj_set_style_line_width(s_xtra_wave_line, 2, 0);
     lv_obj_set_style_line_rounded(s_xtra_wave_line, true, 0);
 
+    // Playback cursor — moves left→right over the waveform while a sample plays.
+    // Created last so it sits ON TOP of the wave line. The P4 doesn't get real
+    // position from the Master, so update_xtra_playhead() sweeps it by time over
+    // the sample's trimmed length. Hidden until PLAY.
+    s_xtra_playhead_line = lv_obj_create(s_xtra_wave_panel);
+    lv_obj_set_size(s_xtra_playhead_line, 2, wph - 4);
+    lv_obj_set_pos(s_xtra_playhead_line, 0, 2);
+    lv_obj_set_style_bg_color(s_xtra_playhead_line, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_xtra_playhead_line, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_xtra_playhead_line, 0, 0);
+    lv_obj_clear_flag(s_xtra_playhead_line, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+
     // --- Info + controls ---------------------------------------------------
     s_xtra_info_lbl = lv_label_create(scr_performance);
     lv_label_set_text(s_xtra_info_lbl, "Slot vacio");
@@ -9087,6 +9144,7 @@ static void ui_reload_themed_screens(void) {
     s_drone_toggle_btn = NULL; s_drone_status_lbl = NULL;
     s_xtra_wave_panel = NULL; s_xtra_wave_line = NULL;
     s_xtra_trim_a_line = NULL; s_xtra_trim_b_line = NULL;
+    s_xtra_playhead_line = NULL; s_xtra_play_start_ms = 0;
     s_xtra_info_lbl = NULL; s_xtra_trim_lbl = NULL; s_xtra_fade_lbl = NULL;
     for (int i = 0; i < 4; i++) { grid_xtra_btns[i] = NULL; grid_xtra_delete_btns[i] = NULL; }
     header_bar = NULL; hdr_bpm_label = NULL; hdr_pattern_label = NULL;
@@ -9268,8 +9326,13 @@ void ui_navigate_to(int screen_id) {
         }
         if (screen_id != 9) s_sd_for_xtra = false;
         // Leaving the XTRA screen: drop the drone so it doesn't get stuck (the
-        // synth all-notes-off below would silence it anyway; keep state in sync).
-        if (active_screen == 6 && screen_id != 6 && s_drone_on) drone_force_off();
+        // synth all-notes-off below would silence it anyway; keep state in sync)
+        // and stop/hide the playhead so it doesn't freeze mid-sweep.
+        if (active_screen == 6 && screen_id != 6) {
+            if (s_drone_on) drone_force_off();
+            s_xtra_play_start_ms = 0;
+            if (s_xtra_playhead_line) lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+        }
         bool keep_piano_preview = s_piano_play_active &&
             ((active_screen == 10 && screen_id == 11) || (active_screen == 11 && screen_id == 10));
         // Before leaving most screens, stop active synths to prevent stuck notes.
@@ -9673,6 +9736,7 @@ void ui_update_current_screen(void) {
     else if (active == scr_sequencer) update_sequencer_screen();
     else if (active == scr_fx) update_fx_screen();
     else if (active == scr_volumes) update_volumes_screen();
+    else if (active == scr_performance) update_xtra_playhead();
     else if (active == scr_piano || active == scr_piano_params) update_piano_screen();
     else if (active == scr_sdcard && p4sd.needs_refresh) {
         p4sd.needs_refresh = false;
