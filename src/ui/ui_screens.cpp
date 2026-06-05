@@ -8787,15 +8787,18 @@ static lv_obj_t* xtra_make_btn(lv_obj_t* par, int x, int y, int w, int h,
 static const uint8_t DRONE_ENGINES[]      = {4, 5, 6, 3};   // WT, SH101, FM2, 303 (sustaining)
 static const char*   DRONE_ENGINE_NAMES[] = {"WT", "SH101", "FM2", "303"};
 static constexpr int DRONE_ENGINE_COUNT   = 4;
-static const char*   DRONE_MODE_NAMES[]   = {"ROOT", "+5th", "OCT", "TRIAD"};
-static constexpr int DRONE_MODE_COUNT     = 4;
+// Chord shapes built from a single root → harmonic beds. maj↔min is the big
+// emotional flip (bright↔sad); sus4 = unresolved tension; 7ths add cinematic
+// colour. This is what makes the reframe actually audible.
+static const char*   DRONE_MODE_NAMES[]   = {"ROOT", "5th", "maj", "min", "sus4", "min7", "maj7"};
+static constexpr int DRONE_MODE_COUNT     = 7;
 
 static bool    s_drone_on       = false;
 static int     s_drone_eng_idx  = 0;
 static int     s_drone_root     = 48;    // C3
-static int     s_drone_mode     = 0;
-static uint8_t s_drone_level    = 90;    // note velocity
-static uint8_t s_drone_notes[3] = {0};
+static int     s_drone_mode     = 2;     // maj — a full chord bed is far more noticeable than one note
+static uint8_t s_drone_level    = 110;   // note velocity (louder = more present under the sample)
+static uint8_t s_drone_notes[4] = {0};
 static int     s_drone_note_cnt = 0;
 
 static lv_obj_t* s_drone_toggle_btn = NULL;
@@ -8809,11 +8812,15 @@ static void drone_note_name(int note, char* out, int n) {
 }
 
 static int drone_build_notes(int root, int mode, int* out) {
+    out[0] = root;
     switch (mode) {
-        case 1: out[0] = root; out[1] = root + 7;                 return 2;  // +5th
-        case 2: out[0] = root; out[1] = root + 12;                return 2;  // +octave
-        case 3: out[0] = root; out[1] = root + 4; out[2] = root + 7; return 3;  // major triad
-        default: out[0] = root;                                   return 1;  // root only
+        case 1: out[1] = root + 7;                                          return 2;  // 5th (power)
+        case 2: out[1] = root + 4; out[2] = root + 7;                       return 3;  // major triad
+        case 3: out[1] = root + 3; out[2] = root + 7;                       return 3;  // minor triad
+        case 4: out[1] = root + 5; out[2] = root + 7;                       return 3;  // sus4
+        case 5: out[1] = root + 3; out[2] = root + 7; out[3] = root + 10;   return 4;  // min7
+        case 6: out[1] = root + 4; out[2] = root + 7; out[3] = root + 11;   return 4;  // maj7
+        default:                                                            return 1;  // root only
     }
 }
 
@@ -9039,16 +9046,16 @@ static void create_performance_screen(void) {
     xtra_make_btn(scr_performance, x0 + 360,  fy, 70, 38, "OUT " LV_SYMBOL_MINUS, RED808_CYAN, xtra_edit_adj_cb, 6);
     xtra_make_btn(scr_performance, x0 + 434,  fy, 70, 38, "OUT " LV_SYMBOL_PLUS,  RED808_CYAN, xtra_edit_adj_cb, 7);
 
-    int ay = fy + 50;                     // action row
-    xtra_make_btn(scr_performance, x0,        ay, 300, 52, LV_SYMBOL_PLAY "  PLAY",   RED808_CYAN,    xtra_play_cb,  0);
-    xtra_make_btn(scr_performance, x0 + 320,  ay, W - 2 * x0 - 320, 52, LV_SYMBOL_UPLOAD "  APPLY + SUBIR",
-                  theme_accent2(), xtra_apply_cb, 0);
+    int ay = fy + 50;                     // action row — kept in the LEFT column so
+                                          // it no longer runs under the DRONE panel
+    xtra_make_btn(scr_performance, x0,        ay, 230, 52, LV_SYMBOL_PLAY "  PLAY",  RED808_CYAN,  xtra_play_cb,  0);
+    xtra_make_btn(scr_performance, x0 + 250,  ay, 260, 52, LV_SYMBOL_UPLOAD "  APPLY", theme_accent2(), xtra_apply_cb, 0);
 
     // --- DRONE panel (right half, below the waveform; trim/fade live on left) -
     {
-        const int bx = 540, by = 358;
+        const int bx = 540, by = 356;
         lv_obj_t* dp = lv_obj_create(scr_performance);
-        lv_obj_set_size(dp, W - bx - x0, 182);
+        lv_obj_set_size(dp, W - bx - x0, 174);   // right column, aligned with the action row bottom
         lv_obj_set_pos(dp, bx, by);
         lv_obj_set_style_radius(dp, 10, 0);
         lv_obj_set_style_bg_color(dp, RED808_PANEL, 0);
