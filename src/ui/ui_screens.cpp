@@ -2435,7 +2435,7 @@ static void create_live_screen(void) {
         lv_obj_set_style_radius(live_pad_btns[i], 12, 0);
         lv_obj_set_style_bg_color(live_pad_btns[i], RED808_SURFACE, 0);
         lv_obj_set_style_bg_grad_color(live_pad_btns[i], RED808_PANEL, 0);
-        lv_obj_set_style_bg_grad_dir(live_pad_btns[i], LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_bg_grad_dir(live_pad_btns[i], LV_GRAD_DIR_NONE, 0);  // solid: gradients are costly to repaint while hammering
         lv_obj_set_style_bg_opa(live_pad_btns[i], LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(live_pad_btns[i], 3, 0);
         lv_obj_set_style_border_color(live_pad_btns[i], tc, 0);
@@ -2913,12 +2913,14 @@ static void update_live_screen(void) {
             if (live_pad_num_labels[i])
                 lv_obj_set_style_text_color(live_pad_num_labels[i], RED808_TEXT_DIM, 0);
         } else {
-            // Lit: blend black↔track color by band, brighten border
-            // opa_fill = 32 + (band * 223 / 7): band=1→~64, band=7→255
-            lv_opa_t opa_fill = (lv_opa_t)(32 + (band * 223) / 7);
-            lv_obj_set_style_bg_color(live_pad_btns[i], tc, 0);
-            lv_obj_set_style_bg_grad_color(live_pad_btns[i], RED808_SURFACE, 0);
-            lv_obj_set_style_bg_opa(live_pad_btns[i], opa_fill, 0);
+            // Lit: SOLID OPAQUE colour lerped surface→track by band. The old
+            // path used a gradient + partial opacity (per-pixel interpolation +
+            // alpha blend over the screen), which ×16 pads repainting while
+            // hammering was the real FPS killer — not the glow. A flat opaque
+            // fill is the cheapest draw op there is.
+            uint8_t mix = (uint8_t)(36 + (band * 219) / 7);  // band1→~67, band7→255 (full tc)
+            lv_obj_set_style_bg_color(live_pad_btns[i], lv_color_mix(tc, RED808_SURFACE, mix), 0);
+            lv_obj_set_style_bg_opa(live_pad_btns[i], LV_OPA_COVER, 0);
             // Border widens on hard hits (band 6-7) and stays colored for soft
             lv_coord_t bw = (band >= 6) ? 4 : 3;
             lv_obj_set_style_border_width(live_pad_btns[i], bw, 0);
