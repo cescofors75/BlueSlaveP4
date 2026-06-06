@@ -6488,6 +6488,9 @@ static lv_obj_t* s_piano_eng_preset_lbl   = NULL;
 // Piano gesture state (v3.0): hold+drag for glide and pitch bend.
 static bool      s_piano_glide_enabled     = false;
 static bool      s_piano_bend_enabled      = false;
+static bool      s_piano_sustain           = false;   // SUSTAIN latch active
+static bool      s_piano_latched[128]      = {false};  // the held "pad" notes (snapshot)
+static lv_obj_t* s_piano_sustain_btn       = NULL;
 static int       s_piano_bend_range_st     = 2;     // default +/-2 semitones
 static bool      s_piano_gesture_active    = false;
 static int16_t   s_piano_touch_start_x     = 0;
@@ -6602,6 +6605,7 @@ static void piano_apply_glide_setting(void) {
 
 static void piano_send_off(void);
 static void piano_send_on(uint8_t midi_note, bool legato);
+static void piano_refresh_sustain_btn(void);
 
 static void piano_refresh_gesture_controls(void) {
     if (s_piano_glide_lbl) {
@@ -6735,6 +6739,9 @@ static void piano_send_off(void) {
     s_piano_release_due_ms = 0;
     s_piano_held_note = -1;
     memset(s_piano_note_active, 0, sizeof(s_piano_note_active));
+    // The latched pad is gone too; drop the latch so the button reflects reality.
+    if (s_piano_sustain) { s_piano_sustain = false; piano_refresh_sustain_btn(); }
+    memset(s_piano_latched, 0, sizeof(s_piano_latched));
     piano_reset_vertical_expression();
     piano_reset_bend();
     for (int note = 0; note < 128; note++) {
@@ -6887,8 +6894,10 @@ static void piano_key_event_cb(lv_event_t* e) {
         if (!poly_mode) piano_handle_pressing();
     } else if (code == LV_EVENT_PRESS_LOST) {
         if (poly_mode) {
-            piano_set_note_active(note, false);
-            piano_send_note_off_specific(note);
+            if (!s_piano_latched[note]) {      // latched pad notes keep ringing on key-up
+                piano_set_note_active(note, false);
+                piano_send_note_off_specific(note);
+            }
             if (!piano_touch_inside_keys()) {
                 piano_reset_vertical_expression();
             }
@@ -6904,8 +6913,10 @@ static void piano_key_event_cb(lv_event_t* e) {
         piano_schedule_release();
     } else if (code == LV_EVENT_RELEASED) {
         if (poly_mode) {
-            piano_set_note_active(note, false);
-            piano_send_note_off_specific(note);
+            if (!s_piano_latched[note]) {      // latched pad notes keep ringing on key-up
+                piano_set_note_active(note, false);
+                piano_send_note_off_specific(note);
+            }
             if (!piano_touch_inside_keys()) {
                 piano_reset_vertical_expression();
             }
@@ -7009,6 +7020,42 @@ static void piano_bend_btn_cb(lv_event_t* e) {
         piano_reset_bend();
     }
     piano_refresh_gesture_controls();
+}
+
+static void piano_refresh_sustain_btn(void) {
+    if (!s_piano_sustain_btn) return;
+    lv_obj_t* l = lv_obj_get_child(s_piano_sustain_btn, 0);
+    if (l) {
+        lv_label_set_text(l, s_piano_sustain ? "SUSTAIN ON" : "SUSTAIN");
+        lv_obj_set_style_text_color(l, s_piano_sustain ? lv_color_hex(0x00E676) : RED808_TEXT, 0);
+    }
+    lv_obj_set_style_border_color(s_piano_sustain_btn,
+        s_piano_sustain ? lv_color_hex(0x00E676) : RED808_BORDER, 0);
+    lv_obj_set_style_border_width(s_piano_sustain_btn, s_piano_sustain ? 3 : 1, 0);
+}
+
+// SUSTAIN latch — Hans-Zimmer style. Hold a chord, tap SUSTAIN: those exact
+// notes are "latched" (a pad that keeps ringing). Then play melodies on top —
+// new notes are NOT latched, so they sound and release normally over the pad.
+// Tap SUSTAIN again to release the whole pad. All on the piano's own engine, so
+// no routing conflict.
+static void piano_sustain_btn_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    s_piano_sustain = !s_piano_sustain;
+    if (s_piano_sustain) {
+        // Snapshot the currently-held notes as the latched pad.
+        for (int n = 0; n < 128; n++) s_piano_latched[n] = s_piano_note_active[n];
+    } else {
+        // Release the latched pad.
+        uint8_t eng = piano_engine_code();
+        for (int n = 0; n < 128; n++) {
+            if (!s_piano_latched[n]) continue;
+            s_piano_latched[n] = false;
+            s_piano_note_active[n] = false;
+            if (ui_use_udp_transport()) udp_send_synth_note_off_ex(eng, 0, (uint8_t)n);
+        }
+    }
+    piano_refresh_sustain_btn();
 }
 
 static void piano_rec_btn_cb(lv_event_t* e) {
@@ -7527,6 +7574,11 @@ static void create_piano_screen(void) {
             lv_label_set_text(s_piano_rec_lbl, "● REC");
         }
     }
+
+    /* SUSTAIN latch — hold a chord as a Hans-Zimmer pad and play melodies over it */
+    s_piano_sustain_btn = piano_make_chip(scr_piano, 890, row_y, 126, 36, "SUSTAIN");
+    lv_obj_add_event_cb(s_piano_sustain_btn, piano_sustain_btn_cb, LV_EVENT_CLICKED, NULL);
+    piano_refresh_sustain_btn();
 
     s_piano_status_lbl = lv_label_create(scr_piano);
     lv_label_set_text(s_piano_status_lbl, "—");
@@ -9330,6 +9382,8 @@ static void ui_reload_themed_screens(void) {
     s_piano_keys24_btn = NULL; s_piano_keys24_lbl = NULL; s_piano_status_lbl = NULL;
     s_piano_expr_bar = NULL;
     s_piano_rec_btn = NULL; s_piano_rec_lbl = NULL;
+    s_piano_sustain_btn = NULL; s_piano_sustain = false;
+    memset(s_piano_latched, 0, sizeof(s_piano_latched));
     s_piano_eng_preset_btn = NULL; s_piano_eng_preset_lbl = NULL;
     for (int i = 0; i < PIANO_ENGINE_COUNT; i++) s_piano_engine_btns[i] = NULL;
     if (scr_piano_params) { lv_obj_del(scr_piano_params); scr_piano_params = NULL; }
@@ -9749,13 +9803,9 @@ static void ui_backing_layer_tick(void) {
             udp_send_trigger(s_xtra_slots[s_xtra_edit_slot].pad, 110);
         s_xtra_play_start_ms = now;
     }
-    // Drone keep-alive: re-voice every DRONE_KEEPALIVE_MS so the pad sustains
-    // indefinitely while it's ON. Skipped on the PIANO screens — re-asserting the
-    // drone engine there would hijack the piano's melody-engine routing.
-    if (s_drone_on && active_screen != 10 && active_screen != 11 &&
-        now - s_drone_keepalive_ms >= DRONE_KEEPALIVE_MS) {
-        drone_revoice();   // also resets s_drone_keepalive_ms
-    }
+    // (Drone keep-alive removed — it caused audible re-attack "repetitions".
+    //  Held notes sustain naturally on the engine; the after-nav re-voice keeps
+    //  the drone alive across screen changes without periodic re-triggering.)
 }
 
 void ui_update_current_screen(void) {
