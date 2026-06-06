@@ -95,6 +95,10 @@ static bool load_wav(File& f) {
             channels    = rd_u16(fb + 2);
             sample_rate = rd_u32(fb + 4);
             bits        = rd_u16(fb + 14);
+            // WAVE_FORMAT_EXTENSIBLE (0xFFFE): the real format code (1=PCM,
+            // 3=IEEE float) lives in the SubFormat GUID at offset 24. Many DAW
+            // exports use this; without it they decode as the wrong type.
+            if (fmt == 0xFFFE && n >= 26) fmt = rd_u16(fb + 24);
             have_fmt = true;
             if (csz > n) f.seek(f.position() + (csz - n));
         } else if (memcmp(ch, "data", 4) == 0) {
@@ -105,9 +109,17 @@ static bool load_wav(File& f) {
             f.seek(f.position() + csz + (csz & 1));   // chunks are word-aligned
         }
     }
-    if (!have_fmt || data_off == 0 || data_len == 0) return false;
+    if (!have_fmt || data_off == 0) return false;
+    // Clamp the data length to what's actually in the file: some encoders write
+    // 0 (streamed) or an oversized data size, which would otherwise fail/over-read.
+    {
+        uint32_t fsz   = (uint32_t)f.size();
+        uint32_t avail = (data_off < fsz) ? (fsz - data_off) : 0;
+        if (data_len == 0 || data_len > avail) data_len = avail;
+    }
+    if (data_len == 0) return false;
     if (channels < 1 || channels > 2) return false;
-    if (sample_rate < 4000 || sample_rate > 96000) return false;
+    if (sample_rate < 4000 || sample_rate > 192000) return false;
 
     int bytes_per_sample = bits / 8;
     if (bytes_per_sample < 1 || bytes_per_sample > 4) return false;
