@@ -7067,6 +7067,12 @@ static void piano_sustain_btn_cb(lv_event_t* e) {
         } else if (ui_use_udp_transport()) {
             udp_send_synth_param(eng, 0, (uint8_t)sus, 1.0f);             // hold at full while gated
             if (rel >= 0) udp_send_synth_param(eng, 0, (uint8_t)rel, 1.5f);  // smooth tail on release
+            // Re-trigger any notes still held so they restart under the now-
+            // infinite sustain (a note that already decayed to IDLE on the 303
+            // wouldn't otherwise come back).
+            for (int n = 0; n < 128; n++)
+                if (s_piano_note_active[n])
+                    udp_send_synth_note_on_ex(eng, (uint8_t)n, 110, false, false);
         }
     } else {
         piano_send_off();                     // release the whole held pad
