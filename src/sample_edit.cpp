@@ -110,12 +110,12 @@ static bool load_wav(File& f) {
         }
     }
     if (!have_fmt || data_off == 0) return false;
-    // Clamp the data length to what's actually in the file: some encoders write
-    // 0 (streamed) or an oversized data size, which would otherwise fail/over-read.
-    {
-        uint32_t fsz   = (uint32_t)f.size();
-        uint32_t avail = (data_off < fsz) ? (fsz - data_off) : 0;
-        if (data_len == 0 || data_len > avail) data_len = avail;
+    // Only when the header omits the data size (0) do we fall back to the bytes
+    // from the data chunk to EOF. Files with a valid data_len are untouched, and
+    // an oversized data_len is harmless — the read loop stops at EOF anyway.
+    if (data_len == 0) {
+        uint32_t fsz = (uint32_t)f.size();
+        if (fsz > data_off) data_len = fsz - data_off;
     }
     if (data_len == 0) return false;
     if (channels < 1 || channels > 2) return false;
