@@ -1250,7 +1250,7 @@ static void trim_wav_extension(char* name) {
     size_t n = strlen(name);
     if (n > 4) {
         const char* ext = name + n - 4;
-        if (strcasecmp(ext, ".wav") == 0) {
+        if (strcasecmp(ext, ".wav") == 0 || strcasecmp(ext, ".mp3") == 0) {
             name[n - 4] = '\0';
         }
     }
@@ -5311,8 +5311,9 @@ static void sd_local_refresh_listing(bool reset_selection) {
         if (!is_dir) {
             size_t nlen = strlen(base);
             bool is_wav = (nlen > 4 && strcasecmp(base + nlen - 4, ".wav") == 0);
+            bool is_mp3 = (nlen > 4 && strcasecmp(base + nlen - 4, ".mp3") == 0);
             is_midi = (nlen > 4 && strcasecmp(base + nlen - 4, ".mid") == 0);
-            if (!is_wav && !is_midi) {
+            if (!is_wav && !is_mp3 && !is_midi) {
                 entry.close();
                 entry = dir.openNextFile();
                 continue;
@@ -6059,7 +6060,7 @@ static void sd_refresh_ui(void) {
 
     if (p4sd.list_complete && p4sd.entry_count == 0) {
         lv_obj_t* lbl = lv_label_create(sd_file_list);
-        lv_label_set_text(lbl, "No files found (.wav / .mid)");
+        lv_label_set_text(lbl, "No files found (.wav / .mp3 / .mid)");
         lv_obj_set_style_text_color(lbl, RED808_TEXT_DIM, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
     }
