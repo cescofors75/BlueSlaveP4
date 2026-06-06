@@ -9042,6 +9042,68 @@ static void drone_revoice(void) {
     drone_refresh_ui();
 }
 
+// =============================================================================
+// XTRA chord-drone pads — one-tap sustained chords (for the Fred reframe test
+// without playing the piano). Each pad holds a chord on SH101 (sustain maxed);
+// tapping another switches, OFF releases. Minor = blue, Major = amber.
+// =============================================================================
+struct DroneChord { const char* lbl; uint8_t notes[3]; uint8_t n; bool major; };
+static const DroneChord XTRA_CHORDS[] = {
+    { "Dm",  {50, 53, 57}, 3, false },  // D minor — "home" (voz en Dm)
+    { "D",   {50, 54, 57}, 3, true  },  // D major — el "lift" agridulce
+    { "F",   {53, 57, 60}, 3, true  },  // F major — relativo mayor, dulce
+    { "Am",  {57, 60, 64}, 3, false },  // A minor
+    { "Gm",  {55, 58, 62}, 3, false },  // G minor (iv)
+    { "Bb",  {58, 62, 65}, 3, true  },  // Bb major (bVI, cinematic)
+    { "C",   {48, 52, 55}, 3, true  },  // C major (bVII)
+    { "OFF", {0,  0,  0 }, 0, false },  // stop the drone
+};
+static constexpr int XTRA_CHORD_COUNT = (int)(sizeof(XTRA_CHORDS) / sizeof(XTRA_CHORDS[0]));
+static uint8_t   s_xtra_chord_notes[3] = {0};
+static int       s_xtra_chord_cnt      = 0;
+static int       s_xtra_chord_active   = -1;
+static lv_obj_t* s_xtra_chord_btns[XTRA_CHORD_COUNT] = {};
+
+static void xtra_chord_refresh(void) {
+    for (int i = 0; i < XTRA_CHORD_COUNT; i++) {
+        if (!s_xtra_chord_btns[i]) continue;
+        bool on = (i == s_xtra_chord_active);
+        lv_obj_set_style_border_width(s_xtra_chord_btns[i], on ? 4 : 2, 0);
+        lv_obj_set_style_border_color(s_xtra_chord_btns[i],
+            on ? lv_color_white()
+               : (XTRA_CHORDS[i].n == 0 ? RED808_ERROR
+                  : (XTRA_CHORDS[i].major ? lv_color_hex(0xFFB300) : lv_color_hex(0x00B0FF))), 0);
+    }
+}
+
+static void xtra_chord_all_off(void) {
+    if (ui_use_udp_transport())
+        for (int i = 0; i < s_xtra_chord_cnt; i++)
+            udp_send_synth_note_off_ex(SP_ENGINE_SH101, 0, s_xtra_chord_notes[i]);
+    s_xtra_chord_cnt = 0;
+    s_xtra_chord_active = -1;
+}
+
+static void xtra_chord_cb(lv_event_t* e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= XTRA_CHORD_COUNT) return;
+    xtra_chord_all_off();                       // release the previous chord
+    if (XTRA_CHORDS[idx].n > 0 && ui_use_udp_transport()) {
+        // Lock in the proven sustaining setup, then hold the chord.
+        udp_send_melody_set_engine(SP_ENGINE_SH101);
+        udp_send_synth_preset(SP_ENGINE_SH101, 3);            // "Drone" preset
+        udp_send_synth_param(SP_ENGINE_SH101, 0, 9, 1.0f);    // VCA sustain = max
+        udp_send_synth_param(SP_ENGINE_SH101, 0, 10, 1.5f);   // release
+        for (int i = 0; i < XTRA_CHORDS[idx].n; i++) {
+            udp_send_synth_note_on_ex(SP_ENGINE_SH101, XTRA_CHORDS[idx].notes[i], 100, false, false);
+            s_xtra_chord_notes[i] = XTRA_CHORDS[idx].notes[i];
+        }
+        s_xtra_chord_cnt = XTRA_CHORDS[idx].n;
+        s_xtra_chord_active = idx;
+    }
+    xtra_chord_refresh();
+}
+
 static void create_performance_screen(void) {
     scr_performance = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_performance, RED808_BG, 0);
@@ -9186,9 +9248,40 @@ static void create_performance_screen(void) {
     xtra_make_btn(scr_performance, x0 + 260,  ay, 250, 52, LV_SYMBOL_UPLOAD "  APPLY", theme_accent2(), xtra_apply_cb, 0);
     xtra_refresh_loop_btn();
 
-    // (XTRA DRONE panel removed — the drone now lives on the PIANO via the
-    //  one-tap DRONE / SUSTAIN buttons, which actually sustain. XTRA is just the
-    //  sample + loop.)
+    // --- DRONE chord pads (right column) — one tap = sustained chord under the
+    //     looping sample, to hear the Fred reframe without playing the piano.
+    {
+        const int bx = 540, by = 356;
+        lv_obj_t* dp = lv_obj_create(scr_performance);
+        lv_obj_set_size(dp, W - bx - x0, 174);
+        lv_obj_set_pos(dp, bx, by);
+        lv_obj_set_style_radius(dp, 10, 0);
+        lv_obj_set_style_bg_color(dp, RED808_PANEL, 0);
+        lv_obj_set_style_bg_opa(dp, LV_OPA_40, 0);
+        lv_obj_set_style_border_width(dp, 1, 0);
+        lv_obj_set_style_border_color(dp, theme_accent2(), 0);
+        lv_obj_set_style_border_opa(dp, LV_OPA_50, 0);
+        lv_obj_set_style_pad_all(dp, 0, 0);
+        lv_obj_clear_flag(dp, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* dt = lv_label_create(scr_performance);
+        lv_label_set_text(dt, LV_SYMBOL_AUDIO "  DRONE  (azul=menor  ambar=mayor)");
+        lv_obj_set_style_text_font(dt, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(dt, theme_accent2(), 0);
+        lv_obj_set_pos(dt, bx + 12, by + 8);
+
+        const int cols = 4, cw = 104, chh = 50, gap = 8;
+        for (int i = 0; i < XTRA_CHORD_COUNT; i++) {
+            int r = i / cols, c = i % cols;
+            int cx = bx + 12 + c * (cw + gap);
+            int cy = by + 36 + r * (chh + gap);
+            lv_color_t col = (XTRA_CHORDS[i].n == 0) ? RED808_ERROR
+                           : (XTRA_CHORDS[i].major ? lv_color_hex(0xFFB300) : lv_color_hex(0x00B0FF));
+            s_xtra_chord_btns[i] = xtra_make_btn(scr_performance, cx, cy, cw, chh,
+                                                 XTRA_CHORDS[i].lbl, col, xtra_chord_cb, i);
+        }
+        xtra_chord_refresh();
+    }
 
     xtra_load_state();
     s_xtra_edit_slot = 0;
@@ -9248,6 +9341,8 @@ static void ui_reload_themed_screens(void) {
     s_xtra_wave_panel = NULL; s_xtra_wave_line = NULL;
     s_xtra_trim_a_line = NULL; s_xtra_trim_b_line = NULL;
     s_xtra_playhead_line = NULL; s_xtra_play_start_ms = 0;
+    for (int i = 0; i < XTRA_CHORD_COUNT; i++) s_xtra_chord_btns[i] = NULL;
+    s_xtra_chord_cnt = 0; s_xtra_chord_active = -1;
     s_xtra_loop_btn = NULL; s_xtra_loop_on = false;
     s_xtra_info_lbl = NULL; s_xtra_trim_lbl = NULL; s_xtra_fade_lbl = NULL;
     for (int i = 0; i < 4; i++) { grid_xtra_btns[i] = NULL; grid_xtra_delete_btns[i] = NULL; }
@@ -9433,10 +9528,11 @@ void ui_navigate_to(int screen_id) {
         // Leaving the XTRA screen: drop the drone so it doesn't get stuck (the
         // synth all-notes-off below would silence it anyway; keep state in sync)
         // and stop/hide the playhead so it doesn't freeze mid-sweep.
-        // Leaving XTRA: keep the drone + loop playing as a backing layer (so you
-        // can go to LIVE and jam pads over them). Just hide the on-screen cursor.
+        // Leaving XTRA: hide the playhead and drop the chord-drone state (the
+        // synth all-notes-off below silences it; keep our tracking in sync).
         if (active_screen == 6 && screen_id != 6) {
             if (s_xtra_playhead_line) lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+            s_xtra_chord_cnt = 0; s_xtra_chord_active = -1;
         }
         bool keep_piano_preview = s_piano_play_active &&
             ((active_screen == 10 && screen_id == 11) || (active_screen == 11 && screen_id == 10));
