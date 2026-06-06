@@ -7032,14 +7032,46 @@ static void piano_refresh_sustain_btn(void) {
     lv_obj_set_style_border_width(s_piano_sustain_btn, s_piano_sustain ? 3 : 1, 0);
 }
 
-// SUSTAIN pedal — Hans-Zimmer style. While ON, notes you play keep ringing
-// after you lift your finger (they're never released on key-up), so you build a
-// sustained pad/chord and it holds. Tap SUSTAIN again to release everything.
-// All on the piano's own engine → no routing conflict, smooth infinite hold.
+// Amp-envelope param IDs per engine (from shared/synth_params.h). WT is
+// attack/decay only (no sustain stage) so it physically can't hold a drone.
+static int piano_engine_sus_param(uint8_t eng) {
+    switch (eng) {
+        case SP_ENGINE_303:   return 9;    // "Sustain"
+        case SP_ENGINE_SH101: return 9;    // "VCA Sus"
+        case SP_ENGINE_FM2OP: return 2;    // "C Sus"
+        default:              return -1;   // WT, etc. — no sustain stage
+    }
+}
+static int piano_engine_rel_param(uint8_t eng) {
+    switch (eng) {
+        case SP_ENGINE_303:   return 10;
+        case SP_ENGINE_SH101: return 10;
+        case SP_ENGINE_FM2OP: return 3;
+        default:              return -1;
+    }
+}
+
+// SUSTAIN pedal — Hans-Zimmer style. While ON: notes you play stay gated after
+// key-up AND the engine's amp sustain is pushed to max, so the chord holds
+// forever (a real drone). Tapping off releases the pad and restores the preset.
+// WT has no sustain stage, so it warns instead.
 static void piano_sustain_btn_cb(lv_event_t* e) {
     LV_UNUSED(e);
+    uint8_t eng = piano_engine_code();
+    int sus = piano_engine_sus_param(eng);
+    int rel = piano_engine_rel_param(eng);
     s_piano_sustain = !s_piano_sustain;
-    if (!s_piano_sustain) piano_send_off();   // pedal up → release the whole held pad
+    if (s_piano_sustain) {
+        if (sus < 0) {
+            ui_show_toast("WT no sostiene: usa SH101 / 303 / FM2", RED808_WARNING);
+        } else if (ui_use_udp_transport()) {
+            udp_send_synth_param(eng, 0, (uint8_t)sus, 1.0f);             // hold at full while gated
+            if (rel >= 0) udp_send_synth_param(eng, 0, (uint8_t)rel, 1.5f);  // smooth tail on release
+        }
+    } else {
+        piano_send_off();                     // release the whole held pad
+        piano_sync_active_engine_state();     // restore the preset's envelope
+    }
     piano_refresh_sustain_btn();
 }
 
