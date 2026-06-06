@@ -56,8 +56,21 @@ void lv_free_core(void * p)
 
 void lv_mem_monitor_core(lv_mem_monitor_t * mon_p)
 {
-    /* Heap is shared with the rest of the firmware; LVGL-only stats are N/A. */
-    LV_UNUSED(mon_p);
+    /* LVGL shares the global PSRAM heap, so report the whole PSRAM pool — that's
+     * the number that actually matters for OOM here. */
+    if (mon_p == NULL) return;
+    size_t total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    size_t freeb = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t big   = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    size_t used  = (total > freeb) ? (total - freeb) : 0;
+    mon_p->total_size        = total;
+    mon_p->free_cnt          = 0;
+    mon_p->free_size         = freeb;
+    mon_p->free_biggest_size = big;
+    mon_p->used_cnt          = 0;
+    mon_p->max_used          = used;
+    mon_p->used_pct          = total ? (uint8_t)((used * 100) / total) : 0;
+    mon_p->frag_pct          = freeb ? (uint8_t)(100 - (big * 100) / freeb) : 0;
 }
 
 lv_result_t lv_mem_test_core(void)
