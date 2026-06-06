@@ -8725,6 +8725,11 @@ static bool xtra_apply_current(void) {
     size_t n = sample_edit::bake_wav(SD_MMC, outp, s.trim_start, s.trim_end,
                                      s.fade_in_ms, s.fade_out_ms);
     if (n == 0) { ui_busy_hide(); ui_show_toast("Error al procesar el sample", RED808_WARNING); return false; }
+    if (n > 4U * 1024U * 1024U) {   // protect the Master: oversized uploads reboot it
+        ui_busy_hide();
+        ui_show_toast("Sample muy largo — recorta con TRIM (~max 20s)", RED808_WARNING);
+        return false;
+    }
     char postname[40];
     snprintf(postname, sizeof(postname), "%s.wav", s.name[0] ? s.name : "xtra");
     bool ok = xtra_http_upload_path(outp, postname, s.pad);
@@ -8780,16 +8785,11 @@ static void update_xtra_playhead(void) {
     }
     unsigned long el = millis() - s_xtra_play_start_ms;
     if (el >= s_xtra_play_dur_ms) {
-        if (s_xtra_loop_on && udp_wifi_connected() &&
-            s_xtra_edit_slot >= 0 && s_xtra_edit_slot < 4) {
-            udp_send_trigger(s_xtra_slots[s_xtra_edit_slot].pad, 110);  // LOOP: re-fire the sample
-            s_xtra_play_start_ms = millis();
-            el = 0;
-        } else {
-            s_xtra_play_start_ms = 0;
-            lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
-            return;
-        }
+        // End of pass. Looping is restarted by ui_backing_layer_tick() (which
+        // runs on every screen); here we only hide the cursor when it's done.
+        if (!s_xtra_loop_on) s_xtra_play_start_ms = 0;
+        lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
+        return;
     }
     float prog = (float)el / (float)s_xtra_play_dur_ms;              // 0..1
     float pos  = s_xtra_play_a + prog * (s_xtra_play_b - s_xtra_play_a);
@@ -8865,6 +8865,8 @@ static int     s_drone_mode     = 2;     // maj — a full chord bed is far more
 static uint8_t s_drone_level    = 110;   // note velocity (louder = more present under the sample)
 static uint8_t s_drone_notes[4] = {0};
 static int     s_drone_note_cnt = 0;
+static unsigned long s_drone_keepalive_ms = 0;   // last (re)voice time for the keep-alive
+static constexpr unsigned long DRONE_KEEPALIVE_MS = 9000;  // re-voice every 9s so the pad never dies
 
 static lv_obj_t* s_drone_toggle_btn = NULL;
 static lv_obj_t* s_drone_status_lbl = NULL;
@@ -8932,12 +8934,7 @@ static void drone_revoice(void) {
         }
         s_drone_note_cnt = n;
     }
-    drone_refresh_ui();
-}
-
-static void drone_force_off(void) {
-    drone_all_off();
-    s_drone_on = false;
+    s_drone_keepalive_ms = millis();   // reset the keep-alive countdown
     drone_refresh_ui();
 }
 
@@ -9411,10 +9408,9 @@ void ui_navigate_to(int screen_id) {
         // Leaving the XTRA screen: drop the drone so it doesn't get stuck (the
         // synth all-notes-off below would silence it anyway; keep state in sync)
         // and stop/hide the playhead so it doesn't freeze mid-sweep.
+        // Leaving XTRA: keep the drone + loop playing as a backing layer (so you
+        // can go to LIVE and jam pads over them). Just hide the on-screen cursor.
         if (active_screen == 6 && screen_id != 6) {
-            if (s_drone_on) drone_force_off();
-            s_xtra_loop_on = false; xtra_refresh_loop_btn();
-            s_xtra_play_start_ms = 0;
             if (s_xtra_playhead_line) lv_obj_add_flag(s_xtra_playhead_line, LV_OBJ_FLAG_HIDDEN);
         }
         bool keep_piano_preview = s_piano_play_active &&
@@ -9425,8 +9421,12 @@ void ui_navigate_to(int screen_id) {
             for (int eng = 0; eng < SYNTH_ENGINE_COUNT; eng++) {
                 udp_send_synth_note_off(eng, 0);  // engine, track=0
             }
+            // ...but the drone is a persistent backing layer — bring it back
+            // right after the all-notes-off so it survives the screen change.
+            // Not when entering PIANO: the drone engine would fight the piano's.
+            if (s_drone_on && screen_id != 10 && screen_id != 11) drone_revoice();
         }
-        
+
         lv_scr_load_anim(targets[screen_id], LV_SCR_LOAD_ANIM_FADE_ON, 200, 0, false);
         prev_active_screen = active_screen;
         active_screen = screen_id;
@@ -9738,10 +9738,31 @@ void ui_pad_frame_update(const bool pressed[16], const uint8_t velocity[16],
     }
 }
 
+// Persistent backing layer — runs on EVERY screen so the XTRA loop keeps
+// re-firing and the drone keeps sounding while you play piano/pads over them.
+static void ui_backing_layer_tick(void) {
+    unsigned long now = millis();
+    // XTRA sample loop: re-fire at the end of each pass, regardless of screen.
+    if (s_xtra_loop_on && s_xtra_play_start_ms != 0 &&
+        now - s_xtra_play_start_ms >= s_xtra_play_dur_ms) {
+        if (ui_use_udp_transport() && s_xtra_edit_slot >= 0 && s_xtra_edit_slot < 4)
+            udp_send_trigger(s_xtra_slots[s_xtra_edit_slot].pad, 110);
+        s_xtra_play_start_ms = now;
+    }
+    // Drone keep-alive: re-voice every DRONE_KEEPALIVE_MS so the pad sustains
+    // indefinitely while it's ON. Skipped on the PIANO screens — re-asserting the
+    // drone engine there would hijack the piano's melody-engine routing.
+    if (s_drone_on && active_screen != 10 && active_screen != 11 &&
+        now - s_drone_keepalive_ms >= DRONE_KEEPALIVE_MS) {
+        drone_revoice();   // also resets s_drone_keepalive_ms
+    }
+}
+
 void ui_update_current_screen(void) {
     unsigned long now = millis();
     static unsigned long boot_enter_ms = 0;
     ui_toast_update();
+    ui_backing_layer_tick();
 
     // Apply deferred master→UI track-engine sync staged from Core 1 (UDP).
     // Done here so the LVGL object writes happen on the render task under lock.
