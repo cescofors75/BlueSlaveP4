@@ -54,6 +54,10 @@
     #define LV_USE_SYSMON         1
     #define LV_USE_PERF_MONITOR   1
     #define LV_USE_MEM_MONITOR    1
+    // Put the overlays at the TOP corners so they don't sit on the piano
+    // keyboard / pads (which fill the bottom, esp. in 24-key mode).
+    #define LV_USE_PERF_MONITOR_POS  LV_ALIGN_TOP_RIGHT
+    #define LV_USE_MEM_MONITOR_POS   LV_ALIGN_TOP_LEFT
 #else
     #define LV_USE_SYSMON         0
     #define LV_USE_PERF_MONITOR   0
