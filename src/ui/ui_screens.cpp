@@ -1250,7 +1250,7 @@ static void trim_wav_extension(char* name) {
     size_t n = strlen(name);
     if (n > 4) {
         const char* ext = name + n - 4;
-        if (strcasecmp(ext, ".wav") == 0) {
+        if (strcasecmp(ext, ".wav") == 0 || strcasecmp(ext, ".mp3") == 0) {
             name[n - 4] = '\0';
         }
     }
@@ -5311,8 +5311,9 @@ static void sd_local_refresh_listing(bool reset_selection) {
         if (!is_dir) {
             size_t nlen = strlen(base);
             bool is_wav = (nlen > 4 && strcasecmp(base + nlen - 4, ".wav") == 0);
+            bool is_mp3 = (nlen > 4 && strcasecmp(base + nlen - 4, ".mp3") == 0);
             is_midi = (nlen > 4 && strcasecmp(base + nlen - 4, ".mid") == 0);
-            if (!is_wav && !is_midi) {
+            if (!is_wav && !is_mp3 && !is_midi) {
                 entry.close();
                 entry = dir.openNextFile();
                 continue;
@@ -6059,7 +6060,7 @@ static void sd_refresh_ui(void) {
 
     if (p4sd.list_complete && p4sd.entry_count == 0) {
         lv_obj_t* lbl = lv_label_create(sd_file_list);
-        lv_label_set_text(lbl, "No files found (.wav / .mid)");
+        lv_label_set_text(lbl, "No files found (.wav / .mp3 / .mid)");
         lv_obj_set_style_text_color(lbl, RED808_TEXT_DIM, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
     }
@@ -8917,7 +8918,10 @@ static void drone_revoice(void) {
     drone_all_off();
     if (s_drone_on && ui_use_udp_transport()) {
         uint8_t eng = DRONE_ENGINES[s_drone_eng_idx];
-        int notes[3];
+        // Route to this engine on the Master (like the piano does). Without it
+        // the held notes go nowhere even though the engine sustains fine.
+        udp_send_melody_set_engine(eng);
+        int notes[4];
         int n = drone_build_notes(s_drone_root, s_drone_mode, notes);
         for (int i = 0; i < n; i++) {
             int v = notes[i];
@@ -8940,6 +8944,8 @@ static void drone_force_off(void) {
 static void drone_toggle_cb(lv_event_t* e) {
     (void)e;
     s_drone_on = !s_drone_on;
+    if (s_drone_on && ui_use_udp_transport())
+        udp_send_synth_preset(DRONE_ENGINES[s_drone_eng_idx], 0);  // load a default patch so it sounds
     drone_revoice();
 }
 
@@ -8956,6 +8962,8 @@ static void drone_engine_cb(lv_event_t* e) {
     (void)e;
     drone_all_off();   // release notes on the OLD engine before switching
     s_drone_eng_idx = (s_drone_eng_idx + 1) % DRONE_ENGINE_COUNT;
+    if (s_drone_on && ui_use_udp_transport())
+        udp_send_synth_preset(DRONE_ENGINES[s_drone_eng_idx], 0);
     drone_revoice();
 }
 
