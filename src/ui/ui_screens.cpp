@@ -8918,7 +8918,10 @@ static void drone_revoice(void) {
     drone_all_off();
     if (s_drone_on && ui_use_udp_transport()) {
         uint8_t eng = DRONE_ENGINES[s_drone_eng_idx];
-        int notes[3];
+        // Route to this engine on the Master (like the piano does). Without it
+        // the held notes go nowhere even though the engine sustains fine.
+        udp_send_melody_set_engine(eng);
+        int notes[4];
         int n = drone_build_notes(s_drone_root, s_drone_mode, notes);
         for (int i = 0; i < n; i++) {
             int v = notes[i];
@@ -8941,6 +8944,8 @@ static void drone_force_off(void) {
 static void drone_toggle_cb(lv_event_t* e) {
     (void)e;
     s_drone_on = !s_drone_on;
+    if (s_drone_on && ui_use_udp_transport())
+        udp_send_synth_preset(DRONE_ENGINES[s_drone_eng_idx], 0);  // load a default patch so it sounds
     drone_revoice();
 }
 
@@ -8957,6 +8962,8 @@ static void drone_engine_cb(lv_event_t* e) {
     (void)e;
     drone_all_off();   // release notes on the OLD engine before switching
     s_drone_eng_idx = (s_drone_eng_idx + 1) % DRONE_ENGINE_COUNT;
+    if (s_drone_on && ui_use_udp_transport())
+        udp_send_synth_preset(DRONE_ENGINES[s_drone_eng_idx], 0);
     drone_revoice();
 }
 
