@@ -7067,12 +7067,39 @@ static void piano_sustain_btn_cb(lv_event_t* e) {
         } else if (ui_use_udp_transport()) {
             udp_send_synth_param(eng, 0, (uint8_t)sus, 1.0f);             // hold at full while gated
             if (rel >= 0) udp_send_synth_param(eng, 0, (uint8_t)rel, 1.5f);  // smooth tail on release
+            // Re-trigger any notes still held so they restart under the now-
+            // infinite sustain (a note that already decayed to IDLE on the 303
+            // wouldn't otherwise come back).
+            for (int n = 0; n < 128; n++)
+                if (s_piano_note_active[n])
+                    udp_send_synth_note_on_ex(eng, (uint8_t)n, 110, false, false);
         }
     } else {
         piano_send_off();                     // release the whole held pad
         piano_sync_active_engine_state();     // restore the preset's envelope
     }
     piano_refresh_sustain_btn();
+}
+
+// One-tap DRONE: configure the whole proven recipe automatically — switch to
+// SH101 (the engine that truly sustains), load its "Drone" preset, max the VCA
+// sustain, and turn the SUSTAIN pedal on. After this you just play and hold.
+static void piano_one_tap_drone_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    if (s_piano_engine_idx != 2) {        // 2 = SH101 in PIANO_ENGINES {3,4,5,6}
+        piano_send_off();
+        s_piano_engine_idx = 2;
+        piano_refresh_engine_chips();
+        piano_refresh_engine_preset_label();
+    }
+    if (ui_use_udp_transport()) {
+        udp_send_melody_set_engine(SP_ENGINE_SH101);       // route to SH101
+        udp_send_synth_preset(SP_ENGINE_SH101, 3);          // "Drone" preset (Bass/Acid/Keys/Drone)
+        udp_send_synth_param(SP_ENGINE_SH101, 0, 9, 1.0f);  // VCA Sus = max → infinite hold
+        udp_send_synth_param(SP_ENGINE_SH101, 0, 10, 1.5f); // VCA Rel = smooth tail
+    }
+    if (!s_piano_sustain) { s_piano_sustain = true; piano_refresh_sustain_btn(); }
+    ui_show_toast("DRONE listo (SH101) — toca y manten", RED808_SUCCESS);
 }
 
 static void piano_rec_btn_cb(lv_event_t* e) {
@@ -7680,6 +7707,13 @@ static void create_piano_screen(void) {
         s_piano_sustain_btn = piano_make_chip(scr_piano, x_cursor, row_y2, 150, 36, "SUSTAIN");
         lv_obj_add_event_cb(s_piano_sustain_btn, piano_sustain_btn_cb, LV_EVENT_CLICKED, NULL);
         piano_refresh_sustain_btn();
+        x_cursor += 150 + 8;
+
+        /* One-tap DRONE: SH101 + Drone preset + sustain, all set up automatically */
+        lv_obj_t* drone1 = piano_make_chip(scr_piano, x_cursor, row_y2, 150, 36, LV_SYMBOL_AUDIO " DRONE");
+        lv_obj_set_style_border_color(drone1, lv_color_hex(0x00E5FF), 0);
+        { lv_obj_t* l = lv_obj_get_child(drone1, 0); if (l) lv_obj_set_style_text_color(l, lv_color_hex(0x00E5FF), 0); }
+        lv_obj_add_event_cb(drone1, piano_one_tap_drone_cb, LV_EVENT_CLICKED, NULL);
     }
 
     /* Melody grid container: 16 cols × 12 rows pitch grid */
@@ -9008,47 +9042,6 @@ static void drone_revoice(void) {
     drone_refresh_ui();
 }
 
-static void drone_toggle_cb(lv_event_t* e) {
-    (void)e;
-    s_drone_on = !s_drone_on;
-    if (s_drone_on && ui_use_udp_transport())
-        udp_send_synth_preset(DRONE_ENGINES[s_drone_eng_idx], 0);  // load a default patch so it sounds
-    drone_revoice();
-}
-
-static void drone_root_cb(lv_event_t* e) {
-    int code = (int)(intptr_t)lv_event_get_user_data(e);   // 0:-1  1:+1  2:-12  3:+12
-    int d = (code == 0) ? -1 : (code == 1) ? +1 : (code == 2) ? -12 : +12;
-    s_drone_root += d;
-    if (s_drone_root < 12)  s_drone_root = 12;
-    if (s_drone_root > 108) s_drone_root = 108;
-    drone_revoice();
-}
-
-static void drone_engine_cb(lv_event_t* e) {
-    (void)e;
-    drone_all_off();   // release notes on the OLD engine before switching
-    s_drone_eng_idx = (s_drone_eng_idx + 1) % DRONE_ENGINE_COUNT;
-    if (s_drone_on && ui_use_udp_transport())
-        udp_send_synth_preset(DRONE_ENGINES[s_drone_eng_idx], 0);
-    drone_revoice();
-}
-
-static void drone_mode_cb(lv_event_t* e) {
-    (void)e;
-    s_drone_mode = (s_drone_mode + 1) % DRONE_MODE_COUNT;
-    drone_revoice();
-}
-
-static void drone_level_cb(lv_event_t* e) {
-    int code = (int)(intptr_t)lv_event_get_user_data(e);   // 0:- 1:+
-    int v = (int)s_drone_level + (code ? +8 : -8);
-    if (v < 24)  v = 24;
-    if (v > 127) v = 127;
-    s_drone_level = (uint8_t)v;
-    drone_revoice();   // retrigger at the new velocity
-}
-
 static void create_performance_screen(void) {
     scr_performance = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_performance, RED808_BG, 0);
@@ -9193,48 +9186,9 @@ static void create_performance_screen(void) {
     xtra_make_btn(scr_performance, x0 + 260,  ay, 250, 52, LV_SYMBOL_UPLOAD "  APPLY", theme_accent2(), xtra_apply_cb, 0);
     xtra_refresh_loop_btn();
 
-    // --- DRONE panel (right half, below the waveform; trim/fade live on left) -
-    {
-        const int bx = 540, by = 356;
-        lv_obj_t* dp = lv_obj_create(scr_performance);
-        lv_obj_set_size(dp, W - bx - x0, 174);   // right column, aligned with the action row bottom
-        lv_obj_set_pos(dp, bx, by);
-        lv_obj_set_style_radius(dp, 10, 0);
-        lv_obj_set_style_bg_color(dp, RED808_PANEL, 0);
-        lv_obj_set_style_bg_opa(dp, LV_OPA_40, 0);
-        lv_obj_set_style_border_width(dp, 1, 0);
-        lv_obj_set_style_border_color(dp, theme_accent2(), 0);
-        lv_obj_set_style_border_opa(dp, LV_OPA_50, 0);
-        lv_obj_set_style_pad_all(dp, 0, 0);
-        lv_obj_clear_flag(dp, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t* dt = lv_label_create(scr_performance);
-        lv_label_set_text(dt, LV_SYMBOL_AUDIO "  DRONE");
-        lv_obj_set_style_text_font(dt, &lv_font_montserrat_18, 0);
-        lv_obj_set_style_text_color(dt, theme_accent2(), 0);
-        lv_obj_set_pos(dt, bx + 14, by + 12);
-
-        s_drone_toggle_btn = xtra_make_btn(scr_performance, bx + 300, by + 8, 130, 36,
-                                           "DRONE OFF", theme_accent2(), drone_toggle_cb, 0);
-
-        s_drone_status_lbl = lv_label_create(scr_performance);
-        lv_obj_set_style_text_font(s_drone_status_lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(s_drone_status_lbl, bx + 14, by + 50);
-
-        int ry = by + 78;    // root / octave / velocity row
-        xtra_make_btn(scr_performance, bx + 14,  ry, 60, 34, LV_SYMBOL_LEFT,  RED808_SUCCESS, drone_root_cb, 0);
-        xtra_make_btn(scr_performance, bx + 80,  ry, 60, 34, LV_SYMBOL_RIGHT, RED808_SUCCESS, drone_root_cb, 1);
-        xtra_make_btn(scr_performance, bx + 150, ry, 70, 34, "OCT-", RED808_CYAN,    drone_root_cb,  2);
-        xtra_make_btn(scr_performance, bx + 226, ry, 70, 34, "OCT+", RED808_CYAN,    drone_root_cb,  3);
-        xtra_make_btn(scr_performance, bx + 320, ry, 56, 34, "VEL-", RED808_WARNING, drone_level_cb, 0);
-        xtra_make_btn(scr_performance, bx + 380, ry, 56, 34, "VEL+", RED808_WARNING, drone_level_cb, 1);
-
-        int ey = by + 120;   // engine / mode row
-        xtra_make_btn(scr_performance, bx + 14,  ey, 200, 36, "ENGINE", theme_text(), drone_engine_cb, 0);
-        xtra_make_btn(scr_performance, bx + 226, ey, 210, 36, "MODE",   theme_text(), drone_mode_cb,   0);
-
-        drone_refresh_ui();
-    }
+    // (XTRA DRONE panel removed — the drone now lives on the PIANO via the
+    //  one-tap DRONE / SUSTAIN buttons, which actually sustain. XTRA is just the
+    //  sample + loop.)
 
     xtra_load_state();
     s_xtra_edit_slot = 0;
