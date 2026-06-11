@@ -8,6 +8,7 @@
 #include "ui/ui_screens.h"
 #include "../include/config.h"
 #include <Arduino.h>
+#include <atomic>
 
 #if P4_USB_CDC_ENABLED
 #include "usb_cdc_handler.h"
@@ -89,7 +90,10 @@ enum PendingPushPhase {
     PP_START,
 };
 struct PendingPush {
-    PendingPushPhase phase;
+    // phase is the cross-core publish flag: staged from the LVGL task
+    // (Core 0), drained by loop() (Core 1). Atomic with release/acquire so
+    // the drainer never sees PP_SELECT before the snapshot below is complete.
+    std::atomic<PendingPushPhase> phase;
     uint8_t  slot;
     int      idx;          // index within current phase
     uint32_t next_ms;      // earliest millis() to send next packet
@@ -104,13 +108,15 @@ static constexpr int PP_PACKETS_PER_TICK = 12;  // packets drained per loop()
 static constexpr uint32_t PP_INTER_MS    = 1;   // pacing between bursts
 
 static void stage_pattern_push(uint8_t slot, const bool steps[16][16]) {
-    s_push.phase   = PP_SELECT;
+    // Fill the snapshot first; publishing the phase must come LAST or the
+    // Core-1 drainer can start sending a half-copied snapshot.
     s_push.slot    = slot;
     s_push.idx     = 0;
     s_push.next_ms = millis();
     for (int t = 0; t < 16; t++)
         for (int s = 0; s < 16; s++)
             s_push.step_bits[t][s] = steps[t][s];
+    s_push.phase.store(PP_SELECT, std::memory_order_release);
 }
 
 static void remember_master_pattern(uint8_t slot, const bool steps[16][16]) {
@@ -415,17 +421,25 @@ static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
                 case SYS_WIFI_STATE:  p4.s3_wifi_connected = (val != 0);   break;
                 case SYS_MASTER_CONN: p4.master_connected = (val != 0);    break;
                 case SYS_THEME:       p4.theme = val;                      break;
+                // Relay volumes only on change — same P4↔S3↔Master loop
+                // topology that required TRACK_ECHO_GUARD_MS for mute/solo.
                 case SYS_VOLUME:
-                    p4.master_volume = val;
-                    if (udp_wifi_connected()) udp_send_set_volume(val);
+                    if (p4.master_volume != val) {
+                        p4.master_volume = val;
+                        if (udp_wifi_connected()) udp_send_set_volume(val);
+                    }
                     break;
                 case SYS_SEQ_VOL:
-                    p4.seq_volume = val;
-                    if (udp_wifi_connected()) udp_send_set_seq_volume(val);
+                    if (p4.seq_volume != val) {
+                        p4.seq_volume = val;
+                        if (udp_wifi_connected()) udp_send_set_seq_volume(val);
+                    }
                     break;
                 case SYS_LIVE_VOL:
-                    p4.live_volume = val;
-                    if (udp_wifi_connected()) udp_send_set_live_volume(val);
+                    if (p4.live_volume != val) {
+                        p4.live_volume = val;
+                        if (udp_wifi_connected()) udp_send_set_live_volume(val);
+                    }
                     break;
                 case SYS_HEARTBEAT:
                     {
@@ -483,11 +497,15 @@ static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
                 // 16-bit values arrive as two packets (H then L). Accumulate
                 // into a staging variable and commit to p4.* only when the
                 // low byte arrives so UI never reads a half-updated value.
+                // Staging is per-transport: UART and USB can both be live
+                // during bring-up, and interleaved H/L pairs across feeds
+                // would corrupt the committed value.
                 case FX_CUTOFF_H: {
-                    static int s_cutoff_staging = 20000;
-                    s_cutoff_staging = (s_cutoff_staging & 0x00FF) | (val << 8);
+                    static int s_cutoff_staging[2] = {20000, 20000};
+                    int src = from_usb ? 1 : 0;
+                    s_cutoff_staging[src] = (s_cutoff_staging[src] & 0x00FF) | (val << 8);
                     // Expose staging until L arrives — keeps high byte visible.
-                    p4.cutoff_hz = s_cutoff_staging;
+                    p4.cutoff_hz = s_cutoff_staging[src];
                     break;
                 }
                 case FX_CUTOFF_L: {
@@ -499,9 +517,10 @@ static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
                 case FX_DISTORTION:   p4.distortion_pct = val;            break;
                 case FX_BITCRUSH:     p4.bitcrush_bits = val;             break;
                 case FX_SAMPLERATE_H: {
-                    static int s_sr_staging = 32000;
-                    s_sr_staging = (s_sr_staging & 0x00FF) | (val << 8);
-                    p4.sample_rate_hz = s_sr_staging;
+                    static int s_sr_staging[2] = {32000, 32000};
+                    int src = from_usb ? 1 : 0;
+                    s_sr_staging[src] = (s_sr_staging[src] & 0x00FF) | (val << 8);
+                    p4.sample_rate_hz = s_sr_staging[src];
                     break;
                 }
                 case FX_SAMPLERATE_L: {
@@ -772,14 +791,42 @@ static void process_extended(uint8_t type, uint8_t id, const uint8_t* payload, i
 static int s_totalDiscarded = 0;
 static int s_processed = 0;
 
+// Resync after a corrupted frame: instead of discarding the whole window
+// (which can swallow the genuine start byte of the next packet after a single
+// dropped byte at 921600 baud), shift the buffer to the next 0xAA/0xAB
+// candidate. Worst case it's a payload byte and the next checksum fails again.
+static void parser_resync(RxParser& parser) {
+    int next = -1;
+    for (int i = 1; i < parser.head; i++) {
+        if (parser.buf[i] == UART_START_BASIC || parser.buf[i] == UART_START_EXTENDED) {
+            next = i;
+            break;
+        }
+    }
+    if (next < 0) {
+        parser.head = 0;
+        return;
+    }
+    memmove(parser.buf, parser.buf + next, parser.head - next);
+    parser.head -= next;
+}
+
+// Drop n consumed bytes from the front of the window, keeping the rest.
+static void parser_consume(RxParser& parser, int n) {
+    if (n >= parser.head) {
+        parser.head = 0;
+        return;
+    }
+    memmove(parser.buf, parser.buf + n, parser.head - n);
+    parser.head -= n;
+}
+
 // Feed one byte into one transport's protocol parser.
 static void feed_byte(RxParser& parser, uint8_t b, bool from_usb) {
     bool link_active = p4.s3_connected;
 #if P4_USB_CDC_ENABLED
     if (from_usb) link_active = usb_cdc_connected() || p4.s3_connected;
 #endif
-
-    parser.buf[parser.head] = b;
 
     // Look for start byte
     if (parser.head == 0) {
@@ -795,41 +842,59 @@ static void feed_byte(RxParser& parser, uint8_t b, bool from_usb) {
         }
     }
 
-    parser.head++;
-
-    // Basic packet complete?
-    if (parser.buf[0] == UART_START_BASIC && parser.head >= UART_BASIC_LEN) {
-        UartBasicPacket* pkt = (UartBasicPacket*)parser.buf;
-        bool is_heartbeat = (pkt->type == MSG_SYSTEM && pkt->id == SYS_HEARTBEAT);
-        if (!p4.s3_connected && !is_heartbeat) {
-            parser.head = 0;
-            return;
-        }
-        if (uart_validate_packet(pkt)) {
-            process_basic(pkt, from_usb);
-            uart_stats.rx_packets++;
-            s_processed++;
-        } else {
-            if (link_active || is_heartbeat) uart_stats.rx_checksum_errors++;
-        }
+    // Guard against buffer overflow (defensive — the parse loop below keeps
+    // head below the largest accepted frame size).
+    if (parser.head >= (int)sizeof(parser.buf)) {
         parser.head = 0;
+        return;
     }
 
-    // Extended packet header complete?
-    if (parser.buf[0] == UART_START_EXTENDED && parser.head >= UART_EXT_HEADER_LEN) {
-        UartExtendedHeader* hdr = (UartExtendedHeader*)parser.buf;
-        int payload_len = ((int)hdr->len_h << 8) | hdr->len_l;
-        int total = UART_EXT_HEADER_LEN + payload_len + 1; // +1 for checksum
+    parser.buf[parser.head] = b;
+    parser.head++;
 
-        // Reject oversized payload up front (also catches garbage in len bytes)
-        if (payload_len > UART_EXT_MAX_PAYLOAD || total > (int)sizeof(parser.buf)) {
-            // Packet too large — discard and resync
-            if (link_active) uart_stats.rx_checksum_errors++;
-            parser.head = 0;
-            return;
+    // Parse as many complete frames as the window holds. After a resync the
+    // window can already contain one or more complete packets, so loop until
+    // the leading frame is incomplete. parser_resync() guarantees buf[0] is a
+    // start byte whenever head > 0.
+    for (;;) {
+        if (parser.head == 0) return;
+
+        // Basic packet?
+        if (parser.buf[0] == UART_START_BASIC) {
+            if (parser.head < UART_BASIC_LEN) return;
+            UartBasicPacket* pkt = (UartBasicPacket*)parser.buf;
+            bool is_heartbeat = (pkt->type == MSG_SYSTEM && pkt->id == SYS_HEARTBEAT);
+            if (!p4.s3_connected && !is_heartbeat) {
+                parser_consume(parser, UART_BASIC_LEN);
+                continue;
+            }
+            if (uart_validate_packet(pkt)) {
+                process_basic(pkt, from_usb);
+                uart_stats.rx_packets++;
+                s_processed++;
+                parser_consume(parser, UART_BASIC_LEN);
+            } else {
+                if (link_active || is_heartbeat) uart_stats.rx_checksum_errors++;
+                parser_resync(parser);
+            }
+            continue;
         }
 
-        if (parser.head >= total) {
+        // Extended packet?
+        if (parser.buf[0] == UART_START_EXTENDED) {
+            if (parser.head < UART_EXT_HEADER_LEN) return;
+            UartExtendedHeader* hdr = (UartExtendedHeader*)parser.buf;
+            int payload_len = ((int)hdr->len_h << 8) | hdr->len_l;
+            int total = UART_EXT_HEADER_LEN + payload_len + 1; // +1 for checksum
+
+            // Reject oversized payload up front (also catches garbage in len bytes)
+            if (payload_len > UART_EXT_MAX_PAYLOAD || total > (int)sizeof(parser.buf)) {
+                if (link_active) uart_stats.rx_checksum_errors++;
+                parser_resync(parser);
+                continue;
+            }
+            if (parser.head < total) return;
+
             // Validate checksum (sum of all bytes)
             uint8_t sum = 0;
             for (int i = 0; i < total - 1; i++) sum += parser.buf[i];
@@ -838,16 +903,21 @@ static void feed_byte(RxParser& parser, uint8_t b, bool from_usb) {
                                  &parser.buf[UART_EXT_HEADER_LEN], payload_len);
                 uart_stats.rx_packets++;
                 s_processed++;
+                parser_consume(parser, total);
             } else {
                 if (link_active) uart_stats.rx_checksum_errors++;
+                parser_resync(parser);
             }
-            parser.head = 0;
+            continue;
         }
-    }
 
-    // Guard against buffer overflow
-    if (parser.head >= (int)sizeof(parser.buf)) {
-        parser.head = 0;
+        // head > 0 without a start byte at [0] — shouldn't happen, resync.
+        parser_resync(parser);
+        if (parser.head > 0 &&
+            parser.buf[0] != UART_START_BASIC && parser.buf[0] != UART_START_EXTENDED) {
+            parser.head = 0;
+            return;
+        }
     }
 }
 
@@ -950,7 +1020,7 @@ void uart_handler_tick_pending_push(void) {
         s_s3_preview_note_off_due_ms = 0;
     }
 
-    if (s_push.phase == PP_IDLE) return;
+    if (s_push.phase.load(std::memory_order_acquire) == PP_IDLE) return;
     if (!udp_wifi_connected()) {
         s_push.phase = PP_IDLE;
         return;

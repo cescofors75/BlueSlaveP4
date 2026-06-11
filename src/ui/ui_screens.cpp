@@ -61,6 +61,11 @@ static const uint32_t SOLO_DEBOUNCE_GLOBAL_MS = 70;
 // Direct touch bypass: flag used by touch_task to early-out when not on LIVE
 static std::atomic<bool> g_live_screen_active{false};
 
+// Bumped by ui_reload_themed_screens(). Update functions keep function-local
+// dirty caches (prev_* statics) that survive widget recreation; they compare
+// against this generation and force a full repaint after a theme reload.
+static uint32_t s_ui_refresh_gen = 1;
+
 // LIVE pad hit-rects mirrored from the LVGL layout. touch_task (Core 0,
 // prio 6) hit-tests against this cache instead of calling lv_obj_get_x/
 // get_width: those APIs can mutate layout state concurrently with the
@@ -838,7 +843,7 @@ static void xtra_load_param_state(void) {
     f.close();
 }
 
-static void xtra_save_param_state(void) {
+static void xtra_save_param_state_now(void) {
     File f = SPIFFS.open(XTRA_PADS_PARAMS_FILE, FILE_WRITE);
     if (!f) return;
     for (int slot = 0; slot < 4; slot++) {
@@ -852,6 +857,32 @@ static void xtra_save_param_state(void) {
         f.print('\n');
     }
     f.close();
+}
+
+// Debounced SPIFFS write: param cells repeat at ~10 Hz while held (slider
+// drags likewise), and each save rewrites the whole file from the LVGL task
+// (SPIFFS GC can block 100+ ms — visible hitches, plus flash wear). Mark
+// dirty here; xtra_param_save_tick() persists 2 s after the last change and
+// ui_navigate_to() flushes on screen exit.
+static bool     s_xtra_param_save_dirty = false;
+static uint32_t s_xtra_param_save_last_change_ms = 0;
+
+static void xtra_save_param_state(void) {
+    s_xtra_param_save_dirty = true;
+    s_xtra_param_save_last_change_ms = millis();
+}
+
+static void xtra_param_save_flush(void) {
+    if (!s_xtra_param_save_dirty) return;
+    s_xtra_param_save_dirty = false;
+    xtra_save_param_state_now();
+}
+
+static void xtra_param_save_tick(void) {
+    if (!s_xtra_param_save_dirty) return;
+    if (millis() - s_xtra_param_save_last_change_ms >= 2000) {
+        xtra_param_save_flush();
+    }
 }
 
 static const char* xtra_slot_mode_label(int slot) {
@@ -1278,10 +1309,13 @@ static uint8_t pad_inst_idx_from_engine_code(int8_t engine) {
     }
 }
 
+// inst index 8 (GuitarT, engine code 7) is master-assignable even though the
+// local modal only offers 0-7 — clamp at 8, not 7, or synced GuitarT tracks
+// display as Sampler.
 static void pad_inst_refresh_pad_badge(uint8_t pad) {
     if (pad > 15 || !live_pad_inst_labels[pad]) return;
     uint8_t inst = s_pad_inst_sel[pad];
-    if (inst > 7) inst = 0;
+    if (inst > 8) inst = 0;
     lv_label_set_text(live_pad_inst_labels[pad], PAD_INST_SHORT[inst]);
 }
 
@@ -1289,7 +1323,7 @@ static void pad_inst_refresh_controls(void) {
     uint8_t pad = s_pad_inst_focus_pad;
     if (pad > 15) pad = 15;
     uint8_t inst = s_pad_inst_sel[pad];
-    if (inst > 7) inst = 0;
+    if (inst > 8) inst = 0;
     if (grid_pad_lbl) lv_label_set_text_fmt(grid_pad_lbl, "PAD %02d", (int)pad + 1);
     if (grid_inst_lbl) lv_label_set_text(grid_inst_lbl, PAD_INST_NAMES[inst]);
 }
@@ -1297,7 +1331,7 @@ static void pad_inst_refresh_controls(void) {
 static void pad_inst_apply_to_master(uint8_t pad) {
     if (pad > 15) return;
     uint8_t inst = s_pad_inst_sel[pad];
-    if (inst > 7) inst = 0;
+    if (inst > 8) inst = 0;
     int8_t engine = pad_inst_engine_code(inst);
     s_pad_inst_local_ms[pad] = millis();
     if (udp_wifi_connected() || udp_master_connected()) {
@@ -1357,89 +1391,9 @@ static void pad_inst_consume_engine_sync(void) {
 static lv_obj_t* grid_sync_btn = NULL;
 static bool sync_pads_active = false;  // OFF by default (synced with S3)
 
-// Ripple effect — pool of expanding ring objects
-static constexpr int RIPPLE_POOL = 4;
-static constexpr int RIPPLE_FRAMES = 12;      // animation steps at ~60Hz = 200ms
-static constexpr int RIPPLE_MAX_R = 80;        // max radius in pixels
-struct RippleState {
-    lv_obj_t* obj = nullptr;
-    int frame = 0;         // 0 = inactive
-    lv_color_t color;
-    lv_coord_t cx, cy;     // center position (absolute on scr_live)
-};
-static RippleState ripples[RIPPLE_POOL];
-
-static void ripple_spawn(int pad) {
-    // DISABLED — ripple overlay forced LVGL to invalidate a large expanding
-    // area every frame for 200ms per tap. On the live screen this stacks up
-    // when tapping fast and drowns the render task. The pad border already
-    // flashes on press, which is enough feedback.
-    (void)pad;
-    return;
-    if (pad < 0 || pad >= 16 || !live_pad_btns[pad] || !scr_live) return;
-    // Calculate pad center in screen coordinates
-    lv_coord_t px = lv_obj_get_x(live_pad_btns[pad]);
-    lv_coord_t py = lv_obj_get_y(live_pad_btns[pad]);
-    lv_coord_t pw = lv_obj_get_width(live_pad_btns[pad]);
-    lv_coord_t ph = lv_obj_get_height(live_pad_btns[pad]);
-    lv_coord_t cx = px + pw / 2;
-    lv_coord_t cy = py + ph / 2;
-    lv_color_t tc = lv_color_hex(theme_presets[currentTheme].track_colors[pad]);
-
-    // Find free or oldest ripple slot
-    int slot = 0;
-    for (int i = 0; i < RIPPLE_POOL; i++) {
-        if (ripples[i].frame == 0) { slot = i; break; }
-        if (ripples[i].frame > ripples[slot].frame) slot = i;
-    }
-
-    RippleState& r = ripples[slot];
-    r.frame = 1;
-    r.color = tc;
-    r.cx = cx;
-    r.cy = cy;
-
-    if (!r.obj) {
-        r.obj = lv_obj_create(scr_live);
-        lv_obj_clear_flag(r.obj, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(r.obj, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_style_bg_opa(r.obj, LV_OPA_0, 0);
-        lv_obj_set_style_shadow_width(r.obj, 0, 0);
-    }
-    // Reset visual
-    lv_obj_set_size(r.obj, 10, 10);
-    lv_obj_set_pos(r.obj, cx - 5, cy - 5);
-    lv_obj_set_style_radius(r.obj, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(r.obj, 3, 0);
-    lv_obj_set_style_border_color(r.obj, tc, 0);
-    lv_obj_set_style_border_opa(r.obj, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(r.obj, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(r.obj);
-}
-
-// Called each frame from update_live_screen to animate active ripples
-static void ripple_update(void) {
-    for (int i = 0; i < RIPPLE_POOL; i++) {
-        RippleState& r = ripples[i];
-        if (r.frame == 0 || !r.obj) continue;
-
-        r.frame++;
-        if (r.frame > RIPPLE_FRAMES) {
-            // Animation done — hide and recycle
-            r.frame = 0;
-            lv_obj_add_flag(r.obj, LV_OBJ_FLAG_HIDDEN);
-            continue;
-        }
-
-        float t = (float)(r.frame - 1) / (float)RIPPLE_FRAMES;  // 0..1
-        int sz = 10 + (int)(t * RIPPLE_MAX_R * 2);
-        lv_obj_set_size(r.obj, sz, sz);
-        lv_obj_set_pos(r.obj, r.cx - sz / 2, r.cy - sz / 2);
-        lv_obj_set_style_border_opa(r.obj, (lv_opa_t)(255 * (1.0f - t)), 0);
-        // Border thins as it expands
-        lv_obj_set_style_border_width(r.obj, (lv_coord_t)(3 * (1.0f - t * 0.7f)), 0);
-    }
-}
+// Ripple effect removed — the overlay forced LVGL to invalidate a large
+// expanding area every frame for 200ms per tap, drowning the render task
+// when tapping fast. The pad border flash on press is enough feedback.
 
 static void pad_touch_cb(lv_event_t* e) {
     // Safety fallback for the LVGL button event. In practice the GT911 direct
@@ -1749,19 +1703,67 @@ static void pad_inst_modal_inst_cb(lv_event_t* e) {
     pad_inst_modal_refresh();
 }
 
-static bool pad_inst_unload_daisy_sample(uint8_t pad) {
+// Async unload: the synchronous POST blocked the LVGL task up to ~2.5 s
+// (TCP connect + response wait) on every "SAMPLER ORIG." tap. The request
+// now runs in a one-shot worker (Core 1, prio 1); the success path is
+// applied by pad_inst_unload_consume_result() on the LVGL task.
+// 0 = idle, 1 = running, 2 = done
+static std::atomic<uint8_t> s_pad_unload_state{0};
+static uint8_t s_pad_unload_pad = 0;
+static bool    s_pad_unload_ok = false;
+
+static void pad_inst_unload_task(void* arg) {
+    (void)arg;
+    uint8_t pad = s_pad_unload_pad;
+    bool ok = false;
     WiFiClient client;
-    if (!client.connect(IPAddress(192, 168, 4, 1), 80)) return false;
-    client.printf("POST /api/unloadDaisy?pad=%d HTTP/1.1\r\n", pad);
-    client.print("Host: 192.168.4.1\r\n");
-    client.print("Content-Length: 0\r\n");
-    client.print("Connection: close\r\n\r\n");
-    uint32_t start = millis();
-    while (!client.available() && client.connected() && (millis() - start) < 2500) delay(10);
-    String statusLine = client.readStringUntil('\n');
-    statusLine.trim();
-    client.stop();
-    return statusLine.startsWith("HTTP/1.1 200") || statusLine.startsWith("HTTP/1.0 200");
+    if (client.connect(IPAddress(192, 168, 4, 1), 80)) {
+        client.printf("POST /api/unloadDaisy?pad=%d HTTP/1.1\r\n", pad);
+        client.print("Host: 192.168.4.1\r\n");
+        client.print("Content-Length: 0\r\n");
+        client.print("Connection: close\r\n\r\n");
+        uint32_t start = millis();
+        while (!client.available() && client.connected() && (millis() - start) < 2500)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        String statusLine = client.readStringUntil('\n');
+        statusLine.trim();
+        client.stop();
+        ok = statusLine.startsWith("HTTP/1.1 200") || statusLine.startsWith("HTTP/1.0 200");
+    }
+    s_pad_unload_ok = ok;
+    s_pad_unload_state.store(2, std::memory_order_release);
+    vTaskDelete(NULL);
+}
+
+static bool pad_inst_unload_daisy_sample(uint8_t pad) {
+    if (s_pad_unload_state.load(std::memory_order_acquire) != 0) return false;
+    s_pad_unload_pad = pad;
+    s_pad_unload_state.store(1, std::memory_order_release);
+    if (xTaskCreatePinnedToCore(pad_inst_unload_task, "padunload",
+                                4096, NULL, 1, NULL, 1) != pdPASS) {
+        s_pad_unload_state.store(0, std::memory_order_release);
+        return false;
+    }
+    return true;
+}
+
+// LVGL task (ui_update_current_screen): apply a finished unload's result.
+static void pad_inst_unload_consume_result(void) {
+    if (s_pad_unload_state.load(std::memory_order_acquire) != 2) return;
+    uint8_t pad = s_pad_unload_pad;
+    bool ok = s_pad_unload_ok;
+    s_pad_unload_state.store(0, std::memory_order_release);
+    if (!ok) {
+        ui_show_toast("No se pudo restaurar sample", RED808_WARNING);
+        return;
+    }
+    if (pad > 15) pad = 15;
+    s_pad_inst_sel[pad] = 0;
+    pad_inst_refresh_pad_badge(pad);
+    pad_inst_refresh_controls();
+    pad_inst_apply_to_master(pad);
+    pad_inst_modal_refresh();
+    ui_show_toast("Sampler original restaurado", RED808_SUCCESS);
 }
 
 static void pad_inst_sampler_original_cb(lv_event_t* e) {
@@ -1772,17 +1774,11 @@ static void pad_inst_sampler_original_cb(lv_event_t* e) {
         ui_show_toast("Master no conectado", RED808_WARNING);
         return;
     }
-    bool ok = pad_inst_unload_daisy_sample(pad);
-    if (!ok) {
-        ui_show_toast("No se pudo restaurar sample", RED808_WARNING);
+    if (!pad_inst_unload_daisy_sample(pad)) {
+        ui_show_toast("Restauracion en curso...", RED808_WARNING);
         return;
     }
-    s_pad_inst_sel[pad] = 0;
-    pad_inst_refresh_pad_badge(pad);
-    pad_inst_refresh_controls();
-    pad_inst_apply_to_master(pad);
-    pad_inst_modal_refresh();
-    ui_show_toast("Sampler original restaurado", RED808_SUCCESS);
+    ui_show_toast("Restaurando sample...", RED808_CYAN);
 }
 
 static void pad_inst_modal_pick_inst_cb(lv_event_t* e) {
@@ -2328,7 +2324,8 @@ static void create_live_screen(void) {
         lv_obj_align(live_pad_state_labels[i], LV_ALIGN_TOP_RIGHT, -8, 9);
 
         live_pad_inst_labels[i] = lv_label_create(live_pad_btns[i]);
-        lv_label_set_text(live_pad_inst_labels[i], PAD_INST_SHORT[s_pad_inst_sel[i] & 0x07]);
+        lv_label_set_text(live_pad_inst_labels[i],
+                          PAD_INST_SHORT[s_pad_inst_sel[i] <= 8 ? s_pad_inst_sel[i] : 0]);
         lv_obj_set_style_text_font(live_pad_inst_labels[i], &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(live_pad_inst_labels[i], tc, 0);
         lv_obj_align(live_pad_inst_labels[i], LV_ALIGN_BOTTOM_RIGHT, -8, -7);
@@ -2664,6 +2661,19 @@ static void update_live_screen(void) {
     if (step_changed) prev_sync_step = p4.current_step;
     static uint8_t pad_prev_band[16] = {};
     static bool pad_prev_muted_for_flash[16] = {};
+    // Theme reload recreates every widget; force-invalidate the dirty caches
+    // or recreated pads/labels keep skipping their first style repaint.
+    static uint32_t live_gen = 0;
+    bool force_refresh = (live_gen != s_ui_refresh_gen);
+    if (force_refresh) {
+        live_gen = s_ui_refresh_gen;
+        for (int i = 0; i < 16; i++) {
+            pad_prev_band[i] = 0xFF;
+            pad_prev_muted_for_flash[i] = p4.track_muted[i];
+        }
+        prev_sync_step = -1;
+        step_changed = true;
+    }
     for (int i = 0; i < 16; i++) {
         if (!live_pad_btns[i]) continue;
 
@@ -2765,7 +2775,8 @@ static void update_live_screen(void) {
         bool muted = p4.track_muted[i];
         bool solo = p4.track_solo[i];
         bool step_lit = !muted && p4.is_playing && p4.steps[i][p4.current_step];
-        if (muted == prev_muted[i] && solo == prev_solo[i] &&
+        if (!force_refresh &&
+            muted == prev_muted[i] && solo == prev_solo[i] &&
             step_lit == prev_step_lit[i] && p4.is_playing == prev_live_playing) {
             continue;
         }
@@ -2797,6 +2808,9 @@ static void update_live_screen(void) {
 
     // Play button state
     static bool gp_prev_play = false;
+    if (force_refresh) {
+        gp_prev_play = !p4.is_playing;   // force label/style repaint below
+    }
     if (grid_play_btn && grid_play_lbl && p4.is_playing != gp_prev_play) {
         gp_prev_play = p4.is_playing;
         lv_label_set_text(grid_play_lbl, p4.is_playing
@@ -2977,8 +2991,6 @@ static void update_live_screen(void) {
         }
     }
 
-    // Ripple animation
-    ripple_update();
 }
 
 // =============================================================================
@@ -3589,9 +3601,17 @@ static void create_fx_screen(void) {
 static void update_fx_screen(void) {
     static uint16_t prev_key[FX_CARD_COUNT];
     static bool prev_init = false;
-    if (!prev_init) {
+    static uint32_t fx_gen = 0;
+    if (!prev_init || fx_gen != s_ui_refresh_gen) {
+        // First run OR theme reload (arcs recreated at 0 while prev_key and
+        // s_fx_arc_anim still hold the live values — without this reset the
+        // recreated arcs stay blank until the FX value next changes).
         prev_init = true;
-        for (int i = 0; i < FX_CARD_COUNT; i++) prev_key[i] = 0xFFFF;
+        fx_gen = s_ui_refresh_gen;
+        for (int i = 0; i < FX_CARD_COUNT; i++) {
+            prev_key[i] = 0xFFFF;
+            s_fx_arc_anim[i] = 0.0f;
+        }
     }
 
     uint32_t now = millis();
@@ -3663,6 +3683,7 @@ static void update_fx_screen(void) {
 // SEQUENCER SCREEN — Studio-grade 16-track × 16-step grid (1024×600)
 // =============================================================================
 static lv_obj_t* seq_step_btns[16][16]  = {};
+static lv_obj_t* seq_step_accents[16][16] = {};  // bottom velocity strip per cell
 static lv_obj_t* seq_track_labels[16]   = {};
 static lv_obj_t* seq_mute_btns[16]      = {};
 static lv_obj_t* seq_solo_btns[16]      = {};
@@ -4275,9 +4296,13 @@ static void create_sequencer_screen(void) {
             lv_obj_add_event_cb(seq_step_btns[t][s], seq_step_cb, LV_EVENT_CLICKED,
                                 (void*)(intptr_t)((t << 8) | s));
 
-            // Bottom accent line inside active cells (velocity-like feel)
-            if (act) {
+            // Bottom accent line inside active cells (velocity-like feel).
+            // Created on every cell and shown/hidden in the update path —
+            // creating it only for cells active at construction left the
+            // accents stale after edits or pattern loads.
+            {
                 lv_obj_t* accent = lv_obj_create(seq_step_btns[t][s]);
+                seq_step_accents[t][s] = accent;
                 lv_obj_set_size(accent, SEQ_CELL_W - 8, 3);
                 lv_obj_align(accent, LV_ALIGN_BOTTOM_MID, 0, -3);
                 lv_obj_set_style_bg_color(accent, lv_color_white(), 0);
@@ -4286,6 +4311,7 @@ static void create_sequencer_screen(void) {
                 lv_obj_set_style_border_width(accent, 0, 0);
                 lv_obj_clear_flag(accent, LV_OBJ_FLAG_SCROLLABLE);
                 lv_obj_clear_flag(accent, LV_OBJ_FLAG_CLICKABLE);
+                if (!act) lv_obj_add_flag(accent, LV_OBJ_FLAG_HIDDEN);
             }
         }
 
@@ -4387,17 +4413,23 @@ static void update_sequencer_screen(void) {
     // Recovery probe: re-request current pattern only when we changed
     // pattern locally and have not yet received a payload for it. This
     // avoids hammering the master when the new pattern is genuinely empty.
+    // Capped: a master that never answers (empty slot, no echo) would
+    // otherwise be probed at 2 Hz for as long as this screen stays open.
     static unsigned long last_probe_ms      = 0;
     static int           last_probe_pattern = -1;
     static uint32_t      last_probe_rev     = 0;
+    static int           probe_attempts     = 0;
     if (last_probe_pattern != p4.current_pattern) {
         last_probe_pattern = p4.current_pattern;
         last_probe_rev     = seq_pattern_payload_revision;
         last_probe_ms      = now - 400;  // probe almost immediately
+        probe_attempts     = 0;
     }
     if (seq_pattern_payload_revision == last_probe_rev &&
+        probe_attempts < 6 &&
         (now - last_probe_ms >= 500)) {
         last_probe_ms = now;
+        probe_attempts++;
         udp_send_get_pattern(p4.current_pattern);
     }
 
@@ -4585,6 +4617,10 @@ static void update_sequencer_screen(void) {
             lv_obj_set_style_shadow_width(seq_step_btns[t][s], shadow_w, 0);
             lv_obj_set_style_shadow_color(seq_step_btns[t][s],
                 is_cur ? RED808_WARNING : tc, 0);
+            if (seq_step_accents[t][s]) {
+                if (active) lv_obj_clear_flag(seq_step_accents[t][s], LV_OBJ_FLAG_HIDDEN);
+                else        lv_obj_add_flag(seq_step_accents[t][s], LV_OBJ_FLAG_HIDDEN);
+            }
         }
     }
 }
@@ -4812,6 +4848,15 @@ static void update_volumes_screen(void) {
     static bool prev_init = false;
     static int prev_master = -1;
     static int prev_bpm = -1;
+    static uint32_t vol_gen = 0;
+    if (vol_gen != s_ui_refresh_gen) {
+        // Theme reload recreated the strips; redo the first full repaint.
+        vol_gen = s_ui_refresh_gen;
+        prev_init = false;
+        prev_master = -1;
+        prev_bpm = -1;
+        for (int i = 0; i < 16; i++) prev_volume[i] = -1;
+    }
 
     if (mix_master_slider && p4.master_volume != prev_master) {
         prev_master = p4.master_volume;
@@ -5366,60 +5411,83 @@ static void sd_midi_load_btn_cb(lv_event_t* e) {
                            steps_found, raw_len, bpm, tracks_used);
 }
 
-static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUpload) {
-    if (p4sd.selected_file[0] == '\0' || p4sd.selected_is_midi) return false;
-
-    int xtraSlot = -1;
-    if (s_xtra_pending_slot >= 0 && s_xtra_pending_slot < 4) {
-        xtraSlot = s_xtra_pending_slot;
-        p4sd.selected_pad = xtra_backing_pad_for_slot(xtraSlot);
-    }
-
-    if (sd_status_lbl) {
-        lv_label_set_text_fmt(sd_status_lbl, "%s PAD %02d...",
-                              triggerAfterUpload ? "PREVIEW" : "UPLOAD",
-                              p4sd.selected_pad + 1);
-        lv_obj_set_style_text_color(sd_status_lbl, RED808_CYAN, 0);
-    }
-
+// ── Async WAV upload ────────────────────────────────────────────────────
+// The transfer (SD read + up to 4 MB over TCP + response wait) used to run
+// synchronously inside the LVGL button callback, freezing rendering and
+// touch for seconds — the "UPLOAD PAD xx..." label never even painted.
+// It now runs in a one-shot worker task (Core 1, prio 1); results are
+// consumed by sd_upload_consume_result() on the LVGL task. The worker must
+// never touch LVGL objects.
+enum SdUploadResult : uint8_t {
+    SD_UP_OK = 0,
+    SD_UP_OPEN_FAILED,
+    SD_UP_INVALID,
+    SD_UP_OFFLINE,
+    SD_UP_WRITE_CUT,
+    SD_UP_HTTP_ERROR,
+};
+struct SdUploadJob {
+    // request (LVGL task → worker)
     char path[192];
-    if (strcmp(p4sd.path, "/") == 0) snprintf(path, sizeof(path), "/%s", p4sd.selected_file);
-    else snprintf(path, sizeof(path), "%s/%s", p4sd.path, p4sd.selected_file);
+    char filename[64];
+    int  pad;
+    int  xtra_slot;
+    bool close_after;
+    bool trigger_after;
+    // result (worker → LVGL task)
+    uint8_t result;
+    int     http_status;
+};
+static SdUploadJob s_sd_upload_job;
+// 0 = idle, 1 = running, 2 = done (result pending consumption)
+static std::atomic<uint8_t> s_sd_upload_state{0};
 
-    File sample = SD_MMC.open(path, FILE_READ);
+static bool sd_upload_in_flight(void) {
+    return s_sd_upload_state.load(std::memory_order_acquire) != 0;
+}
+
+static void sd_upload_task(void* arg) {
+    (void)arg;
+    SdUploadJob& job = s_sd_upload_job;
+    job.result = SD_UP_OK;
+    job.http_status = 0;
+
+    File sample = SD_MMC.open(job.path, FILE_READ);
     if (!sample) {
-        ui_show_toast("No se puede abrir el WAV", RED808_WARNING);
-        if (sd_status_lbl) lv_label_set_text(sd_status_lbl, "OPEN FAILED");
-        return false;
+        job.result = SD_UP_OPEN_FAILED;
+        s_sd_upload_state.store(2, std::memory_order_release);
+        vTaskDelete(NULL);
+        return;
     }
-
     size_t sample_size = sample.size();
     if (sample_size == 0 || sample_size > 4U * 1024U * 1024U) {
         sample.close();
-        ui_show_toast("WAV no valido o demasiado grande", RED808_WARNING);
-        if (sd_status_lbl) lv_label_set_text(sd_status_lbl, "WAV INVALID");
-        return false;
+        job.result = SD_UP_INVALID;
+        s_sd_upload_state.store(2, std::memory_order_release);
+        vTaskDelete(NULL);
+        return;
     }
 
     WiFiClient client;
     client.setTimeout(10000);
     if (!client.connect(IPAddress(192, 168, 4, 1), 80)) {
         sample.close();
-        ui_show_toast("Master no conectado", RED808_WARNING);
-        if (sd_status_lbl) lv_label_set_text(sd_status_lbl, "MASTER OFFLINE");
-        return false;
+        job.result = SD_UP_OFFLINE;
+        s_sd_upload_state.store(2, std::memory_order_release);
+        vTaskDelete(NULL);
+        return;
     }
 
     const char* boundary = "----RED808P4Upload";
     char file_head[192];
     snprintf(file_head, sizeof(file_head),
              "--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\nContent-Type: audio/wav\r\n\r\n",
-             boundary, p4sd.selected_file);
+             boundary, job.filename);
     char file_tail[40];
     snprintf(file_tail, sizeof(file_tail), "\r\n--%s--\r\n", boundary);
     size_t content_len = strlen(file_head) + sample_size + strlen(file_tail);
 
-    client.printf("POST /api/uploadDaisy?pad=%d HTTP/1.1\r\n", p4sd.selected_pad);
+    client.printf("POST /api/uploadDaisy?pad=%d HTTP/1.1\r\n", job.pad);
     client.print("Host: 192.168.4.1\r\n");
     client.print("Connection: close\r\n");
     client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary);
@@ -5435,7 +5503,7 @@ static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUplo
             write_ok = false;
             break;
         }
-        yield();
+        vTaskDelay(1);   // breathe: let loop()/WiFi run between chunks
     }
     sample.close();
     if (write_ok) client.print(file_tail);
@@ -5449,54 +5517,121 @@ static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUplo
             break;
         }
         if (!client.connected()) break;
-        delay(2);
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
     client.stop();
 
-    if (!(write_ok && status == 200)) {
+    job.http_status = status;
+    if (!write_ok)           job.result = SD_UP_WRITE_CUT;
+    else if (status != 200)  job.result = SD_UP_HTTP_ERROR;
+    else                     job.result = SD_UP_OK;
+    s_sd_upload_state.store(2, std::memory_order_release);
+    vTaskDelete(NULL);
+}
+
+// LVGL task: validate, snapshot the request and launch the worker.
+static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUpload) {
+    if (p4sd.selected_file[0] == '\0' || p4sd.selected_is_midi) return false;
+    if (sd_upload_in_flight()) {
+        ui_show_toast("Upload en curso...", RED808_WARNING);
+        return false;
+    }
+
+    int xtraSlot = -1;
+    if (s_xtra_pending_slot >= 0 && s_xtra_pending_slot < 4) {
+        xtraSlot = s_xtra_pending_slot;
+        p4sd.selected_pad = xtra_backing_pad_for_slot(xtraSlot);
+    }
+
+    SdUploadJob& job = s_sd_upload_job;
+    if (strcmp(p4sd.path, "/") == 0)
+        snprintf(job.path, sizeof(job.path), "/%s", p4sd.selected_file);
+    else
+        snprintf(job.path, sizeof(job.path), "%s/%s", p4sd.path, p4sd.selected_file);
+    strncpy(job.filename, p4sd.selected_file, sizeof(job.filename) - 1);
+    job.filename[sizeof(job.filename) - 1] = '\0';
+    job.pad           = p4sd.selected_pad;
+    job.xtra_slot     = xtraSlot;
+    job.close_after   = closeAfterSuccess;
+    job.trigger_after = triggerAfterUpload;
+
+    s_sd_upload_state.store(1, std::memory_order_release);
+    BaseType_t ok = xTaskCreatePinnedToCore(sd_upload_task, "sdupload",
+                                            8192, NULL, 1, NULL, 1);
+    if (ok != pdPASS) {
+        s_sd_upload_state.store(0, std::memory_order_release);
+        ui_show_toast("No se pudo iniciar el upload", RED808_WARNING);
+        return false;
+    }
+
+    if (sd_status_lbl) {
+        lv_label_set_text_fmt(sd_status_lbl, "%s PAD %02d...",
+                              triggerAfterUpload ? "PREVIEW" : "UPLOAD",
+                              p4sd.selected_pad + 1);
+        lv_obj_set_style_text_color(sd_status_lbl, RED808_CYAN, 0);
+    }
+    if (sd_load_btn)    lv_obj_add_state(sd_load_btn, LV_STATE_DISABLED);
+    if (sd_preview_btn) lv_obj_add_state(sd_preview_btn, LV_STATE_DISABLED);
+    return true;
+}
+
+// LVGL task (ui_update_current_screen): apply a finished upload's result.
+static void sd_upload_consume_result(void) {
+    if (s_sd_upload_state.load(std::memory_order_acquire) != 2) return;
+    SdUploadJob job = s_sd_upload_job;   // copy before releasing the slot
+    s_sd_upload_state.store(0, std::memory_order_release);
+
+    if (sd_load_btn)    lv_obj_clear_state(sd_load_btn, LV_STATE_DISABLED);
+    if (sd_preview_btn) lv_obj_clear_state(sd_preview_btn, LV_STATE_DISABLED);
+
+    if (job.result != SD_UP_OK) {
         char msg[64];
-        if (!write_ok) snprintf(msg, sizeof(msg), "Upload cortado");
-        else snprintf(msg, sizeof(msg), "Upload fallido HTTP %d", status);
+        switch (job.result) {
+            case SD_UP_OPEN_FAILED: snprintf(msg, sizeof(msg), "No se puede abrir el WAV"); break;
+            case SD_UP_INVALID:     snprintf(msg, sizeof(msg), "WAV no valido o demasiado grande"); break;
+            case SD_UP_OFFLINE:     snprintf(msg, sizeof(msg), "Master no conectado"); break;
+            case SD_UP_WRITE_CUT:   snprintf(msg, sizeof(msg), "Upload cortado"); break;
+            default:                snprintf(msg, sizeof(msg), "Upload fallido HTTP %d", job.http_status); break;
+        }
         ui_show_toast(msg, RED808_WARNING);
         if (sd_status_lbl) {
             lv_label_set_text(sd_status_lbl, msg);
             lv_obj_set_style_text_color(sd_status_lbl, RED808_WARNING, 0);
         }
-        return false;
+        return;
     }
 
-    if (triggerAfterUpload && udp_wifi_connected()) {
-        udp_send_trigger(p4sd.selected_pad, 110);
+    if (job.trigger_after && udp_wifi_connected()) {
+        udp_send_trigger(job.pad, 110);
     }
 
     char msg[72];
     snprintf(msg, sizeof(msg), "%s PAD %02d",
-             triggerAfterUpload ? "Preview listo en" : "Sample cargado en Daisy",
-             p4sd.selected_pad + 1);
+             job.trigger_after ? "Preview listo en" : "Sample cargado en Daisy",
+             job.pad + 1);
     ui_show_toast(msg, RED808_SUCCESS);
     if (sd_status_lbl) {
         lv_label_set_text(sd_status_lbl, msg);
         lv_obj_set_style_text_color(sd_status_lbl, RED808_SUCCESS, 0);
     }
 
-    if (xtraSlot >= 0 && xtraSlot < 4) {
-        XtraPadSlot& slot = s_xtra_slots[xtraSlot];
+    if (job.xtra_slot >= 0 && job.xtra_slot < 4) {
+        XtraPadSlot& slot = s_xtra_slots[job.xtra_slot];
         slot.used = true;
-        slot.pad = xtra_backing_pad_for_slot(xtraSlot);
+        slot.pad = xtra_backing_pad_for_slot(job.xtra_slot);
         slot.synth_mode = false;
-        strncpy(slot.name, p4sd.selected_file, sizeof(slot.name) - 1);
+        strncpy(slot.name, job.filename, sizeof(slot.name) - 1);
         slot.name[sizeof(slot.name) - 1] = '\0';
         trim_wav_extension(slot.name);
         xtra_save_state();
         xtra_refresh_panel();
-        if (closeAfterSuccess) {
+        if (job.close_after) {
             s_xtra_pending_slot = -1;
             s_sd_for_xtra = false;
             ui_show_toast("XTRA cargado", RED808_SUCCESS);
             ui_navigate_to(6);
         }
     }
-    return true;
 }
 
 static void sd_preview_btn_cb(lv_event_t* e) {
@@ -8459,11 +8594,16 @@ static void ui_reload_themed_screens(void) {
     // to be deleted. ui_navigate_to() at the end restores the flag.
     g_live_screen_active.store(false, std::memory_order_release);
 
+    // Invalidate the prev_* dirty caches in the update functions — the
+    // recreated widgets need a full first repaint (see s_ui_refresh_gen).
+    s_ui_refresh_gen++;
+
     // Modals live on lv_layer_top(), which SURVIVES the screen deletions
     // below. They must be deleted for real here — just nulling the pointers
     // leaves an orphan fullscreen overlay whose close button no longer works.
     pad_inst_modal_close_cb(NULL);
     if (s_pad_mode_modal) { lv_obj_del(s_pad_mode_modal); s_pad_mode_modal = NULL; }
+    if (midi_summary_modal) { lv_obj_del(midi_summary_modal); midi_summary_modal = NULL; }
 
     // The toast is a child of whichever screen was active — it dies with the
     // screen below. Drop the references so ui_toast_update()/ui_show_toast()
@@ -8496,11 +8636,6 @@ static void ui_reload_themed_screens(void) {
         live_pad_accent_strips[i] = NULL;
         live_spectrum_bars[i] = NULL;
         grid_step_dots[i] = NULL;
-    }
-    // Invalidate ripple pool — objects are children of scr_live (already deleted)
-    for (int i = 0; i < RIPPLE_POOL; i++) {
-        ripples[i].obj = nullptr;
-        ripples[i].frame = 0;
     }
     grid_play_btn = NULL; grid_play_lbl = NULL; grid_bpm_lbl = NULL;
     grid_pat_lbl = NULL; grid_step_lbl = NULL;
@@ -8537,7 +8672,10 @@ static void ui_reload_themed_screens(void) {
     fx_page = 0;
     fx_view_mode = 0;
     for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 16; j++) seq_step_btns[i][j] = NULL;
+        for (int j = 0; j < 16; j++) {
+            seq_step_btns[i][j] = NULL;
+            seq_step_accents[i][j] = NULL;
+        }
         seq_track_labels[i] = NULL; seq_mute_btns[i] = NULL;
         seq_solo_btns[i] = NULL;
         seq_solo_labels[i] = NULL;
@@ -8604,6 +8742,7 @@ static void ui_reload_themed_screens(void) {
     if (saved_screen == 7) nav_to = 7;
     if (saved_screen == 8) nav_to = 8;
     if (saved_screen == 10) nav_to = 10;   /* PIANO */
+    if (saved_screen == 11) nav_to = 11;   /* PIANO PARAMS (synth editor) */
     if (saved_screen == 12) nav_to = 12;   /* GUITAR */
     ui_navigate_to(nav_to);
 }
@@ -8639,12 +8778,15 @@ void ui_navigate_to(int screen_id) {
             piano_sync_active_engine_state();
         }
         if (screen_id != 9) s_sd_for_xtra = false;
+        // Leaving a screen: persist any pending XTRA param edits now instead
+        // of waiting out the debounce window.
+        xtra_param_save_flush();
         bool keep_piano_preview = s_piano_play_active &&
             ((active_screen == 10 && screen_id == 11) || (active_screen == 11 && screen_id == 10));
         // Before leaving most screens, stop active synths to prevent stuck notes.
         // Keep the local Melody preview alive while moving between PIANO and PARAMS.
         if (udp_wifi_connected() && !keep_piano_preview) {
-            for (int eng = 0; eng < 9; eng++) {
+            for (int eng = 0; eng < 8; eng++) {  // valid engines 0..7
                 udp_send_synth_note_off(eng, 0);  // engine, track=0
             }
         }
@@ -8730,12 +8872,12 @@ void ui_process_pad_queue(void) {
                 }
             }
             udp_send_trigger(pad, velocity);
-            // Schedule synth note-off for melodic engines so 303/WT/FM2/SH101
-            // don't get stuck after a tap. Drum samples (engine -1, 0, 1, 2)
-            // already self-terminate.
+            // Schedule synth note-off for melodic engines so 303/WT/FM2/
+            // SH101/GuitarT don't get stuck after a tap. Drum samples
+            // (engine -1, 0, 1, 2) already self-terminate.
             if (pad < 16) {
                 int8_t engine = pad_inst_engine_code(s_pad_inst_sel[pad]);
-                if (engine >= 3 && engine <= 6) {
+                if (engine >= 3 && engine <= 7) {
                     s_pad_noteoff_engine[pad] = engine;
                     s_pad_noteoff_at[pad]     = now_ms + 220;
                 }
@@ -8758,7 +8900,7 @@ void ui_process_pad_queue(void) {
         if (engine == 3) {
             // 303 is a single-voice mono synth on master
             udp_send_synth303_note_off();
-        } else if (engine >= 0 && engine <= 6) {
+        } else if (engine >= 0 && engine <= 7) {
             udp_send_synth_note_off((uint8_t)engine, (uint8_t)pad);
         }
     }
@@ -8849,7 +8991,7 @@ void ui_pad_frame_update(const bool pressed[16], const uint8_t velocity[16],
         if (prev_live_active) {  // only on transition OUT of LIVE
             // Send all-notes-off to Master
             if (udp_wifi_connected()) {
-                for (int eng = 0; eng < 7; eng++) {
+                for (int eng = 0; eng < 8; eng++) {  // include 7 (GuitarT) — it holds notes
                     udp_send_synth_note_off(eng, 0);
                 }
             }
@@ -8959,6 +9101,24 @@ void ui_update_current_screen(void) {
     ui_live_consume_sync_p4();
     pad_inst_consume_engine_sync();
 
+    // Melody state latched by udp_handler/uart_handler (Core 1). Snapshot
+    // before clearing pending so a concurrent re-latch is never half-read.
+    if (g_pending_melody_from_s3.pending) {
+        uint8_t eng = g_pending_melody_from_s3.engine;
+        uint8_t oct = g_pending_melody_from_s3.octave;
+        uint8_t rec = g_pending_melody_from_s3.rec;
+        uint8_t pad = g_pending_melody_from_s3.pad;
+        g_pending_melody_from_s3.pending = false;
+        piano_apply_melody_sync(eng, oct, rec != 0, pad);
+    }
+
+    // Debounced XTRA param persistence (see xtra_save_param_state).
+    xtra_param_save_tick();
+
+    // Results from the async SD upload / Daisy unload workers.
+    sd_upload_consume_result();
+    pad_inst_unload_consume_result();
+
     // Auto-navigate from boot to live when Master or optional S3 connects
     if (active_screen == 0) {
         if (boot_enter_ms == 0) boot_enter_ms = now;
@@ -8995,9 +9155,11 @@ void ui_update_current_screen(void) {
 
     // Force fx_screen repaint IMMEDIATELY when UDP receives new FX values.
     // Must be BEFORE the period throttle so dirty updates aren't delayed up to 33ms.
+    // Only when the FX screen is actually visible — the prev_key caches catch
+    // up on the next scheduled update after entering the screen.
     if (g_fx_screen_dirty) {
         g_fx_screen_dirty = false;
-        update_fx_screen();
+        if (lv_scr_act() == scr_fx) update_fx_screen();
     }
 
     // Per-screen pacing. LIVE and STEPS need 60Hz for pad fades/playhead.
