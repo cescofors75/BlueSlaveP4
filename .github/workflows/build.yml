@@ -1,0 +1,39 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      # The firmware includes ../../../shared/synth_params.h, which lives in
+      # the XboxBLE superproject outside this repo. CI builds against a
+      # type-compatible stub (placeholder data — CI binaries are not flashable).
+      - name: Provide synth_params.h stub
+        run: |
+          mkdir -p ../shared
+          cp ci/synth_params_stub.h ../shared/synth_params.h
+
+      - name: Build esp32p4
+        run: pio run -e esp32p4

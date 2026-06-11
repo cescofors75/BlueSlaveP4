@@ -16,6 +16,7 @@
 #include "ui/ui_screens.h"
 #include "ui/ui_theme.h"
 #include "dsp_task.h"
+#include "settings_store.h"
 
 #if P4_USB_CDC_ENABLED && !P4_STANDALONE_MASTER_ONLY
 #include "usb_cdc_handler.h"
@@ -58,8 +59,9 @@ void setup() {
     lvgl_port_init();
     P4_LOG_PRINTLN("[INIT] LVGL OK");
 
-    // 4. Apply default theme
-    ui_theme_apply(THEME_OCEAN);
+    // 4. Load persisted settings (NVS) and apply the saved theme
+    settings_load();
+    ui_theme_apply((VisualTheme)settings_boot_theme());
 
     // 5. Mount SPIFFS BEFORE creating screens: create_live_screen() restores
     // the persisted XTRA pad state from SPIFFS, so the FS must be up first.
@@ -86,6 +88,11 @@ void setup() {
     // 7. Start UART1 (optional S3 connection)
     P4_LOG_PRINTLN("[INIT] UART bridge to S3 (optional)...");
     uart_handler_init();
+
+    // 7b. Overwrite the hardcoded defaults seeded by uart_handler_init() with
+    // the persisted user settings (volumes, BPM, pattern, theme). The master
+    // remains authoritative — its first state_sync overrides these.
+    settings_apply();
 
 #if P4_USB_CDC_ENABLED && !P4_STANDALONE_MASTER_ONLY
     // 8. Start USB Host CDC (S3 via USB-C OTG port)
@@ -126,6 +133,9 @@ void loop() {
     // Try to connect/reconnect to S3 USB CDC device
     usb_cdc_process();
 #endif
+
+    // Debounced NVS persistence of theme/volumes/BPM/pattern.
+    settings_tick();
 
     // LVGL screen updates and rendering are handled by the dedicated LVGL task.
 }
