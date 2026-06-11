@@ -4982,11 +4982,14 @@ static void sd_local_reset_selection(void) {
     p4sd.midi_load_result = -2;
 }
 
-static void sd_local_refresh_listing(bool reset_selection) {
-    if (reset_selection) sd_local_reset_selection();
-    p4sd.entry_count = 0;
-    p4sd.list_complete = false;
+static bool sd_upload_in_flight(void);   // defined with the upload worker below
 
+// Worker context (or LVGL-context fallback). Mount + directory scan:
+// SD_MMC.begin() with no card inserted blocks ~1 s across its two attempts,
+// and this used to run inside ui_navigate_to(), freezing the whole UI on
+// every entry to the SD screen. entry_count is published once at the end so
+// a concurrent sd_refresh_ui() never renders half-written entries.
+static void sd_local_scan_blocking(void) {
     if (!sd_local_try_mount()) {
         p4sd.mounted = false;
         if (p4sd.path[0] == '\0') strcpy(p4sd.path, "/");
@@ -5010,8 +5013,9 @@ static void sd_local_refresh_listing(bool reset_selection) {
         return;
     }
 
+    int count = 0;
     File entry = dir.openNextFile();
-    while (entry && p4sd.entry_count < P4_SD_MAX_ENTRIES) {
+    while (entry && count < P4_SD_MAX_ENTRIES) {
         const char* base = sd_basename(entry.name());
         bool is_dir = entry.isDirectory();
         if (base[0] == '\0' || base[0] == '.') {
@@ -5030,7 +5034,7 @@ static void sd_local_refresh_listing(bool reset_selection) {
                 continue;
             }
         }
-        P4SdEntry& out = p4sd.entries[p4sd.entry_count++];
+        P4SdEntry& out = p4sd.entries[count++];
         strncpy(out.name, base, sizeof(out.name) - 1);
         out.name[sizeof(out.name) - 1] = '\0';
         out.is_dir = is_dir;
@@ -5039,8 +5043,41 @@ static void sd_local_refresh_listing(bool reset_selection) {
         entry = dir.openNextFile();
     }
     dir.close();
+    p4sd.entry_count = count;
     p4sd.list_complete = true;
     p4sd.needs_refresh = true;
+}
+
+// 0 = idle, 1 = scanning
+static std::atomic<uint8_t> s_sd_scan_state{0};
+
+static void sd_scan_task(void* arg) {
+    (void)arg;
+    sd_local_scan_blocking();
+    s_sd_scan_state.store(0, std::memory_order_release);
+    vTaskDelete(NULL);
+}
+
+// LVGL task: kick the scan to a one-shot worker; sd_refresh_ui() shows a
+// scanning placeholder until list_complete flips and needs_refresh repaints.
+static void sd_local_refresh_listing(bool reset_selection) {
+    if (reset_selection) sd_local_reset_selection();
+    if (s_sd_scan_state.load(std::memory_order_acquire) != 0) return;  // already scanning
+    if (sd_upload_in_flight()) {
+        // The upload worker owns SD_MMC right now — don't scan concurrently.
+        ui_show_toast("Upload en curso...", RED808_WARNING);
+        return;
+    }
+    p4sd.entry_count = 0;
+    p4sd.list_complete = false;
+    p4sd.needs_refresh = true;   // paint the scanning placeholder immediately
+
+    s_sd_scan_state.store(1, std::memory_order_release);
+    if (xTaskCreatePinnedToCore(sd_scan_task, "sdscan", 6144, NULL, 1, NULL, 1) != pdPASS) {
+        // Out of resources — degrade to the old synchronous behaviour.
+        s_sd_scan_state.store(0, std::memory_order_release);
+        sd_local_scan_blocking();
+    }
 }
 
 static void sd_local_select(int idx) {
@@ -5360,6 +5397,14 @@ static void sd_midi_load_btn_cb(lv_event_t* e) {
 
     // Local SD branch — parse from P4 SD_MMC and stage directly to Master.
     if (p4sd.selected_file[0] == '\0') return;
+    if (s_sd_scan_state.load(std::memory_order_acquire) != 0 || sd_upload_in_flight()) {
+        // A worker owns SD_MMC right now — retry when it finishes.
+        if (sd_midi_status_lbl) {
+            lv_label_set_text(sd_midi_status_lbl, "SD ocupada, reintenta...");
+            lv_obj_set_style_text_color(sd_midi_status_lbl, RED808_WARNING, 0);
+        }
+        return;
+    }
     if (sd_midi_status_lbl) {
         lv_label_set_text(sd_midi_status_lbl, "Loading SD MIDI...");
         lv_obj_set_style_text_color(sd_midi_status_lbl, RED808_WARNING, 0);
@@ -5534,6 +5579,10 @@ static bool sd_upload_selected_wav(bool closeAfterSuccess, bool triggerAfterUplo
     if (p4sd.selected_file[0] == '\0' || p4sd.selected_is_midi) return false;
     if (sd_upload_in_flight()) {
         ui_show_toast("Upload en curso...", RED808_WARNING);
+        return false;
+    }
+    if (s_sd_scan_state.load(std::memory_order_acquire) != 0) {
+        ui_show_toast("SD ocupada, espera al escaneo", RED808_WARNING);
         return false;
     }
 
@@ -5804,7 +5853,13 @@ static void sd_refresh_ui(void) {
         lv_obj_add_event_cb(btn, sd_file_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
 
-    if (p4sd.list_complete && p4sd.entry_count == 0) {
+    if (!p4sd.list_complete && sd_source == 0) {
+        // Async scan in flight (sd_scan_task) — placeholder until it lands.
+        lv_obj_t* lbl = lv_label_create(sd_file_list);
+        lv_label_set_text(lbl, LV_SYMBOL_REFRESH "  Escaneando SD...");
+        lv_obj_set_style_text_color(lbl, RED808_CYAN, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    } else if (p4sd.list_complete && p4sd.entry_count == 0) {
         lv_obj_t* lbl = lv_label_create(sd_file_list);
         lv_label_set_text(lbl, "No files found (.wav / .mid)");
         lv_obj_set_style_text_color(lbl, RED808_TEXT_DIM, 0);
