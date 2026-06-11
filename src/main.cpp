@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <SPIFFS.h>
+#include <esp_task_wdt.h>
 #include "../include/config.h"
 #include "drivers/display_init.h"
 #include "drivers/lvgl_port.h"
@@ -33,6 +34,20 @@ void setup() {
     Serial.println("[FX][DBG] Waiting for masterFx/state_sync.fx/http FX packets");
 #endif
 
+    // 1b. Task watchdog: the prebuilt Arduino core ships with the IDF
+    // defaults baked in (5 s timeout + panic reset) — sdkconfig.defaults is
+    // NOT applied when framework = arduino uses precompiled libs. Reconfigure
+    // at runtime instead: 30 s absorbs transient bursts (screen transitions,
+    // MIDI load) and no panic keeps a genuine stall from hard-resetting the
+    // instrument mid-session (it logs the culprit task instead).
+    {
+        esp_task_wdt_config_t wdt_cfg = {};
+        wdt_cfg.timeout_ms = 30000;
+        wdt_cfg.idle_core_mask = (1 << 0);   // keep watching Core 0 idle task
+        wdt_cfg.trigger_panic = false;
+        esp_task_wdt_reconfigure(&wdt_cfg);
+    }
+
     // 2. Initialize MIPI-DSI display + backlight
     P4_LOG_PRINTLN("[INIT] Display...");
     display_init();
@@ -44,9 +59,22 @@ void setup() {
     P4_LOG_PRINTLN("[INIT] LVGL OK");
 
     // 4. Apply default theme
-    ui_theme_apply(THEME_RED808);
+    ui_theme_apply(THEME_OCEAN);
 
-    // 5. Create UI screens (boot → live → seq → fx → vol → settings → perf)
+    // 5. Mount SPIFFS BEFORE creating screens: create_live_screen() restores
+    // the persisted XTRA pad state from SPIFFS, so the FS must be up first.
+    // Also used for MEM MIDI storage (/mid/*.mid). Non-fatal if absent.
+    P4_LOG_PRINTLN("[INIT] Mounting SPIFFS...");
+    if (SPIFFS.begin(false, "/spiffs", 10)) {
+#if P4_ENABLE_DEBUG_LOG
+        Serial.printf("[INIT] SPIFFS OK — %u / %u bytes used\n",
+                      (unsigned)SPIFFS.usedBytes(), (unsigned)SPIFFS.totalBytes());
+#endif
+    } else {
+        P4_LOG_PRINTLN("[INIT] SPIFFS mount failed (run uploadfs once)");
+    }
+
+    // 5b. Create UI screens (boot → live → seq → fx → vol → settings → perf)
     P4_LOG_PRINTLN("[INIT] UI screens...");
     ui_create_all_screens();
     P4_LOG_PRINTLN("[INIT] UI screens OK");
@@ -58,17 +86,6 @@ void setup() {
     // 7. Start UART1 (optional S3 connection)
     P4_LOG_PRINTLN("[INIT] UART bridge to S3 (optional)...");
     uart_handler_init();
-
-    // 7b. Mount SPIFFS for MEM MIDI storage (/mid/*.mid). Non-fatal if absent.
-    P4_LOG_PRINTLN("[INIT] Mounting SPIFFS...");
-    if (SPIFFS.begin(false, "/spiffs", 10)) {
-#if P4_ENABLE_DEBUG_LOG
-        Serial.printf("[INIT] SPIFFS OK — %u / %u bytes used\n",
-                      (unsigned)SPIFFS.usedBytes(), (unsigned)SPIFFS.totalBytes());
-#endif
-    } else {
-        P4_LOG_PRINTLN("[INIT] SPIFFS mount failed (run uploadfs once)");
-    }
 
 #if P4_USB_CDC_ENABLED && !P4_STANDALONE_MASTER_ONLY
     // 8. Start USB Host CDC (S3 via USB-C OTG port)

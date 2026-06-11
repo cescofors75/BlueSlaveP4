@@ -13,6 +13,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <math.h>
+#include <atomic>
 
 // =============================================================================
 // CONFIGURATION
@@ -23,7 +24,11 @@ static const IPAddress MASTER_IP(192, 168, 4, 1);
 static const uint16_t  UDP_PORT       = 8888;
 
 // Timing
-static const unsigned long WIFI_RETRY_MS    = 5000;
+// 15 s retry: a full WiFi.begin() restart aborts an association already in
+// progress; on a congested AP auth+DHCP can exceed 5 s, so a short retry
+// could keep killing attempts that were about to succeed (autoReconnect
+// already handles the common cases).
+static const unsigned long WIFI_RETRY_MS    = 15000;
 static const unsigned long MASTER_TIMEOUT_MS = 3000;
 static const unsigned long SYNC_REQUEST_MS  = 500;
 
@@ -31,8 +36,9 @@ static const unsigned long SYNC_REQUEST_MS  = 500;
 // STATE
 // =============================================================================
 static WiFiUDP udp;
-static bool wifiConnected     = false;
-static bool udpStarted        = false;
+// atomic: read by the HTTP worker task, written by loop()
+static std::atomic<bool> wifiConnected{false};
+static std::atomic<bool> udpStarted{false};
 static bool masterAlive        = false;
 static unsigned long lastWifiAttempt  = 0;
 static unsigned long lastMasterPacket = 0;
@@ -406,12 +412,33 @@ static inline void apply_master_step_sync(int step) {
 uint32_t udp_step_phase_us_bridge = 0;
 bool udp_step_phase_valid_bridge = false;
 
-static bool fetch_pattern_http(int pattern) {
-    if (!wifiConnected) return false;
+// =============================================================================
+// HTTP FETCH WORKER
+// =============================================================================
+// HTTPClient calls block for up to ~900 ms each (setTimeout), and the sync
+// retry path used to chain two of them. Running that inside
+// udp_handler_process() froze pads, UART forwarding and the local step clock
+// for whole seconds. A low-priority worker task now performs the blocking
+// transfer only; the JSON is parsed and applied back on the loop() task
+// (http_consume_results), so all p4/UI state keeps a single writer thread.
+enum HttpFetchKind : uint8_t { HTTP_FETCH_NONE = 0, HTTP_FETCH_PATTERN, HTTP_FETCH_STATE };
 
-    char url[96];
-    snprintf(url, sizeof(url), "http://192.168.4.1/api/getPattern?index=%d", pattern);
+static std::atomic<int>     s_http_req_pattern{-1};   // pattern index, -1 = none (latest wins)
+static std::atomic<bool>    s_http_req_state{false};
+static std::atomic<uint8_t> s_http_resp_kind{HTTP_FETCH_NONE};
+static int  s_http_resp_pattern = 0;     // written by worker before resp_kind
+static char s_http_resp_buf[12288];      // body handoff worker → loop()
 
+static void request_pattern_http(int pattern) {
+    s_http_req_pattern.store(pattern, std::memory_order_release);
+}
+
+static void request_master_state_http(void) {
+    s_http_req_state.store(true, std::memory_order_release);
+}
+
+// Worker task context. Returns true with the body in s_http_resp_buf.
+static bool http_fetch_to_buf(const char* url) {
     HTTPClient http;
     http.setTimeout(MASTER_HTTP_TIMEOUT_MS);
     http.setConnectTimeout(MASTER_HTTP_TIMEOUT_MS);
@@ -425,7 +452,61 @@ static bool fetch_pattern_http(int pattern) {
 
     String payload = http.getString();
     http.end();
+    if (payload.length() == 0 || payload.length() >= sizeof(s_http_resp_buf)) {
+        P4_LOG_PRINTF("[HTTP] response empty/too large (%u bytes)\n",
+                      (unsigned)payload.length());
+        return false;
+    }
+    memcpy(s_http_resp_buf, payload.c_str(), payload.length() + 1);
+    return true;
+}
 
+static void http_fetch_task(void* arg) {
+    (void)arg;
+    for (;;) {
+        // Wait until loop() consumed the previous response.
+        if (s_http_resp_kind.load(std::memory_order_acquire) != HTTP_FETCH_NONE) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (!wifiConnected) {
+            // Drop requests while offline; sync/watchdog paths re-request.
+            s_http_req_state.store(false, std::memory_order_relaxed);
+            s_http_req_pattern.store(-1, std::memory_order_relaxed);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        if (s_http_req_state.exchange(false, std::memory_order_acq_rel)) {
+            if (http_fetch_to_buf("http://192.168.4.1/api/p4State")) {
+                s_http_resp_kind.store(HTTP_FETCH_STATE, std::memory_order_release);
+            }
+            continue;
+        }
+        int pat = s_http_req_pattern.exchange(-1, std::memory_order_acq_rel);
+        if (pat >= 0) {
+            char url[96];
+            snprintf(url, sizeof(url), "http://192.168.4.1/api/getPattern?index=%d", pat);
+            if (http_fetch_to_buf(url)) {
+                s_http_resp_pattern = pat;
+                s_http_resp_kind.store(HTTP_FETCH_PATTERN, std::memory_order_release);
+            }
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// loop() task context — parse + apply a pattern body fetched by the worker.
+static bool apply_pattern_http_payload(int pattern, const char* payload) {
+    // Staleness guard, mirroring the UDP pattern_sync path: a GET already in
+    // flight for pattern A can land after the user moved on to pattern B
+    // (the request atomics only coalesce *queued* requests). Apply only if
+    // the body matches what we asked for or what is currently displayed.
+    if (pattern != pendingPatternRequest && pattern != p4.current_pattern) {
+        P4_LOG_PRINTF("[HTTP][PAT] stale response pat=%d cur=%d waiting=%d (ignored)\n",
+                      pattern, p4.current_pattern, pendingPatternRequest);
+        return false;
+    }
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err) {
@@ -462,23 +543,8 @@ static bool fetch_pattern_http(int pattern) {
     return true;
 }
 
-static bool fetch_master_state_http(void) {
-    if (!wifiConnected) return false;
-
-    HTTPClient http;
-    http.setTimeout(MASTER_HTTP_TIMEOUT_MS);
-    http.setConnectTimeout(MASTER_HTTP_TIMEOUT_MS);
-    if (!http.begin("http://192.168.4.1/api/p4State")) return false;
-
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-        http.end();
-        return false;
-    }
-
-    String payload = http.getString();
-    http.end();
-
+// loop() task context — parse + apply a master-state body fetched by the worker.
+static bool apply_master_state_http_payload(const char* payload) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err) {
@@ -599,7 +665,7 @@ static bool fetch_master_state_http(void) {
         int track = 0;
         for (JsonVariant value : trackSynthEngines) {
             if (track >= 16) break;
-            engines[track] = (int8_t)clamp_int(value.as<int>(), -1, 6);
+            engines[track] = (int8_t)clamp_int(value.as<int>(), -1, 7);  // 7 = GuitarT
             track++;
         }
         ui_pad_sound_sync_track_engines(engines);
@@ -644,18 +710,42 @@ static bool fetch_master_state_http(void) {
 
     masterAlive = true;
     p4.master_connected = true;
+    lastMasterPacket = millis();  // without this the 3 s timeout re-fires at once
     P4_LOG_PRINTF("[HTTP][STATE] loaded pat=%d bpm=%.1f\n", pat, bpm);
     return true;
+}
+
+// Called from udp_handler_process() — applies at most one fetched body per
+// loop iteration, on the same thread that owns p4/UI state.
+static void http_consume_results(void) {
+    uint8_t kind = s_http_resp_kind.load(std::memory_order_acquire);
+    if (kind == HTTP_FETCH_NONE) return;
+    if (kind == HTTP_FETCH_PATTERN) {
+        apply_pattern_http_payload(s_http_resp_pattern, s_http_resp_buf);
+    } else if (kind == HTTP_FETCH_STATE) {
+        apply_master_state_http_payload(s_http_resp_buf);
+    }
+    s_http_resp_kind.store(HTTP_FETCH_NONE, std::memory_order_release);
 }
 
 // =============================================================================
 // SEND HELPERS
 // =============================================================================
+// sendJson is reached from three tasks (loop() on Core 1, the LVGL task and
+// the touch task on Core 0 — arcs/sliders/note-off sweeps call udp_send_*
+// directly). WiFiUDP keeps a single tx buffer, so concurrent
+// beginPacket/print/endPacket interleave bytes into corrupted packets.
+// Serialize the whole sequence behind a mutex.
+static SemaphoreHandle_t s_udp_tx_mutex = NULL;
+
 static void sendJson(const char* json) {
     if (!udpStarted) return;
+    if (s_udp_tx_mutex && xSemaphoreTake(s_udp_tx_mutex, pdMS_TO_TICKS(50)) != pdTRUE)
+        return;  // link congested — drop rather than corrupt another sender
     udp.beginPacket(MASTER_IP, UDP_PORT);
     udp.print(json);
     udp.endPacket();
+    if (s_udp_tx_mutex) xSemaphoreGive(s_udp_tx_mutex);
 }
 
 static void sendCmd(const char* cmd) {
@@ -854,10 +944,9 @@ void udp_send_get_pattern(int pattern) {
     if (pendingPatternRetries < 255) pendingPatternRetries++;
     P4_LOG_PRINTF("[UDP][PAT] TX get_pattern idx=%d\n", pattern);
     sendJson(buf);
-    // No synchronous HTTP fetch here: the master answers get_pattern over UDP
-    // in a few ms on the local link, which keeps the loop non-blocking and pad
-    // latency low. HTTP is only used as a fallback from the watchdog if the UDP
-    // reply doesn't arrive (see udp_handler_process()).
+    // Keep the request path non-blocking: worker fetch is async and consumed
+    // on loop() by http_consume_results().
+    request_pattern_http(pattern);
 }
 
 void udp_send_set_step(int track, int step, bool active) {
@@ -1172,7 +1261,7 @@ void udp_request_master_sync(void) {
         sessionCleanSent = true;
     }
 
-    fetch_master_state_http();
+    request_master_state_http();
     udp_send_get_pattern(p4.current_pattern);
     sendJson("{\"cmd\":\"getTrackVolumes\"}");
 
@@ -1182,14 +1271,10 @@ void udp_request_master_sync(void) {
 // =============================================================================
 // PARSE INCOMING JSON
 // =============================================================================
-static void processJson(const char* json, int len) {
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, json, len);
-    if (err) {
-        P4_LOG_PRINTF("[UDP] JSON parse error: %s\n", err.c_str());
-        return;
-    }
-
+// Dispatches one already-parsed command object. Batch packets call this per
+// element directly, so oversized elements are no longer truncated through an
+// intermediate re-serialize buffer.
+static void processJsonVariant(JsonVariant doc) {
     // Mark master alive
     lastMasterPacket = millis();
     if (!masterAlive) {
@@ -1297,7 +1382,7 @@ static void processJson(const char* json, int len) {
             int track = 0;
             for (JsonVariant value : trackSynthEngines) {
                 if (track >= 16) break;
-                engines[track] = (int8_t)clamp_int(value.as<int>(), -1, 6);
+                engines[track] = (int8_t)clamp_int(value.as<int>(), -1, 7);  // 7 = GuitarT
                 track++;
             }
             ui_pad_sound_sync_track_engines(engines);
@@ -1524,23 +1609,34 @@ static void processJson(const char* json, int len) {
         }
     }
     // ----- Volume -----
+    // Relay to S3 only on change: mute/solo needed TRACK_ECHO_GUARD_MS because
+    // S3 reflections ping-ponged through the P4↔S3↔Master loop; the volume
+    // path has the same topology, so at least skip no-op relays.
     else if (strcmp(cmd, "volume_sync") == 0 || strcmp(cmd, "master_volume_sync") == 0 ||
              strcmp(cmd, "volume_master_sync") == 0 || strcmp(cmd, "setVolume") == 0) {
         int v = clamp_int(doc["value"] | 75, 0, 150);
-        p4.master_volume = v;
-        p4.seq_volume = v;
-        p4.live_volume = v;
-        uart_send_to_s3(MSG_SYSTEM, SYS_VOLUME, (uint8_t)v);
-        uart_send_to_s3(MSG_SYSTEM, SYS_SEQ_VOL, (uint8_t)v);
-        uart_send_to_s3(MSG_SYSTEM, SYS_LIVE_VOL, (uint8_t)v);
+        if (v != p4.master_volume || v != p4.seq_volume || v != p4.live_volume) {
+            p4.master_volume = v;
+            p4.seq_volume = v;
+            p4.live_volume = v;
+            uart_send_to_s3(MSG_SYSTEM, SYS_VOLUME, (uint8_t)v);
+            uart_send_to_s3(MSG_SYSTEM, SYS_SEQ_VOL, (uint8_t)v);
+            uart_send_to_s3(MSG_SYSTEM, SYS_LIVE_VOL, (uint8_t)v);
+        }
     }
     else if (strcmp(cmd, "volume_seq_sync") == 0 || strcmp(cmd, "setSequencerVolume") == 0) {
-        p4.seq_volume = clamp_int(doc["value"] | 75, 0, 150);
-        uart_send_to_s3(MSG_SYSTEM, SYS_SEQ_VOL, (uint8_t)p4.seq_volume);
+        int v = clamp_int(doc["value"] | 75, 0, 150);
+        if (v != p4.seq_volume) {
+            p4.seq_volume = v;
+            uart_send_to_s3(MSG_SYSTEM, SYS_SEQ_VOL, (uint8_t)v);
+        }
     }
     else if (strcmp(cmd, "volume_live_sync") == 0 || strcmp(cmd, "setLiveVolume") == 0) {
-        p4.live_volume = clamp_int(doc["value"] | 75, 0, 150);
-        uart_send_to_s3(MSG_SYSTEM, SYS_LIVE_VOL, (uint8_t)p4.live_volume);
+        int v = clamp_int(doc["value"] | 75, 0, 150);
+        if (v != p4.live_volume) {
+            p4.live_volume = v;
+            uart_send_to_s3(MSG_SYSTEM, SYS_LIVE_VOL, (uint8_t)v);
+        }
     }
     // ----- Track volumes -----
     else if (strcmp(cmd, "trackVolumes") == 0 || strcmp(cmd, "track_volumes") == 0 ||
@@ -1617,7 +1713,11 @@ static void processJson(const char* json, int len) {
     else if (strcmp(cmd, "setSampleRate") == 0) {
         unsigned long nowMs = millis();
         if (!is_fx_owned_recent(FX_OWN_SAMPLE_RATE, nowMs)) {
-            p4.sample_rate_hz = clamp_int(doc["value"] | 44100, 1000, 44100);
+            // Same convention as the HTTP/state_sync/local paths: <=0 = bypass,
+            // otherwise clamp to the crush range. (1000-44100 here turned a
+            // master "bypass" into full crush at 9 kHz after S3 re-clamping.)
+            int sr = doc["value"] | p4.sample_rate_hz;
+            p4.sample_rate_hz = (sr <= 0) ? 0 : clamp_int(sr, 9000, 32000);
             forward_fx_samplerate_to_s3(p4.sample_rate_hz);
         }
     }
@@ -1654,6 +1754,16 @@ static void processJson(const char* json, int len) {
         uart_send_to_s3(MSG_TOUCH_CMD, TCMD_MELODY_REC,    rec ? 1 : 0);
         uart_send_to_s3(MSG_TOUCH_CMD, TCMD_MELODY_PAD,    pad);
     }
+}
+
+static void processJson(const char* json, int len) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, json, len);
+    if (err) {
+        P4_LOG_PRINTF("[UDP] JSON parse error: %s\n", err.c_str());
+        return;
+    }
+    processJsonVariant(doc.as<JsonVariant>());
 }
 
 // =============================================================================
@@ -1702,7 +1812,16 @@ static void onWiFiDisconnected(void) {
 // =============================================================================
 void udp_handler_init(void) {
     P4_LOG_PRINTLN("[UDP] Init WiFi/UDP handler");
+    s_udp_tx_mutex = xSemaphoreCreateMutex();
     startWiFi();
+
+    // HTTP worker — Core 1 (with loop()), low priority. It spends nearly all
+    // its time blocked on the socket or sleeping, so it doesn't starve loop().
+    BaseType_t ok = xTaskCreatePinnedToCore(http_fetch_task, "httpfetch",
+                                            8192, NULL, 1, NULL, 1);
+    if (ok != pdPASS) {
+        P4_LOG_PRINTLN("[UDP] Failed to create HTTP fetch task");
+    }
 }
 
 // =============================================================================
@@ -1778,6 +1897,9 @@ void udp_handler_process(void) {
         return;
     }
 
+    // --- Apply HTTP bodies fetched by the worker task (non-blocking) ---
+    http_consume_results();
+
     // --- Master timeout ---
     if (masterAlive && (now - lastMasterPacket > MASTER_TIMEOUT_MS)) {
         masterAlive = false;
@@ -1815,11 +1937,11 @@ void udp_handler_process(void) {
             udp_send_get_pattern(target);
             // UDP reply for the pending pattern is overdue (>=250 ms): fall back
             // to a rate-limited, short-timeout HTTP fetch so the grid still
-            // loads if the UDP packet was dropped. fetch_pattern_http() clears
-            // the pending request on success.
+            // loads if the UDP packet was dropped. The worker request is
+            // coalesced and consumed on loop() by http_consume_results().
             if (now - lastPatternHttpMs >= PATTERN_HTTP_FALLBACK_MS) {
                 lastPatternHttpMs = now;
-                fetch_pattern_http(target);
+                request_pattern_http(target);
             }
         } else if (pendingPatternRetries >= 12) {
             P4_LOG_PRINTF("[UDP][PAT] timeout waiting pattern_sync idx=%d\n",
@@ -1837,19 +1959,22 @@ void udp_handler_process(void) {
     int pkt_budget = 4;
     while (packetSize > 0 && pkt_budget-- > 0) {
         int len = udp.read(rxBuf, sizeof(rxBuf) - 1);
-        if (len > 0) {
+        // Only the master may drive P4 state: the AP PSK is shared, so any
+        // joined device could otherwise spoof tempo/mute/FX and be treated
+        // as the master (lastMasterPacket/masterAlive).
+        if (len > 0 && udp.remoteIP() == MASTER_IP) {
             rxBuf[len] = '\0';
 
             // Handle JSON array (batch) or single object
             if (rxBuf[0] == '[') {
-                // Batch: parse array of commands
+                // Batch: parse array of commands and dispatch each element
+                // directly (re-serializing into a fixed buffer truncated
+                // elements bigger than the buffer and doubled the work).
                 JsonDocument batchDoc;
                 DeserializationError err = deserializeJson(batchDoc, rxBuf, len);
                 if (!err && batchDoc.is<JsonArray>()) {
                     for (JsonVariant item : batchDoc.as<JsonArray>()) {
-                        char singleBuf[512];
-                        int sLen = serializeJson(item, singleBuf, sizeof(singleBuf));
-                        if (sLen > 0) processJson(singleBuf, sLen);
+                        processJsonVariant(item);
                     }
                 }
             } else {

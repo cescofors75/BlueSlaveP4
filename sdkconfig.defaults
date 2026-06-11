@@ -1,5 +1,12 @@
 # BlueSlaveP4 — ESP32-P4 SDK overrides
-# Applied by PlatformIO before build (merged with framework defaults).
+#
+# IMPORTANT: with `framework = arduino` (pioarduino) the core uses PREBUILT
+# IDF libraries, so this file is NOT applied — verified against the shipped
+# core, which bakes in CONFIG_ESP_TASK_WDT_TIMEOUT_S=5 / TASK_WDT_PANIC=1.
+# The Task-WDT values below are therefore enforced at runtime instead via
+# esp_task_wdt_reconfigure() in src/main.cpp setup().
+# This file only takes effect if the project switches to `framework = espidf`
+# or to pioarduino's hybrid `custom_sdkconfig` rebuild.
 
 # ── Task Watchdog ─────────────────────────────────────────────────────────────
 # LVGL 9 SW renderer on 1024x600 takes ~20ms per frame (vsync-gated).
@@ -20,5 +27,7 @@ CONFIG_ESP_TASK_WDT_PANIC=n
 # CONFIG_FREERTOS_HZ=1000  (default)
 
 # ── LVGL / ESP32-P4 PPA ──────────────────────────────────────────────────────
-# PPA requires LVGL draw buffers aligned to the L2 cache line size.
-CONFIG_LV_DRAW_BUF_ALIGN=64
+# NOTE: this option is a no-op in this project — LVGL is built from lib_deps
+# (lvgl@8.3.11, configured via include/lv_conf.h, not Kconfig) and
+# CONFIG_LV_DRAW_BUF_ALIGN only exists in LVGL 9. Kept for reference only.
+# CONFIG_LV_DRAW_BUF_ALIGN=64
