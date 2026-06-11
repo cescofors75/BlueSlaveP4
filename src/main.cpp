@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <SPIFFS.h>
+#include <esp_task_wdt.h>
 #include "../include/config.h"
 #include "drivers/display_init.h"
 #include "drivers/lvgl_port.h"
@@ -32,6 +33,20 @@ void setup() {
     Serial.println("\n[FX][DBG] P4 FX sync log enabled @115200");
     Serial.println("[FX][DBG] Waiting for masterFx/state_sync.fx/http FX packets");
 #endif
+
+    // 1b. Task watchdog: the prebuilt Arduino core ships with the IDF
+    // defaults baked in (5 s timeout + panic reset) — sdkconfig.defaults is
+    // NOT applied when framework = arduino uses precompiled libs. Reconfigure
+    // at runtime instead: 30 s absorbs transient bursts (screen transitions,
+    // MIDI load) and no panic keeps a genuine stall from hard-resetting the
+    // instrument mid-session (it logs the culprit task instead).
+    {
+        esp_task_wdt_config_t wdt_cfg = {};
+        wdt_cfg.timeout_ms = 30000;
+        wdt_cfg.idle_core_mask = (1 << 0);   // keep watching Core 0 idle task
+        wdt_cfg.trigger_panic = false;
+        esp_task_wdt_reconfigure(&wdt_cfg);
+    }
 
     // 2. Initialize MIPI-DSI display + backlight
     P4_LOG_PRINTLN("[INIT] Display...");

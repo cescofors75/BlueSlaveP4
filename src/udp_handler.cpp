@@ -13,6 +13,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <math.h>
+#include <atomic>
 
 // =============================================================================
 // CONFIGURATION
@@ -391,12 +392,33 @@ static inline void apply_master_step_sync(int step) {
 uint32_t udp_step_phase_us_bridge = 0;
 bool udp_step_phase_valid_bridge = false;
 
-static bool fetch_pattern_http(int pattern) {
-    if (!wifiConnected) return false;
+// =============================================================================
+// HTTP FETCH WORKER
+// =============================================================================
+// HTTPClient calls block for up to ~900 ms each (setTimeout), and the sync
+// retry path used to chain two of them. Running that inside
+// udp_handler_process() froze pads, UART forwarding and the local step clock
+// for whole seconds. A low-priority worker task now performs the blocking
+// transfer only; the JSON is parsed and applied back on the loop() task
+// (http_consume_results), so all p4/UI state keeps a single writer thread.
+enum HttpFetchKind : uint8_t { HTTP_FETCH_NONE = 0, HTTP_FETCH_PATTERN, HTTP_FETCH_STATE };
 
-    char url[96];
-    snprintf(url, sizeof(url), "http://192.168.4.1/api/getPattern?index=%d", pattern);
+static std::atomic<int>     s_http_req_pattern{-1};   // pattern index, -1 = none (latest wins)
+static std::atomic<bool>    s_http_req_state{false};
+static std::atomic<uint8_t> s_http_resp_kind{HTTP_FETCH_NONE};
+static int  s_http_resp_pattern = 0;     // written by worker before resp_kind
+static char s_http_resp_buf[12288];      // body handoff worker → loop()
 
+static void request_pattern_http(int pattern) {
+    s_http_req_pattern.store(pattern, std::memory_order_release);
+}
+
+static void request_master_state_http(void) {
+    s_http_req_state.store(true, std::memory_order_release);
+}
+
+// Worker task context. Returns true with the body in s_http_resp_buf.
+static bool http_fetch_to_buf(const char* url) {
     HTTPClient http;
     http.setTimeout(900);
     if (!http.begin(url)) return false;
@@ -409,7 +431,52 @@ static bool fetch_pattern_http(int pattern) {
 
     String payload = http.getString();
     http.end();
+    if (payload.length() == 0 || payload.length() >= sizeof(s_http_resp_buf)) {
+        P4_LOG_PRINTF("[HTTP] response empty/too large (%u bytes)\n",
+                      (unsigned)payload.length());
+        return false;
+    }
+    memcpy(s_http_resp_buf, payload.c_str(), payload.length() + 1);
+    return true;
+}
 
+static void http_fetch_task(void* arg) {
+    (void)arg;
+    for (;;) {
+        // Wait until loop() consumed the previous response.
+        if (s_http_resp_kind.load(std::memory_order_acquire) != HTTP_FETCH_NONE) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (!wifiConnected) {
+            // Drop requests while offline; sync/watchdog paths re-request.
+            s_http_req_state.store(false, std::memory_order_relaxed);
+            s_http_req_pattern.store(-1, std::memory_order_relaxed);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        if (s_http_req_state.exchange(false, std::memory_order_acq_rel)) {
+            if (http_fetch_to_buf("http://192.168.4.1/api/p4State")) {
+                s_http_resp_kind.store(HTTP_FETCH_STATE, std::memory_order_release);
+            }
+            continue;
+        }
+        int pat = s_http_req_pattern.exchange(-1, std::memory_order_acq_rel);
+        if (pat >= 0) {
+            char url[96];
+            snprintf(url, sizeof(url), "http://192.168.4.1/api/getPattern?index=%d", pat);
+            if (http_fetch_to_buf(url)) {
+                s_http_resp_pattern = pat;
+                s_http_resp_kind.store(HTTP_FETCH_PATTERN, std::memory_order_release);
+            }
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// loop() task context — parse + apply a pattern body fetched by the worker.
+static bool apply_pattern_http_payload(int pattern, const char* payload) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err) {
@@ -445,22 +512,8 @@ static bool fetch_pattern_http(int pattern) {
     return true;
 }
 
-static bool fetch_master_state_http(void) {
-    if (!wifiConnected) return false;
-
-    HTTPClient http;
-    http.setTimeout(900);
-    if (!http.begin("http://192.168.4.1/api/p4State")) return false;
-
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-        http.end();
-        return false;
-    }
-
-    String payload = http.getString();
-    http.end();
-
+// loop() task context — parse + apply a master-state body fetched by the worker.
+static bool apply_master_state_http_payload(const char* payload) {
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload);
     if (err) {
@@ -617,6 +670,19 @@ static bool fetch_master_state_http(void) {
     p4.master_connected = true;
     P4_LOG_PRINTF("[HTTP][STATE] loaded pat=%d bpm=%.1f\n", pat, bpm);
     return true;
+}
+
+// Called from udp_handler_process() — applies at most one fetched body per
+// loop iteration, on the same thread that owns p4/UI state.
+static void http_consume_results(void) {
+    uint8_t kind = s_http_resp_kind.load(std::memory_order_acquire);
+    if (kind == HTTP_FETCH_NONE) return;
+    if (kind == HTTP_FETCH_PATTERN) {
+        apply_pattern_http_payload(s_http_resp_pattern, s_http_resp_buf);
+    } else if (kind == HTTP_FETCH_STATE) {
+        apply_master_state_http_payload(s_http_resp_buf);
+    }
+    s_http_resp_kind.store(HTTP_FETCH_NONE, std::memory_order_release);
 }
 
 // =============================================================================
@@ -824,7 +890,7 @@ void udp_send_get_pattern(int pattern) {
     if (pendingPatternRetries < 255) pendingPatternRetries++;
     P4_LOG_PRINTF("[UDP][PAT] TX get_pattern idx=%d\n", pattern);
     sendJson(buf);
-    fetch_pattern_http(pattern);
+    request_pattern_http(pattern);
 }
 
 void udp_send_set_step(int track, int step, bool active) {
@@ -1139,7 +1205,7 @@ void udp_request_master_sync(void) {
         sessionCleanSent = true;
     }
 
-    fetch_master_state_http();
+    request_master_state_http();
     udp_send_get_pattern(p4.current_pattern);
     sendJson("{\"cmd\":\"getTrackVolumes\"}");
 
@@ -1660,6 +1726,14 @@ static void onWiFiDisconnected(void) {
 void udp_handler_init(void) {
     P4_LOG_PRINTLN("[UDP] Init WiFi/UDP handler");
     startWiFi();
+
+    // HTTP worker — Core 1 (with loop()), low priority. It spends nearly all
+    // its time blocked on the socket or sleeping, so it doesn't starve loop().
+    BaseType_t ok = xTaskCreatePinnedToCore(http_fetch_task, "httpfetch",
+                                            8192, NULL, 1, NULL, 1);
+    if (ok != pdPASS) {
+        P4_LOG_PRINTLN("[UDP] Failed to create HTTP fetch task");
+    }
 }
 
 // =============================================================================
@@ -1734,6 +1808,9 @@ void udp_handler_process(void) {
         run_local_step_clock(now);
         return;
     }
+
+    // --- Apply HTTP bodies fetched by the worker task (non-blocking) ---
+    http_consume_results();
 
     // --- Master timeout ---
     if (masterAlive && (now - lastMasterPacket > MASTER_TIMEOUT_MS)) {

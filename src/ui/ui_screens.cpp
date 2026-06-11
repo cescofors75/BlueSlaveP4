@@ -61,6 +61,26 @@ static const uint32_t SOLO_DEBOUNCE_GLOBAL_MS = 70;
 // Direct touch bypass: flag used by touch_task to early-out when not on LIVE
 static std::atomic<bool> g_live_screen_active{false};
 
+// LIVE pad hit-rects mirrored from the LVGL layout. touch_task (Core 0,
+// prio 6) hit-tests against this cache instead of calling lv_obj_get_x/
+// get_width: those APIs can mutate layout state concurrently with the
+// render task, and the pad objects themselves die during theme reload.
+// Written only from the LVGL task (create_live_screen / apply_pad_layout).
+struct PadHitRect { int16_t x, y, w, h; bool visible; };
+static PadHitRect s_pad_hit[16];
+static portMUX_TYPE s_pad_hit_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void pad_hit_store(int i, int x, int y, int w, int h, bool visible) {
+    if (i < 0 || i >= 16) return;
+    portENTER_CRITICAL(&s_pad_hit_mux);
+    s_pad_hit[i].x = (int16_t)x;
+    s_pad_hit[i].y = (int16_t)y;
+    s_pad_hit[i].w = (int16_t)w;
+    s_pad_hit[i].h = (int16_t)h;
+    s_pad_hit[i].visible = visible;
+    portEXIT_CRITICAL(&s_pad_hit_mux);
+}
+
 static inline void enqueue_pad_event(uint8_t pad, uint8_t velocity) {
     uint8_t h = s_pad_qh.load(std::memory_order_relaxed);
     uint8_t t = s_pad_qt.load(std::memory_order_acquire);
@@ -352,7 +372,14 @@ static void ui_show_toast(const char* text, lv_color_t accent) {
     lv_obj_t* parent = lv_scr_act();
     if (!parent) return;
 
-    if (!s_ui_toast || lv_obj_get_parent(s_ui_toast) != parent) {
+    // Re-parent by recreation: delete the old toast first or it stays
+    // visible forever on the previous screen (and leaks).
+    if (s_ui_toast && lv_obj_get_parent(s_ui_toast) != parent) {
+        lv_obj_del(s_ui_toast);
+        s_ui_toast = NULL;
+        s_ui_toast_label = NULL;
+    }
+    if (!s_ui_toast) {
         s_ui_toast = lv_obj_create(parent);
         lv_obj_set_size(s_ui_toast, 420, 62);
         lv_obj_align(s_ui_toast, LV_ALIGN_TOP_MID, 0, 54);
@@ -1282,8 +1309,23 @@ static void pad_inst_apply_to_master(uint8_t pad) {
     }
 }
 
+// Engine sync arrives from the UDP handler (Core 1). Latch the payload and
+// let the LVGL task apply it from ui_update_current_screen() — the badge and
+// modal refreshes below touch LVGL objects, which are not thread-safe.
+static int8_t s_pad_engine_sync[16];
+static std::atomic<bool> s_pad_engine_sync_pending{false};
+
 void ui_pad_sound_sync_track_engines(const int8_t engines[16]) {
     if (!engines) return;
+    memcpy(s_pad_engine_sync, engines, sizeof(s_pad_engine_sync));
+    s_pad_engine_sync_pending.store(true, std::memory_order_release);
+}
+
+// LVGL task only.
+static void pad_inst_consume_engine_sync(void) {
+    if (!s_pad_engine_sync_pending.exchange(false, std::memory_order_acquire)) return;
+    int8_t engines[16];
+    memcpy(engines, s_pad_engine_sync, sizeof(engines));
     unsigned long nowMs = millis();
     bool anyChanged = false;
     for (int pad = 0; pad < 16; pad++) {
@@ -1468,8 +1510,20 @@ static void grid_16l_cb(lv_event_t* e) {
     }
 }
 
-// Called when S3 sends sync toggle — update UI without re-sending
+// Called when S3 sends sync toggle — arrives on the UART handler (Core 1),
+// so only latch the request here. The LVGL task applies it from
+// ui_update_current_screen(); LVGL APIs are not thread-safe. -1 = idle.
+static std::atomic<int> s_sync_p4_pending{-1};
+
 void ui_live_set_sync_p4(bool on) {
+    s_sync_p4_pending.store(on ? 1 : 0, std::memory_order_release);
+}
+
+// LVGL task only.
+static void ui_live_consume_sync_p4(void) {
+    int v = s_sync_p4_pending.exchange(-1, std::memory_order_acquire);
+    if (v < 0) return;
+    bool on = (v != 0);
     sync_pads_active = on;
     if (grid_sync_btn) {
         lv_obj_set_style_bg_color(grid_sync_btn,
@@ -2116,8 +2170,10 @@ static void apply_pad_layout(int mode) {
             lv_obj_set_pos(live_pad_btns[i], M + c*(pw+G), M + r*(ph+G));
             lv_obj_clear_flag(live_pad_btns[i], LV_OBJ_FLAG_HIDDEN);
             lv_obj_move_foreground(live_pad_btns[i]);
+            pad_hit_store(i, M + c*(pw+G), M + r*(ph+G), pw, ph, true);
         } else {
             lv_obj_add_flag(live_pad_btns[i], LV_OBJ_FLAG_HIDDEN);
+            pad_hit_store(i, 0, 0, 0, 0, false);
         }
     }
     if (s_pad_back_btn) {
@@ -2235,6 +2291,7 @@ static void create_live_screen(void) {
         live_pad_btns[i] = lv_btn_create(scr_live);
         lv_obj_set_size(live_pad_btns[i], CW, CH);
         lv_obj_set_pos(live_pad_btns[i], COL_X(c), ROW_Y(r));
+        pad_hit_store(i, COL_X(c), ROW_Y(r), CW, CH, true);
         lv_obj_set_style_radius(live_pad_btns[i], 12, 0);
         lv_obj_set_style_bg_color(live_pad_btns[i], RED808_SURFACE, 0);
         lv_obj_set_style_bg_grad_color(live_pad_btns[i], RED808_PANEL, 0);
@@ -8398,6 +8455,23 @@ void ui_create_all_screens(void) {
 static void ui_reload_themed_screens(void) {
     int saved_screen = active_screen;
 
+    // Stop touch_task from hit-testing/enqueuing against pads that are about
+    // to be deleted. ui_navigate_to() at the end restores the flag.
+    g_live_screen_active.store(false, std::memory_order_release);
+
+    // Modals live on lv_layer_top(), which SURVIVES the screen deletions
+    // below. They must be deleted for real here — just nulling the pointers
+    // leaves an orphan fullscreen overlay whose close button no longer works.
+    pad_inst_modal_close_cb(NULL);
+    if (s_pad_mode_modal) { lv_obj_del(s_pad_mode_modal); s_pad_mode_modal = NULL; }
+
+    // The toast is a child of whichever screen was active — it dies with the
+    // screen below. Drop the references so ui_toast_update()/ui_show_toast()
+    // don't dereference freed memory.
+    s_ui_toast = NULL;
+    s_ui_toast_label = NULL;
+    s_ui_toast_until_ms = 0;
+
     // Navigate to boot temporarily so we can safely delete active screens
     lv_scr_load(scr_boot);
 
@@ -8705,15 +8779,17 @@ int ui_pad_from_xy(uint16_t x, uint16_t y, uint8_t* cell_x, uint8_t* cell_y) {
     if (cell_x) *cell_x = 64;
     if (cell_y) *cell_y = 64;
     if (!g_live_screen_active.load(std::memory_order_acquire)) return -1;
-    // Dynamic hit-test against current pad geometry (PAD MODE aware).
+    // Hit-test against the cached pad geometry (PAD MODE aware). This runs on
+    // touch_task — never touch LVGL objects here (not thread-safe vs render).
     for (int i = 0; i < 16; i++) {
-        lv_obj_t* b = live_pad_btns[i];
-        if (!b) continue;
-        if (lv_obj_has_flag(b, LV_OBJ_FLAG_HIDDEN)) continue;
-        lv_coord_t px = lv_obj_get_x(b);
-        lv_coord_t py = lv_obj_get_y(b);
-        lv_coord_t pw = lv_obj_get_width(b);
-        lv_coord_t ph = lv_obj_get_height(b);
+        portENTER_CRITICAL(&s_pad_hit_mux);
+        PadHitRect r = s_pad_hit[i];
+        portEXIT_CRITICAL(&s_pad_hit_mux);
+        if (!r.visible || r.w <= 0 || r.h <= 0) continue;
+        int px = r.x;
+        int py = r.y;
+        int pw = r.w;
+        int ph = r.h;
         if ((int)x >= px && (int)x < (px + pw) && (int)y >= py && (int)y < (py + ph)) {
             int dx = (int)x - (int)px;
             int dy = (int)y - (int)py;
@@ -8877,6 +8953,11 @@ void ui_update_current_screen(void) {
     unsigned long now = millis();
     static unsigned long boot_enter_ms = 0;
     ui_toast_update();
+
+    // Apply UI state latched by the network/UART handlers on Core 1 —
+    // LVGL objects must only be touched from this task.
+    ui_live_consume_sync_p4();
+    pad_inst_consume_engine_sync();
 
     // Auto-navigate from boot to live when Master or optional S3 connects
     if (active_screen == 0) {
