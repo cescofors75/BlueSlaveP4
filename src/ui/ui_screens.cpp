@@ -222,6 +222,7 @@ lv_obj_t* scr_performance = NULL;
 lv_obj_t* scr_piano = NULL;       /* v2.6 — PIANO live keyboard */
 lv_obj_t* scr_piano_params = NULL; /* v2.7 — synth engine parameter editor */
 lv_obj_t* scr_guitar = NULL;      /* v3.1 — GTR fretboard */
+lv_obj_t* scr_fx_xy = NULL;       /* v3.2 — FX XY performance pad */
 
 // Header widgets
 static lv_obj_t* header_bar = NULL;
@@ -3419,6 +3420,11 @@ static void fx_view_cb(lv_event_t* e) {
     fx_apply_layout();
 }
 
+static void fx_xy_open_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    ui_navigate_to(13);   // FX XY performance pad
+}
+
 static void create_fx_screen(void) {
     scr_fx = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_fx, RED808_BG, 0);
@@ -3595,6 +3601,17 @@ static void create_fx_screen(void) {
     lv_obj_set_style_text_font(fx_view_lbl, &lv_font_montserrat_12, 0);
     lv_obj_center(fx_view_lbl);
 
+    // XY performance pad entry (screen 13)
+    lv_obj_t* xy_btn = lv_btn_create(scr_fx);
+    lv_obj_set_size(xy_btn, 52, 34);
+    lv_obj_set_pos(xy_btn, page_group_x + page_group_w - 80 - 52 - 6, page_ctrl_y);
+    apply_control_button_style(xy_btn, RED808_ACCENT, false, 8);
+    lv_obj_add_event_cb(xy_btn, fx_xy_open_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* xy_lbl = lv_label_create(xy_btn);
+    lv_label_set_text(xy_lbl, "XY");
+    lv_obj_set_style_text_font(xy_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_center(xy_lbl);
+
     fx_apply_layout();
 }
 
@@ -3676,6 +3693,215 @@ static void update_fx_screen(void) {
             }
         }
     }
+}
+
+// =============================================================================
+// FX XY PAD — full-screen Kaoss-style performance surface (screen id 13)
+// One finger drives two FX parameters at once through fx_card_send_value()
+// (same path as the FX cards: p4 state + UDP with ownership marking), so the
+// master echo can't fight the gesture and the FX screen arcs stay in sync.
+// =============================================================================
+static lv_obj_t* s_fxxy_pad      = NULL;
+static lv_obj_t* s_fxxy_dot      = NULL;
+static lv_obj_t* s_fxxy_x_lbl    = NULL;
+static lv_obj_t* s_fxxy_y_lbl    = NULL;
+static lv_obj_t* s_fxxy_mode_lbl = NULL;
+static int       s_fxxy_mode     = 0;   // index into FXXY_MODES (survives theme reload)
+
+// Fixed layout (1024×600) — coords are constants so the dot can be placed
+// from p4 state before the first touch.
+static constexpr int FXXY_PAD_X = 8;
+static constexpr int FXXY_PAD_Y = 56;
+static constexpr int FXXY_PAD_W = 1008;
+static constexpr int FXXY_PAD_H = 532;
+static constexpr int FXXY_DOT   = 30;
+
+struct FxXyMode {
+    const char* name;
+    int         cell_x;     // FX_CARD_* driven by the X axis
+    const char* x_name;
+    int         cell_y;     // FX_CARD_* driven by the Y axis
+    const char* y_name;
+};
+static const FxXyMode FXXY_MODES[] = {
+    {"FILTER", FX_CARD_CUTOFF, "CUTOFF", FX_CARD_RESO, "RESO"},
+    {"CRUSH",  FX_CARD_SRATE,  "SRATE",  FX_CARD_BITS, "BITS"},
+    {"DRIVE",  FX_CARD_DRIVE,  "DRIVE",  FX_CARD_FOLD, "FOLD"},
+};
+static constexpr int FXXY_MODE_COUNT = sizeof(FXXY_MODES) / sizeof(FXXY_MODES[0]);
+
+static void fxxy_update_value_labels(int ux, int uy) {
+    const FxXyMode& m = FXXY_MODES[s_fxxy_mode];
+    if (s_fxxy_x_lbl)
+        lv_label_set_text_fmt(s_fxxy_x_lbl, "%s %d%%", m.x_name, (ux * 100) / 127);
+    if (s_fxxy_y_lbl)
+        lv_label_set_text_fmt(s_fxxy_y_lbl, "%s %d%%", m.y_name, (uy * 100) / 127);
+}
+
+// Place the dot + labels from the CURRENT p4 FX state (screen entry / mode change).
+static void fxxy_sync_from_state(void) {
+    const FxXyMode& m = FXXY_MODES[s_fxxy_mode];
+    int ux = fx_card_current_value_u7(m.cell_x);
+    int uy = fx_card_current_value_u7(m.cell_y);
+    if (s_fxxy_dot) {
+        int lx = (ux * FXXY_PAD_W) / 127;
+        int ly = FXXY_PAD_H - (uy * FXXY_PAD_H) / 127;
+        lv_obj_set_pos(s_fxxy_dot, lx - FXXY_DOT / 2, ly - FXXY_DOT / 2);
+    }
+    fxxy_update_value_labels(ux, uy);
+    if (s_fxxy_mode_lbl) lv_label_set_text_fmt(s_fxxy_mode_lbl, "%s " LV_SYMBOL_LOOP, m.name);
+}
+
+static void fxxy_pad_event_cb(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_PRESSED && code != LV_EVENT_PRESSING) return;
+    lv_indev_t* indev = lv_indev_get_act();
+    if (!indev || !s_fxxy_pad) return;
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+
+    lv_area_t a;
+    lv_obj_get_coords(s_fxxy_pad, &a);
+    int w = a.x2 - a.x1;
+    int h = a.y2 - a.y1;
+    if (w <= 0 || h <= 0) return;
+    int lx = constrain((int)p.x - a.x1, 0, w);
+    int ly = constrain((int)p.y - a.y1, 0, h);
+    int ux = (lx * 127) / w;
+    int uy = ((h - ly) * 127) / h;   // up = more
+
+    if (s_fxxy_dot) lv_obj_set_pos(s_fxxy_dot, lx - FXXY_DOT / 2, ly - FXXY_DOT / 2);
+
+    // Throttle to ~60 Hz and only send axes whose value actually moved —
+    // each send is a UDP packet plus a UART mirror to the S3.
+    static uint32_t last_tx_ms = 0;
+    static int last_ux = -1, last_uy = -1;
+    uint32_t now = millis();
+    if (code == LV_EVENT_PRESSED) { last_ux = -1; last_uy = -1; }
+    if (now - last_tx_ms < 15) return;
+    const FxXyMode& m = FXXY_MODES[s_fxxy_mode];
+    bool sent = false;
+    if (ux != last_ux) {
+        last_ux = ux;
+        s_fx_arc_user_ms[m.cell_x] = now;
+        fx_card_send_value(m.cell_x, ux);
+        sent = true;
+    }
+    if (uy != last_uy) {
+        last_uy = uy;
+        s_fx_arc_user_ms[m.cell_y] = now;
+        fx_card_send_value(m.cell_y, uy);
+        sent = true;
+    }
+    if (sent) {
+        last_tx_ms = now;
+        fxxy_update_value_labels(ux, uy);
+    }
+}
+
+static void fxxy_mode_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    s_fxxy_mode = (s_fxxy_mode + 1) % FXXY_MODE_COUNT;
+    fxxy_sync_from_state();
+}
+
+static void fxxy_back_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    ui_navigate_to(8);   // back to FX cards
+}
+
+static void create_fx_xy_screen(void) {
+    scr_fx_xy = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_fx_xy, RED808_BG, 0);
+    lv_obj_clear_flag(scr_fx_xy, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Header row: BACK · title · mode toggle
+    lv_obj_t* back_btn = lv_btn_create(scr_fx_xy);
+    lv_obj_set_size(back_btn, 96, 40);
+    lv_obj_set_pos(back_btn, FXXY_PAD_X, 8);
+    apply_control_button_style(back_btn, RED808_CYAN, false, 8);
+    lv_obj_add_event_cb(back_btn, fxxy_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  FX");
+    lv_obj_center(back_lbl);
+
+    lv_obj_t* title = lv_label_create(scr_fx_xy);
+    lv_label_set_text(title, "XY PAD");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, RED808_ACCENT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+
+    lv_obj_t* mode_btn = lv_btn_create(scr_fx_xy);
+    lv_obj_set_size(mode_btn, 140, 40);
+    lv_obj_set_pos(mode_btn, FXXY_PAD_X + FXXY_PAD_W - 140, 8);
+    apply_control_button_style(mode_btn, RED808_WARNING, false, 8);
+    lv_obj_add_event_cb(mode_btn, fxxy_mode_cb, LV_EVENT_CLICKED, NULL);
+    s_fxxy_mode_lbl = lv_label_create(mode_btn);
+    lv_label_set_text(s_fxxy_mode_lbl, "FILTER " LV_SYMBOL_LOOP);
+    lv_obj_set_style_text_font(s_fxxy_mode_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(s_fxxy_mode_lbl);
+
+    // Touch surface
+    s_fxxy_pad = lv_obj_create(scr_fx_xy);
+    lv_obj_set_size(s_fxxy_pad, FXXY_PAD_W, FXXY_PAD_H);
+    lv_obj_set_pos(s_fxxy_pad, FXXY_PAD_X, FXXY_PAD_Y);
+    lv_obj_set_style_bg_color(s_fxxy_pad, RED808_SURFACE, 0);
+    lv_obj_set_style_bg_opa(s_fxxy_pad, LV_OPA_40, 0);
+    lv_obj_set_style_border_width(s_fxxy_pad, 2, 0);
+    lv_obj_set_style_border_color(s_fxxy_pad, RED808_ACCENT, 0);
+    lv_obj_set_style_radius(s_fxxy_pad, 12, 0);
+    lv_obj_set_style_pad_all(s_fxxy_pad, 0, 0);
+    lv_obj_clear_flag(s_fxxy_pad, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_fxxy_pad, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_fxxy_pad, fxxy_pad_event_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(s_fxxy_pad, fxxy_pad_event_cb, LV_EVENT_PRESSING, NULL);
+
+    // Faint quadrant guides
+    for (int i = 1; i < 4; i++) {
+        lv_obj_t* vline = lv_obj_create(s_fxxy_pad);
+        lv_obj_set_size(vline, 1, FXXY_PAD_H);
+        lv_obj_set_pos(vline, (FXXY_PAD_W * i) / 4, 0);
+        lv_obj_set_style_bg_color(vline, RED808_BORDER, 0);
+        lv_obj_set_style_bg_opa(vline, LV_OPA_30, 0);
+        lv_obj_set_style_border_width(vline, 0, 0);
+        lv_obj_clear_flag(vline, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* hline = lv_obj_create(s_fxxy_pad);
+        lv_obj_set_size(hline, FXXY_PAD_W, 1);
+        lv_obj_set_pos(hline, 0, (FXXY_PAD_H * i) / 4);
+        lv_obj_set_style_bg_color(hline, RED808_BORDER, 0);
+        lv_obj_set_style_bg_opa(hline, LV_OPA_30, 0);
+        lv_obj_set_style_border_width(hline, 0, 0);
+        lv_obj_clear_flag(hline, LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    // Axis value readouts (inside the pad corners)
+    s_fxxy_x_lbl = lv_label_create(s_fxxy_pad);
+    lv_obj_set_style_text_font(s_fxxy_x_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_fxxy_x_lbl, RED808_CYAN, 0);
+    lv_obj_align(s_fxxy_x_lbl, LV_ALIGN_BOTTOM_RIGHT, -14, -10);
+    lv_obj_clear_flag(s_fxxy_x_lbl, LV_OBJ_FLAG_CLICKABLE);
+
+    s_fxxy_y_lbl = lv_label_create(s_fxxy_pad);
+    lv_obj_set_style_text_font(s_fxxy_y_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(s_fxxy_y_lbl, RED808_WARNING, 0);
+    lv_obj_align(s_fxxy_y_lbl, LV_ALIGN_TOP_LEFT, 14, 10);
+    lv_obj_clear_flag(s_fxxy_y_lbl, LV_OBJ_FLAG_CLICKABLE);
+
+    // Crosshair dot
+    s_fxxy_dot = lv_obj_create(s_fxxy_pad);
+    lv_obj_set_size(s_fxxy_dot, FXXY_DOT, FXXY_DOT);
+    lv_obj_set_style_radius(s_fxxy_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_fxxy_dot, RED808_ACCENT, 0);
+    lv_obj_set_style_bg_opa(s_fxxy_dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_fxxy_dot, 2, 0);
+    lv_obj_set_style_border_color(s_fxxy_dot, RED808_TEXT, 0);
+    lv_obj_set_style_shadow_width(s_fxxy_dot, 18, 0);
+    lv_obj_set_style_shadow_color(s_fxxy_dot, RED808_ACCENT, 0);
+    lv_obj_set_style_shadow_opa(s_fxxy_dot, LV_OPA_70, 0);
+    lv_obj_clear_flag(s_fxxy_dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(s_fxxy_dot, LV_OBJ_FLAG_SCROLLABLE);
+
+    fxxy_sync_from_state();
 }
 
 // =============================================================================
@@ -8633,6 +8859,7 @@ void ui_create_all_screens(void) {
     create_performance_screen();
     create_piano_screen();      /* v2.6 */
     create_piano_params_screen(); /* v2.7 — synth params editor */
+    create_fx_xy_screen();      /* v3.2 — FX XY performance pad */
 
     // Start on boot screen
     lv_scr_load(scr_boot);
@@ -8789,6 +9016,11 @@ static void ui_reload_themed_screens(void) {
     }
     create_piano_params_screen();
     s_gtr_status_lbl = NULL;
+    /* v3.2 — also recreate the FX XY pad (s_fxxy_mode survives, widgets don't) */
+    if (scr_fx_xy) { lv_obj_del(scr_fx_xy); scr_fx_xy = NULL; }
+    s_fxxy_pad = NULL; s_fxxy_dot = NULL;
+    s_fxxy_x_lbl = NULL; s_fxxy_y_lbl = NULL; s_fxxy_mode_lbl = NULL;
+    create_fx_xy_screen();
 
     // Restore navigation (go to live if was on unknown screen)
     int nav_to = (saved_screen == 9) ? 9 : 2;  // stay in sdcard if we were there
@@ -8799,6 +9031,7 @@ static void ui_reload_themed_screens(void) {
     if (saved_screen == 10) nav_to = 10;   /* PIANO */
     if (saved_screen == 11) nav_to = 11;   /* PIANO PARAMS (synth editor) */
     if (saved_screen == 12) nav_to = 12;   /* GUITAR */
+    if (saved_screen == 13) nav_to = 13;   /* FX XY PAD */
     ui_navigate_to(nav_to);
 }
 
@@ -8808,7 +9041,8 @@ void ui_navigate_to(int screen_id) {
         NULL, scr_performance, scr_volumes, scr_fx, scr_sdcard,
         scr_piano,        /* 10 = PIANO (replaces stubbed performance slot) */
         scr_piano_params, /* 11 = PIANO PARAMS (synth editor) */
-        scr_guitar        /* 12 = GUITAR */
+        scr_guitar,       /* 12 = GUITAR */
+        scr_fx_xy         /* 13 = FX XY PAD */
     };
     int count = sizeof(targets) / sizeof(targets[0]);
     if (screen_id >= 0 && screen_id < count && targets[screen_id]) {
@@ -8833,6 +9067,9 @@ void ui_navigate_to(int screen_id) {
             piano_sync_active_engine_state();
         }
         if (screen_id != 9) s_sd_for_xtra = false;
+        // Entering the XY pad: re-place the dot from the live FX state (the
+        // master may have moved cutoff/reso since the screen was created).
+        if (screen_id == 13) fxxy_sync_from_state();
         // Leaving a screen: persist any pending XTRA param edits now instead
         // of waiting out the debounce window.
         xtra_param_save_flush();
