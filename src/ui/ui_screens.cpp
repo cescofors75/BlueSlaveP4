@@ -221,7 +221,6 @@ lv_obj_t* scr_sdcard = NULL;
 lv_obj_t* scr_performance = NULL;
 lv_obj_t* scr_piano = NULL;       /* v2.6 — PIANO live keyboard */
 lv_obj_t* scr_piano_params = NULL; /* v2.7 — synth engine parameter editor */
-lv_obj_t* scr_guitar = NULL;      /* v3.1 — GTR fretboard */
 lv_obj_t* scr_fx_xy = NULL;       /* v3.2 — FX XY performance pad */
 
 // Header widgets
@@ -720,13 +719,21 @@ static void xtra_apply_visual_state(int slot, bool active, lv_coord_t lx, lv_coo
     lv_obj_t* obj = grid_xtra_btns[slot];
     lv_color_t accent = xtra_slot_color(slot);
     if (!active) {
+        // Idle: dark slot-tinted gradient with the slot color on the border —
+        // reads as "armed" without competing with the touch glow below.
+        bool used = s_xtra_slots[slot].used;
         lv_obj_set_style_shadow_width(obj, 0, 0);
         lv_obj_set_style_shadow_opa(obj, LV_OPA_0, 0);
         lv_obj_set_style_outline_width(obj, 0, 0);
         lv_obj_set_style_outline_opa(obj, LV_OPA_0, 0);
+        lv_obj_set_style_bg_color(obj,
+            used ? lv_color_mix(accent, RED808_PANEL, 90) : RED808_SURFACE, 0);
+        lv_obj_set_style_bg_grad_color(obj, RED808_PANEL, 0);
+        lv_obj_set_style_bg_grad_dir(obj, LV_GRAD_DIR_VER, 0);
         lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(obj, 2, 0);
-        lv_obj_set_style_border_color(obj, theme_accent2(), 0);
+        lv_obj_set_style_border_color(obj, used ? accent : theme_border(), 0);
+        lv_obj_set_style_border_opa(obj, used ? LV_OPA_80 : LV_OPA_50, 0);
         if (grid_xtra_meta_lbls[slot]) lv_obj_set_style_text_color(grid_xtra_meta_lbls[slot], theme_text(), 0);
         if (grid_xtra_slot_lbls[slot]) lv_obj_set_style_text_color(grid_xtra_slot_lbls[slot], theme_text_dim(), 0);
         return;
@@ -1187,11 +1194,9 @@ static void xtra_refresh_panel(void) {
         lv_color_t accent = xtra_slot_color(i);
         if (s_xtra_slots[i].used) {
             xtra_slot_refresh_name(i);
-            lv_obj_set_style_bg_color(grid_xtra_btns[i], accent, 0);
-            lv_obj_set_style_border_color(grid_xtra_btns[i], theme_accent2(), 0);
-            lv_obj_set_style_bg_opa(grid_xtra_btns[i], LV_OPA_COVER, 0);
             lv_label_set_text(grid_xtra_lbls[i],
                               s_xtra_slots[i].name[0] ? s_xtra_slots[i].name : "XTRA");
+            lv_obj_set_style_text_color(grid_xtra_lbls[i], lv_color_white(), 0);
             if (grid_xtra_meta_lbls[i]) {
                 if (s_xtra_slots[i].synth_mode) {
                     lv_label_set_text_fmt(grid_xtra_meta_lbls[i], "PRESET %s  ·  XY %s",
@@ -1202,18 +1207,22 @@ static void xtra_refresh_panel(void) {
                 }
             }
         } else {
-            lv_obj_set_style_bg_color(grid_xtra_btns[i], theme_surface(), 0);
-            lv_obj_set_style_border_color(grid_xtra_btns[i], theme_border(), 0);
-            lv_obj_set_style_bg_opa(grid_xtra_btns[i], LV_OPA_80, 0);
             lv_label_set_text(grid_xtra_lbls[i], "+ ADD");
+            lv_obj_set_style_text_color(grid_xtra_lbls[i], theme_text_dim(), 0);
             if (grid_xtra_meta_lbls[i]) lv_label_set_text(grid_xtra_meta_lbls[i], "ENGINE SLOT");
         }
+        // Idle look (gradient, slot-colored border) lives in
+        // xtra_apply_visual_state(false) so a released pad lands on the
+        // exact same style as a freshly refreshed one.
         xtra_apply_visual_state(i, false, 0, 0);
         if (grid_xtra_slot_lbls[i]) lv_label_set_text_fmt(grid_xtra_slot_lbls[i], "S%02d", i + 1);
         if (grid_xtra_change_btns[i]) {
             lv_obj_set_style_border_color(grid_xtra_change_btns[i], accent, 0);
             lv_obj_t* lbl = lv_obj_get_child(grid_xtra_change_btns[i], 0);
-            if (lbl) lv_label_set_text_fmt(lbl, "MODE\n%s", xtra_slot_mode_label(i));
+            if (lbl) {
+                lv_label_set_text_fmt(lbl, "MODE\n%s", xtra_slot_mode_label(i));
+                lv_obj_set_style_text_color(lbl, accent, 0);
+            }
         }
         if (grid_xtra_delete_btns[i]) {
             lv_obj_set_style_border_color(grid_xtra_delete_btns[i], accent, 0);
@@ -1221,6 +1230,7 @@ static void xtra_refresh_panel(void) {
             if (lbl) {
                 if (s_xtra_slots[i].synth_mode) lv_label_set_text_fmt(lbl, "PRESET\n%s", XTRA_PRESET_LABELS[s_xtra_slots[i].preset_idx % 3]);
                 else lv_label_set_text(lbl, "LOAD\nWAV");
+                lv_obj_set_style_text_color(lbl, accent, 0);
             }
         }
     }
@@ -4977,13 +4987,14 @@ static void create_volumes_screen(void) {
     int strip_h  = y_bottom - y_top;            // ~508px
     int name_h   = 14;
     int value_h  = 14;
-    int mute_h   = 10;
+    int mute_h   = 26;
     int slider_h = strip_h - name_h - value_h - mute_h - 18;
 
     for (int i = 0; i < 16; i++) {
         int x = margin + i * (strip_w + gap);
         int cx = x + strip_w / 2;
         lv_color_t tc = lv_color_hex(theme_presets[currentTheme].track_colors[i]);
+        lv_color_t tc_hi = lv_color_mix(lv_color_white(), tc, 110);   // lit top of the fader
 
         // Strip panel background
         vol_strip_panels[i] = lv_obj_create(scr_volumes);
@@ -4997,36 +5008,59 @@ static void create_volumes_screen(void) {
         lv_obj_set_style_border_width(vol_strip_panels[i], 1, 0);
         lv_obj_set_style_border_color(vol_strip_panels[i], tc, 0);
         lv_obj_set_style_border_opa(vol_strip_panels[i], LV_OPA_40, 0);
+        lv_obj_set_style_pad_all(vol_strip_panels[i], 0, 0);
         lv_obj_clear_flag(vol_strip_panels[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(vol_strip_panels[i], LV_OBJ_FLAG_CLICKABLE);
 
-        // Track name
+        // Track number + name ("01·BD")
         vol_name_labels[i] = lv_label_create(scr_volumes);
-        lv_label_set_text(vol_name_labels[i], trackNames[i]);
+        lv_label_set_text_fmt(vol_name_labels[i], "%02d·%s", i + 1, trackNames[i]);
         lv_obj_set_style_text_font(vol_name_labels[i], &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(vol_name_labels[i], tc, 0);
         lv_obj_set_style_text_align(vol_name_labels[i], LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_pos(vol_name_labels[i], x, y_top + 2);
         lv_obj_set_width(vol_name_labels[i], strip_w);
 
-        // Vertical slider (fader)
+        // Fader scale ticks at 25/50/75% — console-style orientation marks
         int y_sl = y_top + name_h + 4;
+        for (int tk = 1; tk <= 3; tk++) {
+            lv_obj_t* tick = lv_obj_create(scr_volumes);
+            lv_obj_set_size(tick, strip_w - 18, 1);
+            lv_obj_set_pos(tick, x + 9, y_sl + (slider_h * tk) / 4);
+            lv_obj_set_style_bg_color(tick, RED808_TEXT_DIM, 0);
+            lv_obj_set_style_bg_opa(tick, tk == 2 ? LV_OPA_40 : LV_OPA_20, 0);
+            lv_obj_set_style_border_width(tick, 0, 0);
+            lv_obj_clear_flag(tick, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_clear_flag(tick, LV_OBJ_FLAG_SCROLLABLE);
+        }
+
+        // Vertical fader — wide groove, gradient indicator that "lights up"
         vol_sliders[i] = lv_slider_create(scr_volumes);
-        lv_obj_set_size(vol_sliders[i], 8, slider_h);
-        lv_obj_set_pos(vol_sliders[i], cx - 4, y_sl);
+        lv_obj_set_size(vol_sliders[i], 14, slider_h);
+        lv_obj_set_pos(vol_sliders[i], cx - 7, y_sl);
         lv_slider_set_range(vol_sliders[i], 0, Config::MAX_VOLUME);
         lv_slider_set_value(vol_sliders[i], p4.track_volume[i], LV_ANIM_OFF);
-        lv_obj_set_style_bg_color(vol_sliders[i], lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+        lv_obj_set_style_bg_color(vol_sliders[i], lv_color_hex(0x1C1C1C), LV_PART_MAIN);
+        lv_obj_set_style_bg_grad_color(vol_sliders[i], lv_color_hex(0x303030), LV_PART_MAIN);
+        lv_obj_set_style_bg_grad_dir(vol_sliders[i], LV_GRAD_DIR_HOR, LV_PART_MAIN);
         lv_obj_set_style_bg_opa(vol_sliders[i], LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_radius(vol_sliders[i], 4, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(vol_sliders[i], tc, LV_PART_INDICATOR);
+        lv_obj_set_style_border_width(vol_sliders[i], 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(vol_sliders[i], lv_color_hex(0x000000), LV_PART_MAIN);
+        lv_obj_set_style_radius(vol_sliders[i], 5, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(vol_sliders[i], tc_hi, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_grad_color(vol_sliders[i], tc, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_grad_dir(vol_sliders[i], LV_GRAD_DIR_VER, LV_PART_INDICATOR);
         lv_obj_set_style_bg_opa(vol_sliders[i], LV_OPA_COVER, LV_PART_INDICATOR);
-        lv_obj_set_style_radius(vol_sliders[i], 4, LV_PART_INDICATOR);
-        lv_obj_set_style_bg_color(vol_sliders[i], lv_color_white(), LV_PART_KNOB);
+        lv_obj_set_style_radius(vol_sliders[i], 5, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(vol_sliders[i], lv_color_hex(0xF2F2F2), LV_PART_KNOB);
+        lv_obj_set_style_bg_grad_color(vol_sliders[i], lv_color_hex(0xB8B8B8), LV_PART_KNOB);
+        lv_obj_set_style_bg_grad_dir(vol_sliders[i], LV_GRAD_DIR_VER, LV_PART_KNOB);
         lv_obj_set_style_bg_opa(vol_sliders[i], LV_OPA_COVER, LV_PART_KNOB);
-        lv_obj_set_style_pad_all(vol_sliders[i], 5, LV_PART_KNOB);
-        lv_obj_set_style_radius(vol_sliders[i], LV_RADIUS_CIRCLE, LV_PART_KNOB);
+        lv_obj_set_style_pad_hor(vol_sliders[i], 7, LV_PART_KNOB);
+        lv_obj_set_style_pad_ver(vol_sliders[i], 4, LV_PART_KNOB);
+        lv_obj_set_style_radius(vol_sliders[i], 4, LV_PART_KNOB);
         lv_obj_set_style_shadow_color(vol_sliders[i], tc, LV_PART_KNOB);
-        lv_obj_set_style_shadow_width(vol_sliders[i], 8, LV_PART_KNOB);
+        lv_obj_set_style_shadow_width(vol_sliders[i], 10, LV_PART_KNOB);
         lv_obj_set_style_shadow_opa(vol_sliders[i], LV_OPA_60, LV_PART_KNOB);
         lv_obj_set_style_border_color(vol_sliders[i], tc, LV_PART_KNOB);
         lv_obj_set_style_border_width(vol_sliders[i], 2, LV_PART_KNOB);
@@ -5052,18 +5086,26 @@ static void create_volumes_screen(void) {
         lv_obj_set_pos(vol_labels[i], x, y_val);
         lv_obj_set_width(vol_labels[i], strip_w);
 
-        // Mute dot
-        vol_mute_dots[i] = lv_obj_create(scr_volumes);
-        lv_obj_set_size(vol_mute_dots[i], 8, 8);
-        lv_obj_set_pos(vol_mute_dots[i], cx - 4, y_val + value_h + 2);
-        lv_obj_set_style_radius(vol_mute_dots[i], 4, 0);
+        // Mute button — real console "M": tap toggles the track (same
+        // debounced callback as the sequencer column). update_volumes_screen
+        // keeps recoloring it red/green through the vol_mute_dots pointer.
+        vol_mute_dots[i] = lv_btn_create(scr_volumes);
+        lv_obj_set_size(vol_mute_dots[i], strip_w - 8, 22);
+        lv_obj_set_pos(vol_mute_dots[i], x + 4, y_val + value_h + 2);
+        lv_obj_set_style_radius(vol_mute_dots[i], 5, 0);
         lv_obj_set_style_bg_color(vol_mute_dots[i], RED808_SUCCESS, 0);
-        lv_obj_set_style_bg_opa(vol_mute_dots[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_opa(vol_mute_dots[i], LV_OPA_60, 0);
         lv_obj_set_style_shadow_color(vol_mute_dots[i], RED808_SUCCESS, 0);
-        lv_obj_set_style_shadow_width(vol_mute_dots[i], 6, 0);
-        lv_obj_set_style_shadow_opa(vol_mute_dots[i], LV_OPA_50, 0);
+        lv_obj_set_style_shadow_width(vol_mute_dots[i], 8, 0);
+        lv_obj_set_style_shadow_opa(vol_mute_dots[i], LV_OPA_40, 0);
         lv_obj_set_style_border_width(vol_mute_dots[i], 0, 0);
         lv_obj_clear_flag(vol_mute_dots[i], LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(vol_mute_dots[i], seq_mute_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+        lv_obj_t* mlbl = lv_label_create(vol_mute_dots[i]);
+        lv_label_set_text(mlbl, "M");
+        lv_obj_set_style_text_font(mlbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mlbl, lv_color_white(), 0);
+        lv_obj_center(mlbl);
     }
 }
 
@@ -6491,11 +6533,22 @@ static uint8_t s_piano_rec_engine = 3;
 static uint8_t s_piano_rec_octave = 4;
 static bool s_piano_rec_has_notes = false;
 
-static constexpr int PIANO_ENGINE_COUNT = 5;
-static const uint8_t PIANO_ENGINES[PIANO_ENGINE_COUNT]      = {3, 4, 5, 6, 7};
-static const char*   PIANO_ENGINE_LABELS[PIANO_ENGINE_COUNT] = {"303", "WT", "SH101", "FM2", "GTR"};
+// GTR (engine 7) removed from the piano selector — it never tracked the
+// physical-model voice well from a keyboard layout; engine 7 remains fully
+// reachable from PAD SOUND / track engine sync.
+static constexpr int PIANO_ENGINE_COUNT = 4;
+static const uint8_t PIANO_ENGINES[PIANO_ENGINE_COUNT]      = {3, 4, 5, 6};
+static const char*   PIANO_ENGINE_LABELS[PIANO_ENGINE_COUNT] = {"303", "WT", "SH101", "FM2"};
+// Signature color per engine — used by the selector chips and the pressed-key
+// glow, so the active synth is readable at a glance from across the room.
+static const uint32_t PIANO_ENGINE_COLORS[PIANO_ENGINE_COUNT] = {
+    0xFFE066,   // 303 — acid yellow
+    0x00E5FF,   // WT — cyan
+    0xB07CFF,   // SH101 — violet
+    0xFF8C42,   // FM2 — orange
+};
 
-static lv_obj_t* s_piano_engine_btns[PIANO_ENGINE_COUNT]   = {NULL, NULL, NULL, NULL, NULL};
+static lv_obj_t* s_piano_engine_btns[PIANO_ENGINE_COUNT]   = {NULL, NULL, NULL, NULL};
 static lv_obj_t* s_piano_octave_lbl       = NULL;
 static lv_obj_t* s_piano_keys24_btn       = NULL;
 static lv_obj_t* s_piano_keys24_lbl       = NULL;
@@ -6511,12 +6564,6 @@ static lv_obj_t* s_piano_bend_btn         = NULL;
 static lv_obj_t* s_piano_bend_lbl         = NULL;
 static lv_obj_t* s_piano_range_btn        = NULL;
 static lv_obj_t* s_piano_range_lbl        = NULL;
-static lv_obj_t* s_gtr_status_lbl         = NULL;
-
-static int       s_gtr_held_note          = -1;
-static int       s_gtr_held_string        = -1;
-static const uint8_t GTR_STRING_OPEN_NOTES[6] = {64, 59, 55, 50, 45, 40};
-static constexpr int GTR_FRET_COUNT = 12;
 
 // Piano gesture state (v3.0): hold+drag for glide and pitch bend.
 static bool      s_piano_glide_enabled     = false;
@@ -6570,8 +6617,14 @@ static inline uint8_t piano_engine_code(void) {
 static void piano_set_key_visual(lv_obj_t* btn, uint8_t note, bool pressed) {
     if (!btn) return;
     bool is_black = piano_pc_is_black(note % 12);
+    lv_color_t eng = lv_color_hex(PIANO_ENGINE_COLORS[s_piano_engine_idx]);
     lv_obj_set_style_bg_color(btn,
-        pressed ? RED808_ACCENT : (is_black ? lv_color_hex(0x101010) : lv_color_hex(0xF0F0E8)), 0);
+        pressed ? eng : (is_black ? lv_color_hex(0x141414) : lv_color_hex(0xFAFAF2)), 0);
+    // Pressed keys glow in the active engine's color; black keys keep a
+    // subtle drop shadow for depth when idle.
+    lv_obj_set_style_shadow_color(btn, pressed ? eng : lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(btn,
+        pressed ? LV_OPA_80 : (is_black ? LV_OPA_40 : LV_OPA_0), 0);
 }
 
 static void piano_set_note_active(uint8_t note, bool pressed) {
@@ -6633,42 +6686,6 @@ static void piano_apply_glide_setting(void) {
 
 static void piano_send_off(void);
 static void piano_send_on(uint8_t midi_note, bool legato);
-
-static void guitar_send_off(void) {
-    if (s_gtr_held_note < 0) return;
-    piano_send_off();
-    s_gtr_held_note = -1;
-    s_gtr_held_string = -1;
-    if (s_gtr_status_lbl) lv_label_set_text(s_gtr_status_lbl, "GTR · —");
-}
-
-static void guitar_send_on(uint8_t midi_note, int string_idx) {
-    guitar_send_off();
-    if (s_piano_engine_idx != (PIANO_ENGINE_COUNT - 1)) {
-        s_piano_engine_idx = PIANO_ENGINE_COUNT - 1;
-    }
-    if (ui_use_udp_transport()) {
-        udp_send_melody_set_engine(7);
-    }
-    piano_send_on(midi_note, false);
-    s_gtr_held_note = (int)midi_note;
-    s_gtr_held_string = string_idx;
-    if (s_gtr_status_lbl) {
-        lv_label_set_text_fmt(s_gtr_status_lbl, "GTR · STR %d · %s", string_idx + 1, piano_note_name(midi_note));
-    }
-}
-
-static void guitar_fret_event_cb(lv_event_t* e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    uintptr_t packed = (uintptr_t)lv_event_get_user_data(e);
-    int string_idx = (int)((packed >> 8) & 0xFF);
-    int fret = (int)(packed & 0xFF);
-    uint8_t midi_note = (uint8_t)(GTR_STRING_OPEN_NOTES[string_idx] + fret);
-
-    if (code == LV_EVENT_CLICKED || code == LV_EVENT_PRESSED) {
-        guitar_send_on(midi_note, string_idx);
-    }
-}
 
 static void piano_refresh_gesture_controls(void) {
     if (s_piano_glide_lbl) {
@@ -6987,10 +7004,15 @@ static void piano_refresh_engine_chips(void) {
     for (int i = 0; i < PIANO_ENGINE_COUNT; i++) {
         if (!s_piano_engine_btns[i]) continue;
         bool sel = (i == s_piano_engine_idx);
-        lv_obj_set_style_bg_color(s_piano_engine_btns[i],
-            sel ? RED808_ACCENT : RED808_SURFACE, 0);
-        lv_obj_set_style_border_color(s_piano_engine_btns[i],
-            sel ? RED808_ACCENT2 : RED808_BORDER, 0);
+        lv_color_t ec = lv_color_hex(PIANO_ENGINE_COLORS[i]);
+        lv_obj_set_style_bg_color(s_piano_engine_btns[i], sel ? ec : RED808_SURFACE, 0);
+        lv_obj_set_style_border_color(s_piano_engine_btns[i], ec, 0);
+        lv_obj_set_style_border_opa(s_piano_engine_btns[i], sel ? LV_OPA_COVER : LV_OPA_50, 0);
+        lv_obj_set_style_shadow_width(s_piano_engine_btns[i], sel ? 14 : 0, 0);
+        lv_obj_set_style_shadow_color(s_piano_engine_btns[i], ec, 0);
+        lv_obj_set_style_shadow_opa(s_piano_engine_btns[i], sel ? LV_OPA_50 : LV_OPA_0, 0);
+        lv_obj_t* lbl = lv_obj_get_child(s_piano_engine_btns[i], 0);
+        if (lbl) lv_obj_set_style_text_color(lbl, sel ? RED808_BG : ec, 0);
     }
     if (s_piano_status_lbl) {
         lv_label_set_text_fmt(s_piano_status_lbl, "ENG %s  OCT %d  PAD %d",
@@ -7171,11 +7193,13 @@ static void piano_grid_refresh_cell(int col, int row) {
     bool on      = s_piano_rec_grid[col][row];
     bool playing = (s_piano_play_active && col == s_piano_play_step);
     bool black   = piano_pc_is_black(PIANO_ROW_TO_PC[row]);
+    bool beat    = ((col & 3) == 0);   // lighten beats 1/5/9/13 for orientation
     uint32_t color;
     if (on && playing)       color = 0xFFD000;       // yellow — note + playhead
     else if (on)             color = 0x00E5FF;       // cyan — armed note
     else if (playing)        color = 0x303030;       // dim grey — playhead
-    else                     color = black ? 0x101820 : 0x222A30;
+    else if (black)          color = beat ? 0x16222C : 0x101820;
+    else                     color = beat ? 0x2A343C : 0x222A30;
     lv_obj_set_style_bg_color(b, lv_color_hex(color), 0);
     lv_obj_set_style_bg_opa(b, on ? LV_OPA_COVER : (playing ? LV_OPA_70 : LV_OPA_60), 0);
 }
@@ -7462,7 +7486,10 @@ static void piano_rebuild_keys(void) {
 
     int base_midi = (s_piano_octave + 1) * 12;   // C(s_piano_octave) MIDI
 
-    /* White keys */
+    /* White keys — ivory gradient, note name on every key (C carries the
+     * octave number in the engine color, the rest stay dim). */
+    static const char* WHITE_NAMES[7] = {"C", "D", "E", "F", "G", "A", "B"};
+    lv_color_t eng_color = lv_color_hex(PIANO_ENGINE_COLORS[s_piano_engine_idx]);
     for (int oct = 0; oct < num_octaves; oct++) {
         for (int w = 0; w < 7; w++) {
             int x = (oct * 7 + w) * white_w;
@@ -7471,27 +7498,34 @@ static void piano_rebuild_keys(void) {
             lv_obj_set_pos(k, x, 0);
             lv_obj_set_size(k, white_w - 2, white_h - 2);
             lv_obj_set_style_radius(k, 6, 0);
-            lv_obj_set_style_bg_color(k, lv_color_hex(0xF0F0E8), 0);
-            lv_obj_set_style_bg_grad_color(k, lv_color_hex(0xB8B8AE), 0);
+            lv_obj_set_style_bg_color(k, lv_color_hex(0xFAFAF2), 0);
+            lv_obj_set_style_bg_grad_color(k, lv_color_hex(0xC4C4B8), 0);
             lv_obj_set_style_bg_grad_dir(k, LV_GRAD_DIR_VER, 0);
             lv_obj_set_style_bg_opa(k, LV_OPA_COVER, 0);
             lv_obj_set_style_border_width(k, 1, 0);
             lv_obj_set_style_border_color(k, lv_color_hex(0x404040), 0);
-            lv_obj_set_style_shadow_width(k, 0, 0);
-            lv_obj_set_style_bg_color(k, RED808_ACCENT, LV_STATE_PRESSED);
+            // Shadow reserved for the pressed engine-glow (opa toggled in
+            // piano_set_key_visual); width must be pre-set or LVGL skips it.
+            lv_obj_set_style_shadow_width(k, 16, 0);
+            lv_obj_set_style_shadow_opa(k, LV_OPA_0, 0);
+            lv_obj_set_style_bg_color(k, eng_color, LV_STATE_PRESSED);
             lv_obj_clear_flag(k, LV_OBJ_FLAG_SCROLLABLE);
             s_piano_key_obj_by_note[midi] = k;
             lv_obj_add_event_cb(k, piano_key_event_cb, LV_EVENT_PRESSED, (void*)(uintptr_t)midi);
             lv_obj_add_event_cb(k, piano_key_event_cb, LV_EVENT_PRESSING, (void*)(uintptr_t)midi);
             lv_obj_add_event_cb(k, piano_key_event_cb, LV_EVENT_RELEASED, (void*)(uintptr_t)midi);
             lv_obj_add_event_cb(k, piano_key_event_cb, LV_EVENT_PRESS_LOST, (void*)(uintptr_t)midi);
+            lv_obj_t* lbl = lv_label_create(k);
             if (w == 0) {
-                lv_obj_t* lbl = lv_label_create(k);
                 lv_label_set_text_fmt(lbl, "C%d", s_piano_octave + oct);
-                lv_obj_set_style_text_color(lbl, lv_color_hex(0x303030), 0);
+                lv_obj_set_style_text_color(lbl, lv_color_hex(0x1A1A1A), 0);
                 lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-                lv_obj_align(lbl, LV_ALIGN_BOTTOM_MID, 0, -4);
+            } else {
+                lv_label_set_text(lbl, WHITE_NAMES[w]);
+                lv_obj_set_style_text_color(lbl, lv_color_hex(0x9A9A90), 0);
+                lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
             }
+            lv_obj_align(lbl, LV_ALIGN_BOTTOM_MID, 0, -6);
         }
     }
     /* Black keys (drawn last so they appear on top) */
@@ -7503,15 +7537,20 @@ static void piano_rebuild_keys(void) {
             lv_obj_t* k = lv_btn_create(s_piano_keys_container);
             lv_obj_set_pos(k, x, 0);
             lv_obj_set_size(k, black_w, black_h);
-            lv_obj_set_style_radius(k, 4, 0);
-            lv_obj_set_style_bg_color(k, lv_color_hex(0x101010), 0);
-            lv_obj_set_style_bg_grad_color(k, lv_color_hex(0x303030), 0);
+            lv_obj_set_style_radius(k, 5, 0);
+            lv_obj_set_style_bg_color(k, lv_color_hex(0x262626), 0);
+            lv_obj_set_style_bg_grad_color(k, lv_color_hex(0x0A0A0A), 0);
             lv_obj_set_style_bg_grad_dir(k, LV_GRAD_DIR_VER, 0);
             lv_obj_set_style_bg_opa(k, LV_OPA_COVER, 0);
             lv_obj_set_style_border_width(k, 1, 0);
             lv_obj_set_style_border_color(k, lv_color_hex(0x000000), 0);
-            lv_obj_set_style_shadow_width(k, 0, 0);
-            lv_obj_set_style_bg_color(k, RED808_ACCENT, LV_STATE_PRESSED);
+            // Drop shadow gives the black keys depth over the whites; the
+            // same shadow flips to the engine glow while pressed.
+            lv_obj_set_style_shadow_width(k, 12, 0);
+            lv_obj_set_style_shadow_ofs_y(k, 4, 0);
+            lv_obj_set_style_shadow_color(k, lv_color_black(), 0);
+            lv_obj_set_style_shadow_opa(k, LV_OPA_40, 0);
+            lv_obj_set_style_bg_color(k, eng_color, LV_STATE_PRESSED);
             lv_obj_clear_flag(k, LV_OBJ_FLAG_SCROLLABLE);
             s_piano_key_obj_by_note[midi] = k;
             lv_obj_add_event_cb(k, piano_key_event_cb, LV_EVENT_PRESSED, (void*)(uintptr_t)midi);
@@ -7520,6 +7559,18 @@ static void piano_rebuild_keys(void) {
             lv_obj_add_event_cb(k, piano_key_event_cb, LV_EVENT_PRESS_LOST, (void*)(uintptr_t)midi);
         }
     }
+
+    /* Red felt strip across the key tops — classic piano detail, and it
+     * doubles as a visual anchor between the grid and the keyboard. */
+    lv_obj_t* felt = lv_obj_create(s_piano_keys_container);
+    lv_obj_set_size(felt, container_w, 5);
+    lv_obj_set_pos(felt, 0, 0);
+    lv_obj_set_style_bg_color(felt, lv_color_hex(0xA01020), 0);
+    lv_obj_set_style_bg_opa(felt, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(felt, 0, 0);
+    lv_obj_set_style_radius(felt, 0, 0);
+    lv_obj_clear_flag(felt, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(felt, LV_OBJ_FLAG_SCROLLABLE);
 }
 
 static void create_piano_screen(void) {
@@ -7539,20 +7590,17 @@ static void create_piano_screen(void) {
     lv_obj_set_style_text_color(title, RED808_TEXT, 0);
     lv_obj_set_pos(title, 64, 12);
 
-    /* Engine selector buttons (top-right) */
+    /* Engine selector buttons (top-right) — colored per engine */
     int eng_w = 80, eng_h = 36, eng_gap = 6;
     int eng_x_start = W - (eng_w + eng_gap) * PIANO_ENGINE_COUNT - 12;
     for (int i = 0; i < PIANO_ENGINE_COUNT; i++) {
         lv_obj_t* btn = piano_make_chip(scr_piano,
             eng_x_start + i * (eng_w + eng_gap), 8,
             eng_w, eng_h, PIANO_ENGINE_LABELS[i]);
-        if (i == s_piano_engine_idx) {
-            lv_obj_set_style_bg_color(btn, RED808_ACCENT, 0);
-            lv_obj_set_style_border_color(btn, RED808_ACCENT2, 0);
-        }
         lv_obj_add_event_cb(btn, piano_engine_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
         s_piano_engine_btns[i] = btn;
     }
+    piano_refresh_engine_chips();
 
     /* Controls row: octave -/+ + 12/24 toggle + status */
     int row_y = 56;
@@ -8497,129 +8545,6 @@ static void xtra_edit_cb(lv_event_t* e) {
     ui_navigate_to(11);
 }
 
-static void guitar_back_cb(lv_event_t* e) {
-    (void)e;
-    ui_navigate_to(10);
-}
-
-static void create_guitar_screen(void) {
-    int W = ui_layout_w();
-    int H = ui_layout_h();
-
-    scr_guitar = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_guitar, RED808_BG, 0);
-    lv_obj_clear_flag(scr_guitar, LV_OBJ_FLAG_SCROLLABLE);
-    ui_create_header(scr_guitar);
-
-    lv_obj_t* title = lv_label_create(scr_guitar);
-    lv_label_set_text(title, "GUITAR · PHYS");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFF8C42), 0);
-    lv_obj_set_pos(title, 20, 60);
-
-    lv_obj_t* sub = lv_label_create(scr_guitar);
-    lv_label_set_text(sub, "Diapason tactil · pulsa traste/cuerda · GTR tambien desde Piano");
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(sub, RED808_TEXT_DIM, 0);
-    lv_obj_set_pos(sub, 20, 96);
-
-    lv_obj_t* back = lv_btn_create(scr_guitar);
-    lv_obj_set_size(back, 90, 38);
-    lv_obj_set_pos(back, W - 104, 58);
-    apply_control_button_style(back, RED808_ERROR, false, 8);
-    lv_obj_add_event_cb(back, guitar_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t* back_lbl = lv_label_create(back);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " PIANO");
-    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_center(back_lbl);
-
-    s_gtr_status_lbl = lv_label_create(scr_guitar);
-    lv_label_set_text(s_gtr_status_lbl, "GTR · —");
-    lv_obj_set_style_text_font(s_gtr_status_lbl, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(s_gtr_status_lbl, RED808_TEXT, 0);
-    lv_obj_set_pos(s_gtr_status_lbl, 20, 126);
-
-    lv_obj_t* fretboard = lv_obj_create(scr_guitar);
-    lv_obj_set_size(fretboard, W - 40, H - 188);
-    lv_obj_set_pos(fretboard, 20, 158);
-    lv_obj_clear_flag(fretboard, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_radius(fretboard, 16, 0);
-    lv_obj_set_style_bg_color(fretboard, lv_color_hex(0x8A5A2B), 0);
-    lv_obj_set_style_bg_grad_color(fretboard, lv_color_hex(0x5A3416), 0);
-    lv_obj_set_style_bg_grad_dir(fretboard, LV_GRAD_DIR_HOR, 0);
-    lv_obj_set_style_border_color(fretboard, lv_color_hex(0xC28A4B), 0);
-    lv_obj_set_style_border_width(fretboard, 2, 0);
-    lv_obj_set_style_pad_all(fretboard, 0, 0);
-
-    const int board_w = W - 40;
-    const int board_h = H - 188;
-    const int left_pad = 34;
-    const int top_pad = 34;
-    const int usable_w = board_w - left_pad - 16;
-    const int usable_h = board_h - top_pad * 2;
-    const int fret_gap = 2;
-    const int fret_w = (usable_w - (GTR_FRET_COUNT - 1) * fret_gap) / GTR_FRET_COUNT;
-    const int string_gap = usable_h / 5;
-
-    for (int fret = 1; fret < GTR_FRET_COUNT; fret++) {
-        lv_obj_t* bar = lv_obj_create(fretboard);
-        lv_obj_set_size(bar, 3, usable_h + 18);
-        lv_obj_set_pos(bar, left_pad + fret * (fret_w + fret_gap) - 2, top_pad - 8);
-        lv_obj_set_style_radius(bar, 2, 0);
-        lv_obj_set_style_bg_color(bar, lv_color_hex(0xD6D2C4), 0);
-        lv_obj_set_style_border_width(bar, 0, 0);
-    }
-
-    const int marker_frets[] = {2, 4, 6, 8, 11};
-    for (int m = 0; m < 5; m++) {
-        int fret = marker_frets[m];
-        int dot_x = left_pad + fret * (fret_w + fret_gap) - (fret_w / 2);
-        lv_obj_t* dot = lv_obj_create(fretboard);
-        lv_obj_set_size(dot, 14, 14);
-        lv_obj_set_pos(dot, dot_x, top_pad + usable_h / 2 - 7);
-        lv_obj_set_style_radius(dot, 7, 0);
-        lv_obj_set_style_bg_color(dot, lv_color_hex(0xF7E7A9), 0);
-        lv_obj_set_style_border_width(dot, 0, 0);
-    }
-
-    for (int string_idx = 0; string_idx < 6; string_idx++) {
-        int y = top_pad + string_idx * string_gap;
-        lv_obj_t* string_lbl = lv_label_create(fretboard);
-        lv_label_set_text_fmt(string_lbl, "S%d", string_idx + 1);
-        lv_obj_set_style_text_font(string_lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(string_lbl, lv_color_hex(0xFFB26B), 0);
-        lv_obj_set_pos(string_lbl, 4, y - 10);
-
-        lv_obj_t* string_line = lv_obj_create(fretboard);
-        lv_obj_set_size(string_line, usable_w + 6, 2 + (5 - string_idx));
-        lv_obj_set_pos(string_line, left_pad, y);
-        lv_obj_set_style_radius(string_line, 2, 0);
-        lv_obj_set_style_bg_color(string_line, lv_color_hex(0xE9E4D4), 0);
-        lv_obj_set_style_border_width(string_line, 0, 0);
-
-        for (int fret = 0; fret < GTR_FRET_COUNT; fret++) {
-            lv_obj_t* cell = lv_btn_create(fretboard);
-            lv_obj_set_size(cell, fret_w, string_gap);
-            lv_obj_set_pos(cell, left_pad + fret * (fret_w + fret_gap), y - string_gap / 2);
-            lv_obj_set_style_bg_opa(cell, LV_OPA_10, 0);
-            lv_obj_set_style_border_opa(cell, LV_OPA_20, 0);
-            lv_obj_set_style_border_color(cell, lv_color_hex(0xFFF5CC), 0);
-            lv_obj_set_style_border_width(cell, 1, 0);
-            lv_obj_set_style_radius(cell, 4, 0);
-            if (string_idx == 0) {
-                lv_obj_t* fret_lbl = lv_label_create(fretboard);
-                lv_label_set_text_fmt(fret_lbl, "%d", fret);
-                lv_obj_set_style_text_font(fret_lbl, &lv_font_montserrat_14, 0);
-                lv_obj_set_style_text_color(fret_lbl, lv_color_hex(0xF7E7A9), 0);
-                lv_obj_set_pos(fret_lbl, left_pad + fret * (fret_w + fret_gap) + (fret_w / 2) - 5, 8);
-            }
-            uintptr_t packed = (uintptr_t)(((uint16_t)string_idx << 8) | (uint16_t)fret);
-            lv_obj_add_flag(cell, LV_OBJ_FLAG_PRESS_LOCK);
-            lv_obj_add_event_cb(cell, guitar_fret_event_cb, LV_EVENT_CLICKED, (void*)packed);
-        }
-    }
-}
-
 static void create_piano_params_screen(void) {
     int W = ui_layout_w();
     int H = ui_layout_h();
@@ -9015,7 +8940,6 @@ static void ui_reload_themed_screens(void) {
         s_pp_sliders[i] = NULL; s_pp_val_lbls[i] = NULL;
     }
     create_piano_params_screen();
-    s_gtr_status_lbl = NULL;
     /* v3.2 — also recreate the FX XY pad (s_fxxy_mode survives, widgets don't) */
     if (scr_fx_xy) { lv_obj_del(scr_fx_xy); scr_fx_xy = NULL; }
     s_fxxy_pad = NULL; s_fxxy_dot = NULL;
@@ -9030,7 +8954,6 @@ static void ui_reload_themed_screens(void) {
     if (saved_screen == 8) nav_to = 8;
     if (saved_screen == 10) nav_to = 10;   /* PIANO */
     if (saved_screen == 11) nav_to = 11;   /* PIANO PARAMS (synth editor) */
-    if (saved_screen == 12) nav_to = 12;   /* GUITAR */
     if (saved_screen == 13) nav_to = 13;   /* FX XY PAD */
     ui_navigate_to(nav_to);
 }
@@ -9041,7 +8964,7 @@ void ui_navigate_to(int screen_id) {
         NULL, scr_performance, scr_volumes, scr_fx, scr_sdcard,
         scr_piano,        /* 10 = PIANO (replaces stubbed performance slot) */
         scr_piano_params, /* 11 = PIANO PARAMS (synth editor) */
-        scr_guitar,       /* 12 = GUITAR */
+        NULL,             /* 12 = reserved (guitar screen removed) */
         scr_fx_xy         /* 13 = FX XY PAD */
     };
     int count = sizeof(targets) / sizeof(targets[0]);
