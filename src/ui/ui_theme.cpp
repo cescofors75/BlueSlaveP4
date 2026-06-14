@@ -48,11 +48,12 @@ const ThemeColors theme_presets[THEME_COUNT] = {
       .track_colors={0xFF0000,0xFF5500,0xFFAA00,0xFFFF00,0x88FF00,0x00FF00,0x00FF88,0x00FFFF,
                      0x0088FF,0x0000FF,0x5500FF,0xAA00FF,0xFF00FF,0xFF0088,0xFF4444,0x44FFAA},
       .name="RAINBOW" },
-    // THEME_GREYSCALE
+    // THEME_GREYSCALE — warning/error luminance lifted so accent-colored
+    // outline buttons (border + label over the dark surface) stay legible.
     { .bg=0x101010, .panel=0x1A1A1A, .surface=0x252525, .border=0x404040,
       .text=0xE0E0E0, .text_dim=0x808080,
       .accent=0xCCCCCC, .accent2=0xAAAAAA,
-      .success=0xBBBBBB, .warning=0x999999, .error=0x666666, .info=0xDDDDDD, .cyan=0xC0C0C0,
+      .success=0xBBBBBB, .warning=0xC8C8C8, .error=0xA0A0A0, .info=0xDDDDDD, .cyan=0xC0C0C0,
       .track_colors={0xFFFFFF,0xEEEEEE,0xDDDDDD,0xCCCCCC,0xBBBBBB,0xAAAAAA,0x999999,0x888888,
                      0x777777,0x666666,0x555555,0x444444,0x333333,0x222222,0xF0F0F0,0xD0D0D0},
       .name="GREYSCALE" },

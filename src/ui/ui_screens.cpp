@@ -501,9 +501,9 @@ void ui_create_header(lv_obj_t* parent) {
     hdr_wifi_label = NULL; hdr_s3_label = NULL;
     for (int i = 0; i < 16; i++) hdr_step_dots[i] = NULL;
 
-    // Small floating back button (top-left)
+    // Small floating back button (top-left) — ≥40px tall for reliable live taps
     lv_obj_t* back_btn = lv_btn_create(parent);
-    lv_obj_set_size(back_btn, 44, 34);
+    lv_obj_set_size(back_btn, 48, 42);
     lv_obj_set_pos(back_btn, 8, 8);
     apply_control_button_style(back_btn, RED808_BORDER, false, 8);
     lv_obj_add_event_cb(back_btn, [](lv_event_t* e) {
@@ -2509,10 +2509,13 @@ static void create_live_screen(void) {
     lv_obj_add_event_cb(step_panel, live_step_nav_cb, LV_EVENT_CLICKED, NULL);
     live_home_panels[live_home_panel_count++] = step_panel;
 
+    // Title doubles as the SEQUENCER nav cue (the whole panel is clickable →
+    // live_step_nav_cb). The chevron + accent color signal it is tappable, so
+    // the step sequencer is discoverable from the LIVE hub.
     lv_obj_t* step_title = lv_label_create(step_panel);
-    lv_label_set_text(step_title, "STEP ACTIVO");
-    lv_obj_set_style_text_font(step_title, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(step_title, RED808_TEXT_DIM, 0);
+    lv_label_set_text(step_title, "SEQUENCER " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(step_title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(step_title, RED808_CYAN, 0);
     lv_obj_align(step_title, LV_ALIGN_TOP_MID, 0, 2);
 
     grid_step_lbl = lv_label_create(step_panel);
@@ -3566,7 +3569,7 @@ static void create_fx_screen(void) {
     const int page_group_x = LCD_H_RES - 24 - page_group_w;
 
     lv_obj_t* prev_btn = lv_btn_create(scr_fx);
-    lv_obj_set_size(prev_btn, 46, 34);
+    lv_obj_set_size(prev_btn, 46, 42);
     lv_obj_set_pos(prev_btn, page_group_x, page_ctrl_y);
     apply_control_button_style(prev_btn, RED808_CYAN, false, 8);
     lv_obj_t* prev_lbl = lv_label_create(prev_btn);
@@ -3575,7 +3578,7 @@ static void create_fx_screen(void) {
     lv_obj_add_event_cb(prev_btn, fx_page_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
 
     lv_obj_t* next_btn = lv_btn_create(scr_fx);
-    lv_obj_set_size(next_btn, 46, 34);
+    lv_obj_set_size(next_btn, 46, 42);
     lv_obj_set_pos(next_btn, page_group_x + page_ctrl_w + page_ctrl_gap, page_ctrl_y);
     apply_control_button_style(next_btn, RED808_CYAN, false, 8);
     lv_obj_t* next_lbl = lv_label_create(next_btn);
@@ -3602,7 +3605,7 @@ static void create_fx_screen(void) {
     }
 
     fx_view_btn = lv_btn_create(scr_fx);
-    lv_obj_set_size(fx_view_btn, 80, 34);
+    lv_obj_set_size(fx_view_btn, 80, 42);
     lv_obj_set_pos(fx_view_btn, page_group_x + page_group_w - 80, page_ctrl_y);
     apply_control_button_style(fx_view_btn, RED808_WARNING, false, 8);
     lv_obj_add_event_cb(fx_view_btn, fx_view_cb, LV_EVENT_CLICKED, NULL);
@@ -3613,7 +3616,7 @@ static void create_fx_screen(void) {
 
     // XY performance pad entry (screen 13)
     lv_obj_t* xy_btn = lv_btn_create(scr_fx);
-    lv_obj_set_size(xy_btn, 52, 34);
+    lv_obj_set_size(xy_btn, 52, 42);
     lv_obj_set_pos(xy_btn, page_group_x + page_group_w - 80 - 52 - 6, page_ctrl_y);
     apply_control_button_style(xy_btn, RED808_ACCENT, false, 8);
     lv_obj_add_event_cb(xy_btn, fx_xy_open_cb, LV_EVENT_CLICKED, NULL);
@@ -7406,7 +7409,8 @@ static void piano_assign_btn_cb(lv_event_t* e) {
 // v2.9 — Apply melody_sync payload from master (engine/octave/rec/pad).
 // Must be called from within lvgl_port_lock.
 void piano_apply_melody_sync(uint8_t engine, uint8_t octave, bool rec, uint8_t pad) {
-    // Map engine value 3..7 → index 0..4
+    // Map engine code 3..6 → index 0..3 (GTR/engine 7 no longer in the list;
+    // an engine-7 sync keeps the current index, see below)
     int new_idx = s_piano_engine_idx;
     for (int i = 0; i < PIANO_ENGINE_COUNT; i++) {
         if (PIANO_ENGINES[i] == engine) { new_idx = i; break; }
@@ -7690,7 +7694,7 @@ static void create_piano_screen(void) {
     /* v2.8/v2.9 — compact melody row: pad assign + presets + transport */
     int row_y2 = 104;
     int x_cursor = 12;
-    lv_obj_t* pad_minus = piano_make_chip(scr_piano, x_cursor, row_y2, 54, 36, "PAD-");
+    lv_obj_t* pad_minus = piano_make_chip(scr_piano, x_cursor, row_y2, 54, 42, "PAD-");
     lv_obj_set_style_border_color(pad_minus, lv_color_hex(0xFF1493), 0);
     lv_obj_add_event_cb(pad_minus, piano_pad_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
     x_cursor += 54 + 4;
@@ -7698,14 +7702,14 @@ static void create_piano_screen(void) {
     lv_label_set_text_fmt(s_piano_pad_lbl, "PAD %d", s_piano_assign_pad + 1);
     lv_obj_set_style_text_font(s_piano_pad_lbl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_piano_pad_lbl, lv_color_hex(0xFF1493), 0);
-    lv_obj_set_pos(s_piano_pad_lbl, x_cursor, row_y2 + 9);
+    lv_obj_set_pos(s_piano_pad_lbl, x_cursor, row_y2 + 11);
     x_cursor += 70 + 4;
-    lv_obj_t* pad_plus = piano_make_chip(scr_piano, x_cursor, row_y2, 54, 36, "PAD+");
+    lv_obj_t* pad_plus = piano_make_chip(scr_piano, x_cursor, row_y2, 54, 42, "PAD+");
     lv_obj_set_style_border_color(pad_plus, lv_color_hex(0xFF1493), 0);
     lv_obj_add_event_cb(pad_plus, piano_pad_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)+1);
     x_cursor += 54 + 6;
     {
-        lv_obj_t* assign = piano_make_chip(scr_piano, x_cursor, row_y2, 90, 36, "ASSIGN");
+        lv_obj_t* assign = piano_make_chip(scr_piano, x_cursor, row_y2, 90, 42, "ASSIGN");
         lv_obj_set_style_border_color(assign, lv_color_hex(0xFF1493), 0);
         lv_obj_t* l = lv_obj_get_child(assign, 0);
         if (l) lv_obj_set_style_text_color(l, lv_color_hex(0xFF1493), 0);
@@ -7722,48 +7726,48 @@ static void create_piano_screen(void) {
             { "SCALE", 2, 0x00E5FF },
         };
         for (int i = 0; i < 3; i++) {
-            lv_obj_t* b = piano_make_chip(scr_piano, x_cursor, row_y2, 64, 36, presets[i].lbl);
+            lv_obj_t* b = piano_make_chip(scr_piano, x_cursor, row_y2, 64, 42, presets[i].lbl);
             lv_obj_set_style_border_color(b, lv_color_hex(presets[i].color), 0);
             lv_obj_t* l = lv_obj_get_child(b, 0);
             if (l) lv_obj_set_style_text_color(l, lv_color_hex(presets[i].color), 0);
             lv_obj_add_event_cb(b, piano_preset_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)presets[i].idx);
             x_cursor += 64 + 4;
         }
-        lv_obj_t* clr = piano_make_chip(scr_piano, x_cursor, row_y2, 64, 36, "CLEAR");
+        lv_obj_t* clr = piano_make_chip(scr_piano, x_cursor, row_y2, 64, 42, "CLEAR");
         lv_obj_set_style_border_color(clr, lv_color_hex(0xFF6060), 0);
         lv_obj_add_event_cb(clr, piano_clear_btn_cb, LV_EVENT_CLICKED, NULL);
         x_cursor += 64 + 8;
 
-        s_piano_play_btn = piano_make_chip(scr_piano, x_cursor, row_y2, 84, 36, "PLAY");
+        s_piano_play_btn = piano_make_chip(scr_piano, x_cursor, row_y2, 84, 42, "PLAY");
         s_piano_play_lbl = lv_obj_get_child(s_piano_play_btn, 0);
         lv_obj_set_style_border_color(s_piano_play_btn, lv_color_hex(0x7CFF6B), 0);
         if (s_piano_play_lbl) lv_obj_set_style_text_color(s_piano_play_lbl, lv_color_hex(0x7CFF6B), 0);
         lv_obj_add_event_cb(s_piano_play_btn, piano_play_btn_cb, LV_EVENT_CLICKED, NULL);
         x_cursor += 84 + 8;
 
-        lv_obj_t* vm = piano_make_chip(scr_piano, x_cursor, row_y2, 42, 36, "V-");
+        lv_obj_t* vm = piano_make_chip(scr_piano, x_cursor, row_y2, 42, 42, "V-");
         lv_obj_add_event_cb(vm, piano_vel_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
         x_cursor += 42 + 4;
         s_piano_vel_lbl = lv_label_create(scr_piano);
         lv_label_set_text_fmt(s_piano_vel_lbl, "VEL %d", (int)s_piano_velocity);
         lv_obj_set_style_text_font(s_piano_vel_lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(s_piano_vel_lbl, RED808_TEXT, 0);
-        lv_obj_set_pos(s_piano_vel_lbl, x_cursor, row_y2 + 9);
+        lv_obj_set_pos(s_piano_vel_lbl, x_cursor, row_y2 + 11);
         x_cursor += 70 + 4;
-        lv_obj_t* vp = piano_make_chip(scr_piano, x_cursor, row_y2, 42, 36, "V+");
+        lv_obj_t* vp = piano_make_chip(scr_piano, x_cursor, row_y2, 42, 42, "V+");
         lv_obj_add_event_cb(vp, piano_vel_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)+1);
         x_cursor += 42 + 8;
 
-        lv_obj_t* bm = piano_make_chip(scr_piano, x_cursor, row_y2, 42, 36, "B-");
+        lv_obj_t* bm = piano_make_chip(scr_piano, x_cursor, row_y2, 42, 42, "B-");
         lv_obj_add_event_cb(bm, piano_bpm_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)-1);
         x_cursor += 42 + 4;
         s_piano_bpm_lbl = lv_label_create(scr_piano);
         lv_label_set_text_fmt(s_piano_bpm_lbl, "BPM %d", (int)s_piano_bpm);
         lv_obj_set_style_text_font(s_piano_bpm_lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(s_piano_bpm_lbl, RED808_TEXT, 0);
-        lv_obj_set_pos(s_piano_bpm_lbl, x_cursor, row_y2 + 9);
+        lv_obj_set_pos(s_piano_bpm_lbl, x_cursor, row_y2 + 11);
         x_cursor += 78 + 4;
-        lv_obj_t* bp = piano_make_chip(scr_piano, x_cursor, row_y2, 42, 36, "B+");
+        lv_obj_t* bp = piano_make_chip(scr_piano, x_cursor, row_y2, 42, 42, "B+");
         lv_obj_add_event_cb(bp, piano_bpm_btn_cb, LV_EVENT_CLICKED, (void*)(intptr_t)+1);
     }
 
@@ -8567,16 +8571,17 @@ static void create_piano_params_screen(void) {
     lv_obj_set_style_text_color(s_pp_title_lbl, pp_engine_color(s_pp_engine_idx), 0);
     lv_obj_set_pos(s_pp_title_lbl, 64, 12);
 
-    // BACK button (top right)
+    // Return-to-PIANO button (top right). Distinct from the header back
+    // button (top-left → LIVE): label it "PIANO" so the two aren't ambiguous.
     {
         lv_obj_t* b = lv_btn_create(scr_piano_params);
-        lv_obj_set_size(b, 80, 36);
-        lv_obj_set_pos(b, W - 92, 8);
-        apply_control_button_style(b, RED808_ERROR, false, 8);
+        lv_obj_set_size(b, 96, 42);
+        lv_obj_set_pos(b, W - 108, 8);
+        apply_control_button_style(b, RED808_ACCENT, false, 8);
         lv_obj_t* l = lv_label_create(b);
-        lv_label_set_text(l, LV_SYMBOL_LEFT " BACK");
+        lv_label_set_text(l, LV_SYMBOL_LEFT " PIANO");
         lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(l, RED808_ERROR, 0);
+        lv_obj_set_style_text_color(l, RED808_ACCENT, 0);
         lv_obj_center(l);
         lv_obj_add_event_cb(b, pp_back_cb, LV_EVENT_CLICKED, NULL);
     }
@@ -8755,10 +8760,12 @@ static void create_performance_screen(void) {
         lv_obj_set_style_text_align(ch_lbl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_center(ch_lbl);
 
+        // PRESET/LOAD button — accent color, NOT warning: it cycles preset
+        // A→B→C (or loads a WAV), it never deletes, so a danger color misled.
         grid_xtra_delete_btns[i] = lv_btn_create(scr_performance);
         lv_obj_set_size(grid_xtra_delete_btns[i], 88, 68);
         lv_obj_set_pos(grid_xtra_delete_btns[i], side_x, card_y + pad_h - 68);
-        apply_control_button_style(grid_xtra_delete_btns[i], theme_warning(), false, 8);
+        apply_control_button_style(grid_xtra_delete_btns[i], theme_accent(), false, 8);
         lv_obj_add_event_cb(grid_xtra_delete_btns[i], xtra_delete_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
         lv_obj_t* del_lbl = lv_label_create(grid_xtra_delete_btns[i]);
         lv_label_set_text(del_lbl, "PRESET\nA");
