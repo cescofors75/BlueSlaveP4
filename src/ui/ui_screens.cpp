@@ -8924,6 +8924,11 @@ static void ui_reload_themed_screens(void) {
     s_piano_rec_btn = NULL; s_piano_rec_lbl = NULL;
     for (int i = 0; i < PIANO_ENGINE_COUNT; i++) s_piano_engine_btns[i] = NULL;
     for (int i = 0; i < 4; i++) s_piano_eng_preset_btns[i] = NULL;
+    s_piano_grid_container = NULL; s_piano_play_btn = NULL; s_piano_play_lbl = NULL;
+    s_piano_pad_lbl = NULL; s_piano_glide_btn = NULL; s_piano_bend_btn = NULL;
+    s_piano_glide_lbl = NULL; s_piano_bend_lbl = NULL;
+    for (int c = 0; c < 16; c++)
+        for (int r = 0; r < 12; r++) s_piano_grid_btns[c][r] = NULL;
     create_piano_screen();
     /* v2.7 — also recreate piano params on theme reload */
     if (scr_piano_params) { lv_obj_del(scr_piano_params); scr_piano_params = NULL; }
