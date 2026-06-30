@@ -314,6 +314,12 @@ void uart_send_sd_load_midi(uint8_t slot) {
 // =============================================================================
 // PROCESS BASIC PACKET
 // =============================================================================
+// 16-bit FX values (cutoff, sample rate) arrive as two 8-bit packets (H then
+// L) and are staged per-transport (index 0=UART, 1=USB) so interleaved H/L
+// pairs from the two feeds can't cross-contaminate each other's commit.
+static int s_cutoff_staging[2] = {20000, 20000};
+static int s_sr_staging[2]     = {32000, 32000};
+
 static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
     uint8_t type = pkt->type;
     uint8_t id   = pkt->id;
@@ -501,7 +507,6 @@ static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
                 // during bring-up, and interleaved H/L pairs across feeds
                 // would corrupt the committed value.
                 case FX_CUTOFF_H: {
-                    static int s_cutoff_staging[2] = {20000, 20000};
                     int src = from_usb ? 1 : 0;
                     s_cutoff_staging[src] = (s_cutoff_staging[src] & 0x00FF) | (val << 8);
                     // Expose staging until L arrives — keeps high byte visible.
@@ -509,22 +514,27 @@ static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
                     break;
                 }
                 case FX_CUTOFF_L: {
-                    // Commit: take last high byte from current value.
-                    p4.cutoff_hz = (p4.cutoff_hz & 0xFF00) | val;
+                    // Commit: take the high byte from THIS transport's staging
+                    // slot, not the shared p4.cutoff_hz (which the other
+                    // transport's H byte may have clobbered in between).
+                    int src = from_usb ? 1 : 0;
+                    s_cutoff_staging[src] = (s_cutoff_staging[src] & 0xFF00) | val;
+                    p4.cutoff_hz = s_cutoff_staging[src];
                     break;
                 }
                 case FX_RESONANCE:    p4.resonance_x10 = val;             break;
                 case FX_DISTORTION:   p4.distortion_pct = val;            break;
                 case FX_BITCRUSH:     p4.bitcrush_bits = val;             break;
                 case FX_SAMPLERATE_H: {
-                    static int s_sr_staging[2] = {32000, 32000};
                     int src = from_usb ? 1 : 0;
                     s_sr_staging[src] = (s_sr_staging[src] & 0x00FF) | (val << 8);
                     p4.sample_rate_hz = s_sr_staging[src];
                     break;
                 }
                 case FX_SAMPLERATE_L: {
-                    p4.sample_rate_hz = (p4.sample_rate_hz & 0xFF00) | val;
+                    int src = from_usb ? 1 : 0;
+                    s_sr_staging[src] = (s_sr_staging[src] & 0xFF00) | val;
+                    p4.sample_rate_hz = s_sr_staging[src];
                     break;
                 }
                 case FX_RESP_MODE:    p4.fx_resp_mode = val;              break;
