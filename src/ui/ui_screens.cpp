@@ -7146,7 +7146,7 @@ static void piano_pad_btn_cb(lv_event_t* e) {
 
 // =============================================================================
 // PIANO MELODY GRID — 16 steps × 12 pitch-classes editor with preview
-// (P3/P4 Prioridad 4: visual partitura, edición, presets, play, BPM/velocity)
+// (P3/P4 Prioridad 4: visual partitura, edición, presets, play)
 // =============================================================================
 static lv_obj_t* s_piano_grid_container = NULL;
 static lv_obj_t* s_piano_grid_btns[16][12] = {{NULL}};
