@@ -33,6 +33,14 @@
 #define P4_FX_LOG_PRINTF(...) ((void)0)
 #endif
 
+// Periodic Serial report of render FPS, LVGL task rate, touch poll rate and
+// free heap (internal/PSRAM) — every PERF_LOG_INTERVAL_MS. Zero-cost when
+// disabled (counters + prints compile out entirely). Enable with
+// -DP4_ENABLE_PERF_LOG=1 to get real numbers before tuning anything else.
+#ifndef P4_ENABLE_PERF_LOG
+#define P4_ENABLE_PERF_LOG 0
+#endif
+
 // =============================================================================
 // DISPLAY — Guition JC1060P470C (7" MIPI-DSI, JD9165BA)
 // =============================================================================
