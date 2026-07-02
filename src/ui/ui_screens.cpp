@@ -4400,6 +4400,30 @@ static void create_sequencer_screen(void) {
         lv_obj_set_style_text_font(uall_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(uall_lbl, lv_color_white(), 0);
         lv_obj_center(uall_lbl);
+
+        // P1..P4 bar-page buttons for multi-bar MEM-MIDI patterns.
+        // seq_page_cb / seq_apply_page_styles already implement the behavior
+        // (tap = push that bar to the Master, disabled beyond seq_raw_len) —
+        // these buttons went missing in the visual overhaul, leaving page
+        // switching reachable only through playback auto-advance.
+        {
+            const int PGW = 50, PGGAP = 6;
+            int px = 744;
+            for (int p = 0; p < 4; p++) {
+                seq_page_btns[p] = lv_btn_create(scr_sequencer);
+                lv_obj_set_size(seq_page_btns[p], PGW, HH);
+                lv_obj_set_pos(seq_page_btns[p], px, HY);
+                apply_control_button_style(seq_page_btns[p], RED808_BORDER, false, 8);
+                lv_obj_add_event_cb(seq_page_btns[p], seq_page_cb, LV_EVENT_CLICKED,
+                                    (void*)(intptr_t)p);
+                seq_page_lbls[p] = lv_label_create(seq_page_btns[p]);
+                lv_label_set_text_fmt(seq_page_lbls[p], "P%d", p + 1);
+                lv_obj_set_style_text_font(seq_page_lbls[p], &lv_font_montserrat_14, 0);
+                lv_obj_center(seq_page_lbls[p]);
+                px += PGW + PGGAP;
+            }
+            seq_apply_page_styles();
+        }
     }
 
     // ── Precompute step X positions ──
@@ -5199,7 +5223,7 @@ static lv_obj_t* sd_preview_lbl = NULL;
 // MIDI section
 static lv_obj_t* sd_wav_section       = NULL;
 static lv_obj_t* sd_midi_section      = NULL;
-static lv_obj_t* sd_midi_pat_btns[10] = {};
+static lv_obj_t* sd_midi_pat_btns[6] = {};
 static lv_obj_t* sd_midi_load_btn     = NULL;
 static lv_obj_t* sd_midi_info_lbl     = NULL;
 static lv_obj_t* sd_midi_status_lbl   = NULL;
@@ -7987,7 +8011,10 @@ static void pp_init_engine_defaults(int eng_idx) {
 
 static void piano_sync_active_engine_state(void) {
     if (!ui_use_udp_transport()) return;
-    int eng_idx = s_piano_engine_idx;
+    // Map the piano index (into PIANO_ENGINES) to the SP_ENGINES index by
+    // engine code — the two tables happen to share order today, but nothing
+    // enforces that.
+    int eng_idx = pp_engine_idx_from_code(piano_engine_code());
     if (eng_idx < 0 || eng_idx >= SP_ENGINE_COUNT) return;
     const SynthEngineDef* eng = &SP_ENGINES[eng_idx];
     int preset_idx = s_pp_preset_idx[eng_idx];
@@ -8882,6 +8909,7 @@ static void ui_reload_themed_screens(void) {
         seq_ruler_labels[i] = NULL;
     }
     for (int b = 0; b < 4; b++) seq_beat_bg[b] = NULL;
+    for (int p = 0; p < 4; p++) { seq_page_btns[p] = NULL; seq_page_lbls[p] = NULL; }
     seq_playhead_line = NULL;
     seq_status_step_lbl = NULL;
     seq_status_pat_lbl = NULL;
@@ -8971,10 +8999,15 @@ void ui_navigate_to(int screen_id) {
         if (screen_id == 11) {
             if (s_pp_from_xtra && s_pp_xtra_slot >= 0 && s_pp_xtra_slot < 4) {
                 pp_refresh_view();
-            } else if (s_piano_engine_idx >= 0 && s_piano_engine_idx < SP_ENGINE_COUNT) {
-                s_pp_engine_idx = s_piano_engine_idx;
-                pp_refresh_view();
-                piano_sync_active_engine_state();
+            } else {
+                // Map by engine code, not raw index — PIANO_ENGINES and
+                // SP_ENGINES share order today but nothing enforces it.
+                int pp_idx = pp_engine_idx_from_code(PIANO_ENGINES[s_piano_engine_idx]);
+                if (pp_idx >= 0 && pp_idx < SP_ENGINE_COUNT) {
+                    s_pp_engine_idx = pp_idx;
+                    pp_refresh_view();
+                    piano_sync_active_engine_state();
+                }
             }
         }
         if (screen_id == 10) {
