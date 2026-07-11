@@ -58,10 +58,19 @@ static uint8_t s_hb_streak = 0;
 // ignored (set by uart_lock_tempo() after applying a MIDI-file tempo).
 static uint32_t s_tempo_lock_until_ms = 0;
 
+static bool tempo_lock_active(void) {
+    if (s_tempo_lock_until_ms == 0) return false;
+    if ((int32_t)(millis() - s_tempo_lock_until_ms) < 0) return true;
+    s_tempo_lock_until_ms = 0;
+    return false;
+}
+
 // v2.9 — Track S3's current melody engine/octave so TCMD_MELODY_REC can
 // forward the correct engine+octave to master in melodyRecToggle.
 static uint8_t s_s3_mel_engine = 3;
 static uint8_t s_s3_mel_octave = 4;
+static bool    s_s3_mel_rec = false;
+static uint8_t s_s3_mel_pad = 0;
 static uint8_t s_s3_preview_engine = 3;
 static uint32_t s_s3_preview_note_off_due_ms = 0;
 
@@ -72,8 +81,29 @@ static uint32_t s_last_solo_tx_ms[16] = {};
 static bool s_last_mute_tx_val[16] = {};
 static bool s_last_solo_tx_val[16] = {};
 
-// v2.9 — Pending melody state received from S3 (consumed by main loop under LVGL lock)
-PendingMelodyFromS3 g_pending_melody_from_s3 = {};
+// Packed cross-core melody snapshot. Bit 31 is the pending marker.
+static std::atomic<uint32_t> s_pending_melody{0};
+
+void p4_publish_pending_melody(uint8_t engine, uint8_t octave,
+                               bool rec, uint8_t pad) {
+    uint32_t packed = 0x80000000u |
+                      ((uint32_t)engine) |
+                      ((uint32_t)octave << 8) |
+                      ((uint32_t)(rec ? 1u : 0u) << 16) |
+                      ((uint32_t)pad << 17);
+    s_pending_melody.store(packed, std::memory_order_release);
+}
+
+bool p4_consume_pending_melody(uint8_t* engine, uint8_t* octave,
+                               bool* rec, uint8_t* pad) {
+    uint32_t packed = s_pending_melody.exchange(0, std::memory_order_acq_rel);
+    if ((packed & 0x80000000u) == 0) return false;
+    if (engine) *engine = (uint8_t)(packed & 0xFFu);
+    if (octave) *octave = (uint8_t)((packed >> 8) & 0xFFu);
+    if (rec) *rec = ((packed >> 16) & 0x01u) != 0;
+    if (pad) *pad = (uint8_t)((packed >> 17) & 0xFFu);
+    return true;
+}
 
 // -----------------------------------------------------------------------------
 // Deferred pattern push to Master. The first push for an unknown slot sends a
@@ -82,6 +112,7 @@ PendingMelodyFromS3 g_pending_melody_from_s3 = {};
 // -----------------------------------------------------------------------------
 enum PendingPushPhase {
     PP_IDLE = 0,
+    PP_STAGING,
     PP_SELECT,
     PP_RESET_MIX,
     PP_DELTA,
@@ -100,6 +131,13 @@ struct PendingPush {
     bool     step_bits[16][16];  // snapshot of steps to broadcast
 };
 static PendingPush s_push = {PP_IDLE, 0, 0, 0, {{false}}};
+struct QueuedPush {
+    uint8_t slot;
+    bool step_bits[16][16];
+};
+static QueuedPush s_queued_push = {};
+static bool s_queued_push_valid = false;
+static portMUX_TYPE s_push_queue_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_master_step_cache[16][16][16] = {};
 static bool s_master_step_cache_valid[16] = {};
 
@@ -108,15 +146,61 @@ static constexpr int PP_PACKETS_PER_TICK = 12;  // packets drained per loop()
 static constexpr uint32_t PP_INTER_MS    = 1;   // pacing between bursts
 
 static void stage_pattern_push(uint8_t slot, const bool steps[16][16]) {
-    // Fill the snapshot first; publishing the phase must come LAST or the
-    // Core-1 drainer can start sending a half-copied snapshot.
-    s_push.slot    = slot;
-    s_push.idx     = 0;
-    s_push.next_ms = millis();
+    PendingPushPhase expected = PP_IDLE;
+    if (s_push.phase.compare_exchange_strong(expected, PP_STAGING,
+                                              std::memory_order_acq_rel)) {
+        // We exclusively own the active slot while phase=PP_STAGING.
+        // This new request is newer than any replacement queued just before
+        // the previous transfer became idle.
+        portENTER_CRITICAL(&s_push_queue_mux);
+        s_queued_push_valid = false;
+        portEXIT_CRITICAL(&s_push_queue_mux);
+        s_push.slot    = slot;
+        s_push.idx     = 0;
+        s_push.next_ms = millis();
+        for (int t = 0; t < 16; t++)
+            for (int s = 0; s < 16; s++)
+                s_push.step_bits[t][s] = steps[t][s];
+        s_push.phase.store(PP_SELECT, std::memory_order_release);
+        return;
+    }
+
+    // A transfer is active. Preserve one latest-wins replacement instead of
+    // overwriting fields that Core 1 is currently draining.
+    portENTER_CRITICAL(&s_push_queue_mux);
+    s_queued_push.slot = slot;
     for (int t = 0; t < 16; t++)
         for (int s = 0; s < 16; s++)
-            s_push.step_bits[t][s] = steps[t][s];
+            s_queued_push.step_bits[t][s] = steps[t][s];
+    s_queued_push_valid = true;
+    portEXIT_CRITICAL(&s_push_queue_mux);
+}
+
+static bool activate_queued_push(void) {
+    PendingPushPhase expected = PP_IDLE;
+    if (!s_push.phase.compare_exchange_strong(expected, PP_STAGING,
+                                               std::memory_order_acq_rel)) {
+        return false;
+    }
+    bool found = false;
+    portENTER_CRITICAL(&s_push_queue_mux);
+    if (s_queued_push_valid) {
+        s_push.slot = s_queued_push.slot;
+        for (int t = 0; t < 16; t++)
+            for (int s = 0; s < 16; s++)
+                s_push.step_bits[t][s] = s_queued_push.step_bits[t][s];
+        s_queued_push_valid = false;
+        found = true;
+    }
+    portEXIT_CRITICAL(&s_push_queue_mux);
+    if (!found) {
+        s_push.phase.store(PP_IDLE, std::memory_order_release);
+        return false;
+    }
+    s_push.idx = 0;
+    s_push.next_ms = millis();
     s_push.phase.store(PP_SELECT, std::memory_order_release);
+    return true;
 }
 
 static void remember_master_pattern(uint8_t slot, const bool steps[16][16]) {
@@ -376,11 +460,11 @@ static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
                     // Tempo lock window: ignore S3-initiated BPM updates for
                     // a short time after we applied a MIDI file's tempo, so
                     // the S3's stale cached BPM doesn't overwrite it.
-                    if (millis() < s_tempo_lock_until_ms) break;
+                    if (tempo_lock_active()) break;
                     p4.bpm_int = val;
                     break;
                 case SYS_BPM_FRAC:
-                    if (millis() < s_tempo_lock_until_ms) break;
+                    if (tempo_lock_active()) break;
                     p4.bpm_frac = val;
                     // Relay BPM to Master (frac arrives after int)
                     if (udp_wifi_connected()) {
@@ -594,19 +678,20 @@ static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
             // Also forward to master via UDP so web/other UIs stay in sync.
             else if (id == TCMD_MELODY_ENGINE) {
                 s_s3_mel_engine = val;
-                g_pending_melody_from_s3.engine = val;
-                g_pending_melody_from_s3.pending = true;
+                p4_publish_pending_melody(s_s3_mel_engine, s_s3_mel_octave,
+                                           s_s3_mel_rec, s_s3_mel_pad);
                 if (udp_wifi_connected()) udp_send_melody_set_engine(val);
             }
             else if (id == TCMD_MELODY_OCTAVE) {
                 s_s3_mel_octave = val;
-                g_pending_melody_from_s3.octave = val;
-                g_pending_melody_from_s3.pending = true;
+                p4_publish_pending_melody(s_s3_mel_engine, s_s3_mel_octave,
+                                           s_s3_mel_rec, s_s3_mel_pad);
                 if (udp_wifi_connected()) udp_send_melody_set_octave(val);
             }
             else if (id == TCMD_MELODY_REC) {
-                g_pending_melody_from_s3.rec = val;
-                g_pending_melody_from_s3.pending = true;
+                s_s3_mel_rec = (val != 0);
+                p4_publish_pending_melody(s_s3_mel_engine, s_s3_mel_octave,
+                                           s_s3_mel_rec, s_s3_mel_pad);
                 if (udp_wifi_connected())
                     udp_send_melody_rec_toggle(val != 0, s_s3_mel_engine, s_s3_mel_octave);
             }
@@ -614,8 +699,9 @@ static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
                 if (udp_wifi_connected()) udp_send_melody_clear();
             }
             else if (id == TCMD_MELODY_PAD) {
-                g_pending_melody_from_s3.pad = val;
-                g_pending_melody_from_s3.pending = true;
+                s_s3_mel_pad = val;
+                p4_publish_pending_melody(s_s3_mel_engine, s_s3_mel_octave,
+                                           s_s3_mel_rec, s_s3_mel_pad);
                 if (udp_wifi_connected()) udp_send_melody_set_pad(val);
             }
             else if (id == TCMD_MELODY_NOTE) {
@@ -1020,9 +1106,17 @@ void uart_handler_tick_pending_push(void) {
         s_s3_preview_note_off_due_ms = 0;
     }
 
-    if (s_push.phase.load(std::memory_order_acquire) == PP_IDLE) return;
+    PendingPushPhase phase = s_push.phase.load(std::memory_order_acquire);
+    if (phase == PP_IDLE) {
+        if (!activate_queued_push()) return;
+    } else if (phase == PP_STAGING) {
+        return;
+    }
     if (!udp_wifi_connected()) {
         s_push.phase = PP_IDLE;
+        portENTER_CRITICAL(&s_push_queue_mux);
+        s_queued_push_valid = false;
+        portEXIT_CRITICAL(&s_push_queue_mux);
         return;
     }
     uint32_t now = millis();

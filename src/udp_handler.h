@@ -55,9 +55,11 @@ void udp_send_solo(int track, bool soloed);
 void udp_send_mute_mask(uint16_t mask);
 void udp_send_solo_mask(uint16_t mask);
 
-// Dirty flag: set true by UDP task when FX values change.
-// Consumed (cleared) by LVGL ui_tick() to force update_fx_screen().
-extern volatile bool g_fx_screen_dirty;
+// Cross-core FX repaint notification. Producers may call the marker from any
+// task; the LVGL task consumes it atomically so a simultaneous update is never
+// lost while the flag is being cleared.
+void udp_mark_fx_screen_dirty(void);
+bool udp_consume_fx_screen_dirty(void);
 
 // Synth (melody) — engine: 3=303, 4=WTosc, 5=SH101, 6=FM2Op
 void udp_send_synth_note_on_ex(uint8_t engine, uint8_t note, uint8_t velocity,
@@ -71,6 +73,10 @@ void udp_send_synth_trigger(uint8_t engine, uint8_t instrument, uint8_t velocity
 void udp_send_synth_param(uint8_t engine, uint8_t instrument, uint8_t paramId, float value);
 void udp_send_synth_preset(uint8_t engine, uint8_t preset);
 
+// Non-destructive sample editor on Master. Values are normalized 0..1 and
+// operate on the already-loaded pad sample.
+void udp_send_trim_sample(uint8_t pad, float trim_start, float trim_end);
+
 // v2.7 — record-mode note for the S3 melody screen (master forwards to all slaves)
 void udp_send_melody_rec_note(uint8_t engine, uint8_t note);
 
@@ -79,7 +85,8 @@ void udp_send_melody_rec_note(uint8_t engine, uint8_t note);
 // grid[col][row]: row 0 = B (highest), row 11 = C (lowest)
 void udp_send_melody_assign(uint8_t pad, uint8_t engine, uint8_t octave,
                             const bool grid[16][12],
-                            const uint8_t notes[16][12] = nullptr);
+                            const uint8_t notes[16][12] = nullptr,
+                            uint8_t gate_percent = 55);
 
 // v2.9 — master-authoritative melody state commands
 void udp_send_melody_rec_toggle(bool active, uint8_t engine, uint8_t octave);

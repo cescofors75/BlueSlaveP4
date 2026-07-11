@@ -14,6 +14,7 @@
 #include <ArduinoJson.h>
 #include <math.h>
 #include <atomic>
+#include <freertos/queue.h>
 
 // =============================================================================
 // CONFIGURATION
@@ -80,8 +81,16 @@ static unsigned long lastRemoteMasterFxLogMs = 0;
 static unsigned long lastRemoteStateSyncFxLogMs = 0;
 static unsigned long lastRemoteHttpFxLogMs = 0;
 static const unsigned long FX_SYNC_LOG_MIN_MS = 250;
-// Dirty flag: set by UDP handler (any task), consumed by LVGL task in ui_tick()
-volatile bool g_fx_screen_dirty = false;
+// Dirty flag: set by UDP/UI producers, atomically consumed by the LVGL task.
+static std::atomic<bool> s_fx_screen_dirty{false};
+
+void udp_mark_fx_screen_dirty(void) {
+    s_fx_screen_dirty.store(true, std::memory_order_release);
+}
+
+bool udp_consume_fx_screen_dirty(void) {
+    return s_fx_screen_dirty.exchange(false, std::memory_order_acq_rel);
+}
 
 // JSON parse buffer
 static char rxBuf[8192];
@@ -106,7 +115,8 @@ enum FxOwnershipIndex : int {
 
 static inline bool is_track_volume_owned_recent(int track, unsigned long nowMs) {
     if (track < 0 || track >= 16) return false;
-    return (nowMs - lastLocalTrackVolMs[track]) < LOCAL_OWNERSHIP_MS;
+    unsigned long stamp = lastLocalTrackVolMs[track];
+    return stamp != 0 && (nowMs - stamp) < LOCAL_OWNERSHIP_MS;
 }
 
 static inline bool is_pattern_owned_recent(unsigned long nowMs) {
@@ -114,7 +124,8 @@ static inline bool is_pattern_owned_recent(unsigned long nowMs) {
 }
 
 static inline bool is_fx_owned_recent(FxOwnershipIndex idx, unsigned long nowMs) {
-    return (nowMs - lastLocalFxMs[(int)idx]) < LOCAL_OWNERSHIP_MS;
+    unsigned long stamp = lastLocalFxMs[(int)idx];
+    return stamp != 0 && (nowMs - stamp) < LOCAL_OWNERSHIP_MS;
 }
 
 static inline void mark_local_track_volume(int track) {
@@ -280,7 +291,7 @@ static void apply_remote_macro_fx_state(JsonObjectConst fx, const char* source, 
         p4.pot_value[2] = phaser_depth_to_u7(fx["phaserDepth"], p4.pot_value[2]);
     }
 
-    g_fx_screen_dirty = true;
+    udp_mark_fx_screen_dirty();
     log_remote_macro_fx_state(source, fx, lastLogMs);
 }
 
@@ -326,7 +337,7 @@ static void apply_remote_master_fx_param(const char* param, JsonVariantConst val
         handled = false;
     }
 
-    if (handled) g_fx_screen_dirty = true;
+    if (handled) udp_mark_fx_screen_dirty();
     log_remote_master_fx_param(param, value, handled);
 }
 
@@ -368,7 +379,8 @@ static void apply_step_ownership_window(bool steps[16][64], int stepCount) {
     int maxStep = clamp_int(stepCount, 16, 64);
     for (int t = 0; t < 16; t++) {
         for (int s = 0; s < maxStep; s++) {
-            if (nowMs - lastLocalStepMs[t][s] < LOCAL_STEP_OWNERSHIP_MS) {
+            unsigned long stamp = lastLocalStepMs[t][s];
+            if (stamp != 0 && nowMs - stamp < LOCAL_STEP_OWNERSHIP_MS) {
                 steps[t][s] = p4.steps[t][s];
             }
         }
@@ -437,6 +449,40 @@ static void request_master_state_http(void) {
     s_http_req_state.store(true, std::memory_order_release);
 }
 
+class FixedBufferStream final : public Stream {
+public:
+    FixedBufferStream(char* buffer, size_t capacity)
+        : buffer_(buffer), capacity_(capacity) {}
+
+    size_t write(uint8_t value) override {
+        return write(&value, 1);
+    }
+
+    size_t write(const uint8_t* data, size_t length) override {
+        if (!data || length > capacity_ - size_) {
+            overflow_ = true;
+            return 0;
+        }
+        memcpy(buffer_ + size_, data, length);
+        size_ += length;
+        return length;
+    }
+
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+    void flush() override {}
+
+    size_t size() const { return size_; }
+    bool overflowed() const { return overflow_; }
+
+private:
+    char* buffer_;
+    size_t capacity_;
+    size_t size_ = 0;
+    bool overflow_ = false;
+};
+
 // Worker task context. Returns true with the body in s_http_resp_buf.
 static bool http_fetch_to_buf(const char* url) {
     HTTPClient http;
@@ -450,14 +496,26 @@ static bool http_fetch_to_buf(const char* url) {
         return false;
     }
 
-    String payload = http.getString();
-    http.end();
-    if (payload.length() == 0 || payload.length() >= sizeof(s_http_resp_buf)) {
-        P4_LOG_PRINTF("[HTTP] response empty/too large (%u bytes)\n",
-                      (unsigned)payload.length());
+    int declared_len = http.getSize();
+    if (declared_len >= (int)sizeof(s_http_resp_buf)) {
+        P4_LOG_PRINTF("[HTTP] response too large (%d bytes)\n", declared_len);
+        http.end();
         return false;
     }
-    memcpy(s_http_resp_buf, payload.c_str(), payload.length() + 1);
+
+    // HTTPClient decodes both Content-Length and chunked transfer encoding.
+    // The fixed Stream avoids the temporary heap String used by getString().
+    FixedBufferStream sink(s_http_resp_buf, sizeof(s_http_resp_buf) - 1);
+    int written = http.writeToStream(&sink);
+    http.end();
+    size_t total = sink.size();
+    if (written < 0 || sink.overflowed() || total == 0 ||
+        (declared_len >= 0 && total != (size_t)declared_len)) {
+        P4_LOG_PRINTF("[HTTP] response incomplete (%u/%d bytes)\n",
+                      (unsigned)total, declared_len);
+        return false;
+    }
+    s_http_resp_buf[total] = '\0';
     return true;
 }
 
@@ -591,7 +649,8 @@ static bool apply_master_state_http_payload(const char* payload) {
         int track = 0;
         for (JsonVariant value : mute) {
             if (track >= 16) break;
-            if (nowMs - lastLocalMuteMs[track] < LOCAL_OWNERSHIP_MS) {
+            if (lastLocalMuteMs[track] != 0 &&
+                nowMs - lastLocalMuteMs[track] < LOCAL_OWNERSHIP_MS) {
                 bool incoming = value.as<bool>();
                 if (incoming != p4.track_muted[track]) {
                     P4_LOG_PRINTF("[SYNC][MUTE] keep-local t=%d incoming=%d local=%d age=%lu\n",
@@ -619,7 +678,8 @@ static bool apply_master_state_http_payload(const char* payload) {
         int track = 0;
         for (JsonVariant value : solo) {
             if (track >= 16) break;
-            if (nowMs - lastLocalSoloMs[track] < LOCAL_OWNERSHIP_MS) {
+            if (lastLocalSoloMs[track] != 0 &&
+                nowMs - lastLocalSoloMs[track] < LOCAL_OWNERSHIP_MS) {
                 bool incoming = value.as<bool>();
                 if (incoming != p4.track_solo[track]) {
                     P4_LOG_PRINTF("[SYNC][SOLO] keep-local t=%d incoming=%d local=%d age=%lu\n",
@@ -731,21 +791,47 @@ static void http_consume_results(void) {
 // =============================================================================
 // SEND HELPERS
 // =============================================================================
-// sendJson is reached from three tasks (loop() on Core 1, the LVGL task and
-// the touch task on Core 0 — arcs/sliders/note-off sweeps call udp_send_*
-// directly). WiFiUDP keeps a single tx buffer, so concurrent
-// beginPacket/print/endPacket interleave bytes into corrupted packets.
-// Serialize the whole sequence behind a mutex.
-static SemaphoreHandle_t s_udp_tx_mutex = NULL;
+// sendJson is reached from loop(), LVGL and touch tasks. WiFiUDP itself is not
+// safe for concurrent beginPacket/write/endPacket sequences, and waiting on a
+// mutex here used to stall LVGL for up to 50 ms. Producers now enqueue into a
+// short staging buffer; udp_handler_process() is the sole WiFiUDP TX owner.
+static constexpr size_t UDP_TX_MAX_LEN = 768;
+static constexpr int UDP_TX_QUEUE_DEPTH = 24;
+struct UdpTxPacket {
+    uint16_t len;
+    char data[UDP_TX_MAX_LEN];
+};
+static QueueHandle_t s_udp_tx_queue = NULL;
+static SemaphoreHandle_t s_udp_tx_stage_mutex = NULL;
+static UdpTxPacket s_udp_tx_stage;
+static std::atomic<uint32_t> s_udp_tx_drops{0};
 
 static void sendJson(const char* json) {
-    if (!udpStarted) return;
-    if (s_udp_tx_mutex && xSemaphoreTake(s_udp_tx_mutex, pdMS_TO_TICKS(50)) != pdTRUE)
-        return;  // link congested — drop rather than corrupt another sender
-    udp.beginPacket(MASTER_IP, UDP_PORT);
-    udp.print(json);
-    udp.endPacket();
-    if (s_udp_tx_mutex) xSemaphoreGive(s_udp_tx_mutex);
+    if (!udpStarted || !json || !s_udp_tx_queue || !s_udp_tx_stage_mutex) return;
+    size_t len = strnlen(json, UDP_TX_MAX_LEN);
+    if (len == 0 || len >= UDP_TX_MAX_LEN) {
+        s_udp_tx_drops.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (xSemaphoreTake(s_udp_tx_stage_mutex, pdMS_TO_TICKS(2)) != pdTRUE) {
+        s_udp_tx_drops.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    s_udp_tx_stage.len = (uint16_t)len;
+    memcpy(s_udp_tx_stage.data, json, len);
+    bool queued = xQueueSend(s_udp_tx_queue, &s_udp_tx_stage, 0) == pdTRUE;
+    xSemaphoreGive(s_udp_tx_stage_mutex);
+    if (!queued) s_udp_tx_drops.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void udp_drain_tx_queue(int budget) {
+    if (!udpStarted || !s_udp_tx_queue) return;
+    static UdpTxPacket pkt;
+    while (budget-- > 0 && xQueueReceive(s_udp_tx_queue, &pkt, 0) == pdTRUE) {
+        if (!udp.beginPacket(MASTER_IP, UDP_PORT)) continue;
+        udp.write((const uint8_t*)pkt.data, pkt.len);
+        udp.endPacket();
+    }
 }
 
 static void sendCmd(const char* cmd) {
@@ -825,6 +911,18 @@ void udp_send_synth_preset(uint8_t engine, uint8_t preset) {
     sendJson(buf);
 }
 
+void udp_send_trim_sample(uint8_t pad, float trim_start, float trim_end) {
+    if (trim_start < 0.0f) trim_start = 0.0f;
+    if (trim_start > 0.98f) trim_start = 0.98f;
+    if (trim_end < trim_start + 0.01f) trim_end = trim_start + 0.01f;
+    if (trim_end > 1.0f) trim_end = 1.0f;
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"cmd\":\"trimSample\",\"pad\":%u,\"trimStart\":%.4f,\"trimEnd\":%.4f}",
+             (unsigned)pad, trim_start, trim_end);
+    sendJson(buf);
+}
+
 void udp_send_melody_rec_note(uint8_t engine, uint8_t note) {
     char buf[96];
     snprintf(buf, sizeof(buf),
@@ -875,15 +973,18 @@ void udp_send_melody_assign_pad(uint8_t pad, uint8_t engine, uint8_t octave) {
 
 void udp_send_melody_assign(uint8_t pad, uint8_t engine, uint8_t octave,
                             const bool grid[16][12],
-                            const uint8_t notes[16][12]) {
+                            const uint8_t notes[16][12],
+                            uint8_t gate_percent) {
     // Mirror the JSON shape produced by S3's ui_screens.cpp mel_assign_cb:
     //   {"cmd":"melodyAssign","pad":N,"engine":E,"octave":O,
     //    "steps":[[midi,midi,...], ... 16 columns]}
     char buf[768];
+    gate_percent = (uint8_t)constrain((int)gate_percent, 10, 100);
     int n = snprintf(buf, sizeof(buf),
                      "{\"cmd\":\"melodyAssign\",\"pad\":%u,\"engine\":%u,"
-                     "\"octave\":%u,\"steps\":[",
-                     (unsigned)pad, (unsigned)engine, (unsigned)octave);
+                     "\"octave\":%u,\"gate\":%u,\"steps\":[",
+                     (unsigned)pad, (unsigned)engine, (unsigned)octave,
+                     (unsigned)gate_percent);
     if (n < 0 || n >= (int)sizeof(buf)) return;
     // S3 mapping: row r -> pc = (11 - r), midi = (octave + 1) * 12 + pc
     for (int c = 0; c < 16; c++) {
@@ -1102,6 +1203,10 @@ void udp_send_set_sample_rate(int rateHz) {
 // Ranges are intentionally conservative: audible first, no harsh clipping.
 // Params resent periodically to survive UDP packet drops.
 // =============================================================================
+static bool s_fx_enc_last_active[3] = {};
+static bool s_fx_enc_latch_valid[3] = {};
+static uint32_t s_fx_enc_last_full_ms[3] = {};
+
 void udp_send_fx_enc(int enc_id, uint8_t value, bool muted) {
     if (!udpStarted) return;
     if (enc_id < 0 || enc_id > 2) return;
@@ -1109,15 +1214,27 @@ void udp_send_fx_enc(int enc_id, uint8_t value, bool muted) {
     char buf[96];
     bool active = (!muted && value > 0);
     float norm = (float)value / 127.0f;
-    bool fullSend = active;
+    uint32_t now = millis();
+    bool activeChanged = !s_fx_enc_latch_valid[enc_id] ||
+                         s_fx_enc_last_active[enc_id] != active;
+    // Mix/depth follows the gesture at the UI throttle rate. The larger
+    // parameter snapshot is only needed on activation and periodically as a
+    // UDP-loss repair, not for every single arc increment.
+    bool fullSend = active && (activeChanged ||
+                    (uint32_t)(now - s_fx_enc_last_full_ms[enc_id]) >= 250);
+    s_fx_enc_latch_valid[enc_id] = true;
+    s_fx_enc_last_active[enc_id] = active;
+    if (fullSend) s_fx_enc_last_full_ms[enc_id] = now;
 
     P4_LOG_PRINTF("[FX] enc%d val=%d muted=%d active=%d norm=%.2f full=%d\n",
                   enc_id, value, muted, active, norm, fullSend);
 
     switch (enc_id) {
         case 0: // Flanger — stronger modulation than chorus, with capped feedback/mix.
-            snprintf(buf, sizeof(buf), "{\"cmd\":\"setFlangerActive\",\"value\":%d}", active ? 1 : 0);
-            sendJson(buf);
+            if (activeChanged || fullSend) {
+                snprintf(buf, sizeof(buf), "{\"cmd\":\"setFlangerActive\",\"value\":%d}", active ? 1 : 0);
+                sendJson(buf);
+            }
             if (active) {
                 int rate_pct = clamp_int((int)(8.0f + norm * 44.0f + 0.5f), 8, 52);
                 int depth_pct = clamp_int((int)(18.0f + norm * 62.0f + 0.5f), 18, 80);
@@ -1137,8 +1254,10 @@ void udp_send_fx_enc(int enc_id, uint8_t value, bool muted) {
             break;
         case 1: // Delay — unmistakable echo effect
             mark_local_fx(FX_OWN_DELAY);
-            snprintf(buf, sizeof(buf), "{\"cmd\":\"setDelayActive\",\"value\":%d}", active ? 1 : 0);
-            sendJson(buf);
+            if (activeChanged || fullSend) {
+                snprintf(buf, sizeof(buf), "{\"cmd\":\"setDelayActive\",\"value\":%d}", active ? 1 : 0);
+                sendJson(buf);
+            }
             if (active) {
                 int delay_ms = clamp_int((int)(90.0f + norm * 650.0f + 0.5f), 60, 900);
                 int fb_pct = clamp_int((int)(14.0f + norm * 56.0f + 0.5f), 0, 85);
@@ -1156,8 +1275,10 @@ void udp_send_fx_enc(int enc_id, uint8_t value, bool muted) {
             break;
         case 2: // Reverb — unmistakable room/hall effect
             mark_local_fx(FX_OWN_REVERB);
-            snprintf(buf, sizeof(buf), "{\"cmd\":\"setReverbActive\",\"value\":%d}", active ? 1 : 0);
-            sendJson(buf);
+            if (activeChanged || fullSend) {
+                snprintf(buf, sizeof(buf), "{\"cmd\":\"setReverbActive\",\"value\":%d}", active ? 1 : 0);
+                sendJson(buf);
+            }
             if (active) {
                 float feedback = 0.28f + norm * 0.48f;
                 int lp_hz = clamp_int((int)(2200.0f + norm * 6800.0f + 0.5f), 1800, 12000);
@@ -1239,8 +1360,13 @@ void udp_send_fx_pot(int pot_id, uint8_t value, bool muted) {
     }
 }
 
-// Kept for the WiFi reconnect path; current FX macros resend their full state directly.
-void udp_reset_fx_latch(void) {}
+void udp_reset_fx_latch(void) {
+    for (int i = 0; i < 3; i++) {
+        s_fx_enc_latch_valid[i] = false;
+        s_fx_enc_last_active[i] = false;
+        s_fx_enc_last_full_ms[i] = 0;
+    }
+}
 
 // =============================================================================
 // SYNC REQUEST — handshake + request initial data
@@ -1742,11 +1868,7 @@ static void processJsonVariant(JsonVariant doc) {
         uint8_t oct = (uint8_t)(doc["octave"] | 4);
         bool    rec = doc["rec"] | false;
         uint8_t pad = (uint8_t)(doc["pad"]    | 0);
-        g_pending_melody_from_s3.engine = eng;
-        g_pending_melody_from_s3.octave = oct;
-        g_pending_melody_from_s3.rec    = rec ? 1 : 0;
-        g_pending_melody_from_s3.pad    = pad;
-        g_pending_melody_from_s3.pending = true;
+        p4_publish_pending_melody(eng, oct, rec, pad);
         // v2.9 — forward melody state to S3 so its melody screen stays in sync.
         // S3 has no WiFi; it receives these via UART and applies under LVGL lock.
         uart_send_to_s3(MSG_TOUCH_CMD, TCMD_MELODY_ENGINE, eng);
@@ -1781,10 +1903,13 @@ static void startWiFi(void) {
 static void onWiFiConnected(void) {
     wifiConnected = true;
     p4.wifi_connected = true;
-    P4_LOG_PRINTF("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    IPAddress local_ip = WiFi.localIP();
+    P4_LOG_PRINTF("[WiFi] Connected! IP: %u.%u.%u.%u\n",
+                  local_ip[0], local_ip[1], local_ip[2], local_ip[3]);
 
     // Start UDP
     if (udp.begin(UDP_PORT)) {
+        if (s_udp_tx_queue) xQueueReset(s_udp_tx_queue);
         udpStarted = true;
         P4_LOG_PRINTF("[UDP] Listening on port %d\n", UDP_PORT);
         udp_request_master_sync();
@@ -1801,6 +1926,7 @@ static void onWiFiDisconnected(void) {
         masterAlive = false;
         p4.wifi_connected = false;
         p4.master_connected = false;
+        if (s_udp_tx_queue) xQueueReset(s_udp_tx_queue);
         // Clear FX latches so they are re-sent after reconnect (LP filter, etc.)
         extern void udp_reset_fx_latch(void);
         udp_reset_fx_latch();
@@ -1812,7 +1938,14 @@ static void onWiFiDisconnected(void) {
 // =============================================================================
 void udp_handler_init(void) {
     P4_LOG_PRINTLN("[UDP] Init WiFi/UDP handler");
-    s_udp_tx_mutex = xSemaphoreCreateMutex();
+    s_udp_tx_stage_mutex = xSemaphoreCreateMutex();
+    // Internal RAM keeps the queue usable while flash/NVS temporarily changes
+    // external-memory cache state. Depth 24 still covers the largest command
+    // burst (a complete deferred pattern) plus interactive input.
+    s_udp_tx_queue = xQueueCreate(UDP_TX_QUEUE_DEPTH, sizeof(UdpTxPacket));
+    if (!s_udp_tx_stage_mutex || !s_udp_tx_queue) {
+        P4_LOG_PRINTLN("[UDP] Failed to create TX queue");
+    }
     startWiFi();
 
     // HTTP worker — Core 1 (with loop()), low priority. It spends nearly all
@@ -1899,6 +2032,10 @@ void udp_handler_process(void) {
 
     // --- Apply HTTP bodies fetched by the worker task (non-blocking) ---
     http_consume_results();
+
+    // --- Drain all cross-task outgoing commands from one WiFiUDP owner ---
+    // 24 entries cover a full deferred-pattern burst plus interactive input.
+    udp_drain_tx_queue(UDP_TX_QUEUE_DEPTH);
 
     // --- Master timeout ---
     if (masterAlive && (now - lastMasterPacket > MASTER_TIMEOUT_MS)) {
@@ -1992,4 +2129,8 @@ void udp_handler_process(void) {
 
     // --- Local step clock (authoritative) ---
     run_local_step_clock(now);
+
+    // Commands generated while processing inbound packets should not wait for
+    // the next Arduino loop iteration.
+    udp_drain_tx_queue(UDP_TX_QUEUE_DEPTH);
 }

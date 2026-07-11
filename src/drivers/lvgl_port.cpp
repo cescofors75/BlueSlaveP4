@@ -16,6 +16,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <atomic>
 
 // =============================================================================
 // TASK + SYNC PRIMITIVES
@@ -24,6 +25,9 @@ static SemaphoreHandle_t lvgl_mutex    = NULL;
 static SemaphoreHandle_t sem_vsync_end = NULL;  // vsync acked our swap
 static SemaphoreHandle_t sem_gui_ready = NULL;  // swap pending, wait for vsync
 static volatile bool task_started = false;
+static std::atomic<uint32_t> s_refresh_seq{0};
+static_assert(std::atomic<uint32_t>::is_always_lock_free,
+              "VSYNC counter must remain ISR-safe");
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
@@ -33,11 +37,14 @@ static lv_disp_drv_t disp_drv;
 static lv_indev_drv_t touch_drvs[MAX_TOUCH_POINTS];
 static lv_indev_t* touch_indevs[MAX_TOUCH_POINTS];
 
-static struct {
-    volatile lv_point_t point;
-    volatile lv_indev_state_t state;
-    volatile uint8_t area;   // GT911 touch size byte — proxy for finger pressure/area
-} touch_data[MAX_TOUCH_POINTS];
+struct TouchPointState {
+    lv_point_t point;
+    lv_indev_state_t state;
+    uint8_t area;   // GT911 touch size byte — proxy for finger pressure/area
+};
+static TouchPointState touch_data[MAX_TOUCH_POINTS] = {};
+static portMUX_TYPE s_touch_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_touch_last_frame_ms = 0;
 
 // =============================================================================
 // VSYNC ISR — dual-semaphore handshake (Espressif pattern)
@@ -49,6 +56,7 @@ static bool IRAM_ATTR dpi_on_refresh_done(esp_lcd_panel_handle_t panel,
                                            void *user_ctx) {
     (void)panel; (void)edata; (void)user_ctx;
     BaseType_t woken = pdFALSE;
+    s_refresh_seq.fetch_add(1, std::memory_order_relaxed);
     if (sem_gui_ready && xSemaphoreTakeFromISR(sem_gui_ready, &woken) == pdTRUE) {
         xSemaphoreGiveFromISR(sem_vsync_end, &woken);
     }
@@ -79,10 +87,28 @@ static void disp_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
     esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, color_p);
 
     // Step 2: arm handshake \u2014 must come AFTER draw_bitmap
+    // Drain tokens left by a timed-out older flush before arming this swap.
+    while (xSemaphoreTake(sem_vsync_end, 0) == pdTRUE) {}
+    while (xSemaphoreTake(sem_gui_ready, 0) == pdTRUE) {}
+    uint32_t refresh_before = s_refresh_seq.load(std::memory_order_acquire);
     xSemaphoreGive(sem_gui_ready);
 
-    // Step 3: wait for next frame refresh (vsync ACK)
-    xSemaphoreTake(sem_vsync_end, pdMS_TO_TICKS(500));
+    // Step 3: wait for a refresh newer than this framebuffer swap. The
+    // sequence check prevents a stale semaphore token acknowledging it.
+    TickType_t wait_start = xTaskGetTickCount();
+    const TickType_t wait_limit = pdMS_TO_TICKS(500);
+    bool refreshed = false;
+    do {
+        TickType_t now = xTaskGetTickCount();
+        TickType_t elapsed = now - wait_start;
+        TickType_t remaining = (elapsed < wait_limit) ? (wait_limit - elapsed) : 0;
+        if (xSemaphoreTake(sem_vsync_end, remaining) != pdTRUE) break;
+        refreshed = (s_refresh_seq.load(std::memory_order_acquire) != refresh_before);
+    } while (!refreshed);
+    if (!refreshed) {
+        xSemaphoreTake(sem_gui_ready, 0);
+        P4_LOG_PRINTLN("[LVGL] Vsync timeout");
+    }
 
     lv_disp_flush_ready(drv);
 }
@@ -93,6 +119,26 @@ static void disp_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
 // GT911 TOUCH — init + polling (runs on separate Core 0 task)
 // =============================================================================
 static bool gt911_initialized = false;
+
+static void touch_publish(const TouchPointState next[MAX_TOUCH_POINTS]) {
+    portENTER_CRITICAL(&s_touch_mux);
+    memcpy(touch_data, next, sizeof(touch_data));
+    portEXIT_CRITICAL(&s_touch_mux);
+}
+
+static void touch_release_all(void) {
+    TouchPointState next[MAX_TOUCH_POINTS] = {};
+    for (int i = 0; i < MAX_TOUCH_POINTS; i++) next[i].state = LV_INDEV_STATE_REL;
+    touch_publish(next);
+}
+
+static void touch_release_if_stale(void) {
+    if (s_touch_last_frame_ms != 0 &&
+        (uint32_t)(millis() - s_touch_last_frame_ms) >= 1000) {
+        touch_release_all();
+        s_touch_last_frame_ms = millis();
+    }
+}
 
 static void gt911_init(void) {
     Wire.begin(TOUCH_I2C_SDA, TOUCH_I2C_SCL, 400000);
@@ -118,17 +164,17 @@ static void gt911_init(void) {
 
 static void gt911_poll_all(void) {
     if (!gt911_initialized) {
-        for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
-            touch_data[i].state = LV_INDEV_STATE_REL;
-            touch_data[i].area  = 0;
-        }
+        touch_release_all();
         return;
     }
 
     Wire.beginTransmission(TOUCH_I2C_ADDR);
     Wire.write(0x81); Wire.write(0x4E);
-    if (Wire.endTransmission(false) != 0) return;
-    if (Wire.requestFrom((uint8_t)TOUCH_I2C_ADDR, (uint8_t)1) != 1) return;
+    if (Wire.endTransmission(false) != 0) { touch_release_if_stale(); return; }
+    if (Wire.requestFrom((uint8_t)TOUCH_I2C_ADDR, (uint8_t)1) != 1) {
+        touch_release_if_stale();
+        return;
+    }
     uint8_t status = Wire.read();
 
     uint8_t touches = status & 0x0F;
@@ -136,13 +182,11 @@ static void gt911_poll_all(void) {
 
     // Keep last valid frame when the controller hasn't published a new one yet.
     // This avoids short REL glitches that can cut sustained piano notes.
-    if (!buf_ready) return;
+    if (!buf_ready) { touch_release_if_stale(); return; }
 
     if (touches == 0 || touches > MAX_TOUCH_POINTS) {
-        for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
-            touch_data[i].state = LV_INDEV_STATE_REL;
-            touch_data[i].area  = 0;
-        }
+        touch_release_all();
+        s_touch_last_frame_ms = millis();
         Wire.beginTransmission(TOUCH_I2C_ADDR);
         Wire.write(0x81); Wire.write(0x4E); Wire.write((uint8_t)0);
         Wire.endTransmission();
@@ -152,24 +196,29 @@ static void gt911_poll_all(void) {
     int readLen = touches * 8;
     uint8_t buf[MAX_TOUCH_POINTS * 8];
     Wire.beginTransmission(TOUCH_I2C_ADDR);
-    Wire.write(0x81); Wire.write(0x50);
+    // Start at 0x814F so each 8-byte record includes its stable tracking ID.
+    Wire.write(0x81); Wire.write(0x4F);
     bool ok = (Wire.endTransmission(false) == 0);
     if (ok) ok = (Wire.requestFrom((uint8_t)TOUCH_I2C_ADDR, (uint8_t)readLen) == readLen);
     if (ok) {
-        for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
-            touch_data[i].state = LV_INDEV_STATE_REL;
-            touch_data[i].area  = 0;
-        }
+        TouchPointState next[MAX_TOUCH_POINTS] = {};
+        for (int i = 0; i < MAX_TOUCH_POINTS; i++) next[i].state = LV_INDEV_STATE_REL;
         for (int i = 0; i < readLen; i++) buf[i] = Wire.read();
         for (int i = 0; i < touches; i++) {
-            uint16_t x    = buf[i*8]   | ((uint16_t)buf[i*8+1] << 8);
-            uint16_t y    = buf[i*8+2] | ((uint16_t)buf[i*8+3] << 8);
-            uint16_t size = buf[i*8+4] | ((uint16_t)buf[i*8+5] << 8);
-            touch_data[i].point.x = (x < LCD_H_RES) ? (lv_coord_t)x : (lv_coord_t)(LCD_H_RES - 1);
-            touch_data[i].point.y = (y < LCD_V_RES) ? (lv_coord_t)y : (lv_coord_t)(LCD_V_RES - 1);
-            touch_data[i].area  = (size > 255) ? 255 : (uint8_t)size;
-            touch_data[i].state = LV_INDEV_STATE_PR;
+            uint8_t track_id = buf[i*8] & 0x0F;
+            int idx = (track_id < MAX_TOUCH_POINTS) ? track_id : i;
+            uint16_t x    = buf[i*8+1] | ((uint16_t)buf[i*8+2] << 8);
+            uint16_t y    = buf[i*8+3] | ((uint16_t)buf[i*8+4] << 8);
+            uint16_t size = buf[i*8+5] | ((uint16_t)buf[i*8+6] << 8);
+            next[idx].point.x = (x < LCD_H_RES) ? (lv_coord_t)x : (lv_coord_t)(LCD_H_RES - 1);
+            next[idx].point.y = (y < LCD_V_RES) ? (lv_coord_t)y : (lv_coord_t)(LCD_V_RES - 1);
+            next[idx].area  = (size > 255) ? 255 : (uint8_t)size;
+            next[idx].state = LV_INDEV_STATE_PR;
         }
+        touch_publish(next);
+        s_touch_last_frame_ms = millis();
+    } else {
+        touch_release_if_stale();
     }
 
     Wire.beginTransmission(TOUCH_I2C_ADDR);
@@ -185,6 +234,11 @@ static void touch_task(void* arg) {
     while (true) {
         gt911_poll_all();
 
+        TouchPointState points[MAX_TOUCH_POINTS];
+        portENTER_CRITICAL(&s_touch_mux);
+        memcpy(points, touch_data, sizeof(points));
+        portEXIT_CRITICAL(&s_touch_mux);
+
         bool    pressed[16]  = {};
         uint8_t velocity[16] = {};
         uint8_t cell_x[16];
@@ -195,18 +249,18 @@ static void touch_task(void* arg) {
         }
 
         for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
-            if (touch_data[i].state != LV_INDEV_STATE_PR) continue;
+            if (points[i].state != LV_INDEV_STATE_PR) continue;
             uint8_t lx = 64;
             uint8_t ly = 64;
-            int pad = ui_pad_from_xy((uint16_t)touch_data[i].point.x,
-                                     (uint16_t)touch_data[i].point.y,
+            int pad = ui_pad_from_xy((uint16_t)points[i].point.x,
+                                     (uint16_t)points[i].point.y,
                                      &lx, &ly);
             if (pad < 0) continue;
             pressed[pad] = true;
             // Map GT911 area byte (0..255) to MIDI velocity (40..127).
             // Very light contacts (area==0) get a sensible floor so the sample
             // still plays clearly. Hard presses approach 127.
-            uint8_t a = touch_data[i].area;
+            uint8_t a = points[i].area;
             uint8_t v = a ? (uint8_t)(40 + ((uint32_t)a * 87) / 255) : 100;
             if (v > 127) v = 127;
             if (v > velocity[pad]) {
@@ -225,9 +279,11 @@ static void touch_task(void* arg) {
 // LVGL touch callback — instant read from cache (zero I2C overhead)
 static void touch_read_cb(lv_indev_drv_t* drv, lv_indev_data_t* data) {
     int idx = (int)(intptr_t)drv->user_data;
-    data->point.x = touch_data[idx].point.x;
-    data->point.y = touch_data[idx].point.y;
-    data->state   = touch_data[idx].state;
+    portENTER_CRITICAL(&s_touch_mux);
+    TouchPointState point = touch_data[idx];
+    portEXIT_CRITICAL(&s_touch_mux);
+    data->point = point.point;
+    data->state = point.state;
 }
 
 // =============================================================================
@@ -245,10 +301,10 @@ static void lvgl_task(void* arg) {
             ui_update_current_screen();
             lvgl_port_unlock();
         }
-        // 8ms (125Hz tick) lets pad flashes appear on the very next vsync
-        // after a touch. The actual paint cost is now tiny (partial refresh),
-        // so the CPU spends most of the 8ms idle waiting for vsync.
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(8));
+        // The panel refreshes at 60 Hz and touch/pad delivery has its own
+        // 200 Hz task. Running LVGL at 125 Hz added wakeups without producing
+        // extra visible frames; align UI work with the physical display.
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(16));
     }
 }
 
@@ -347,10 +403,14 @@ lv_indev_t* lvgl_port_get_touch_indev(void) {
 }
 
 uint8_t lvgl_port_get_touch_velocity(void) {
+    TouchPointState points[MAX_TOUCH_POINTS];
+    portENTER_CRITICAL(&s_touch_mux);
+    memcpy(points, touch_data, sizeof(points));
+    portEXIT_CRITICAL(&s_touch_mux);
     uint8_t best = 0;
     for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
-        if (touch_data[i].state != LV_INDEV_STATE_PR) continue;
-        uint8_t a = touch_data[i].area;
+        if (points[i].state != LV_INDEV_STATE_PR) continue;
+        uint8_t a = points[i].area;
         uint8_t v = a ? (uint8_t)(40 + ((uint32_t)a * 87) / 255) : 100;
         if (v > 127) v = 127;
         if (v > best) best = v;

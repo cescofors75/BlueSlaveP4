@@ -70,13 +70,21 @@ static inline uint8_t channel_to_track(uint8_t ch) {
 static File          s_f;
 static bool          s_err = false;
 static unsigned long s_parse_start_ms = 0;
+static uint32_t      s_read_limit = 0;
 static constexpr unsigned long MIDI_PARSE_TIMEOUT_MS = 5000;
 
 static inline bool parse_timed_out() {
     return (millis() - s_parse_start_ms) > MIDI_PARSE_TIMEOUT_MS;
 }
 
-static uint8_t  readU8()  { uint8_t b = 0; if (s_f.read(&b, 1) != 1) s_err = true; return b; }
+static uint8_t readU8() {
+    uint8_t b = 0;
+    if (s_err || (uint32_t)s_f.position() >= s_read_limit ||
+        s_f.read(&b, 1) != 1) {
+        s_err = true;
+    }
+    return b;
+}
 static uint16_t readU16() { uint8_t a = readU8(), b2 = readU8(); return (uint16_t)((a << 8) | b2); }
 static uint32_t readU32() { uint16_t a = readU16(), b2 = readU16(); return ((uint32_t)a << 16) | b2; }
 
@@ -92,37 +100,79 @@ static uint32_t readVLQ() {
 }
 
 static void skipN(uint32_t n) {
-    if (n == 0) return;
-    s_f.seek(s_f.position() + n);
+    if (n == 0 || s_err) return;
+    uint32_t pos = (uint32_t)s_f.position();
+    if (pos > s_read_limit || n > s_read_limit - pos || !s_f.seek(pos + n)) {
+        s_err = true;
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Event buffer in PSRAM
 // ---------------------------------------------------------------------------
-#define MIDI_EVENT_BUF 4096
+static constexpr int MIDI_EVENT_BUF_INITIAL = 4096;
+static constexpr int MIDI_EVENT_BUF_MAX = 32768;
 struct RawEvt { uint32_t tick; uint8_t trk; };
 static RawEvt* s_evbuf = nullptr;
 static int     s_evcount = 0;
+static int     s_evcap = 0;
 static bool    s_evbuf_overflow = false;
 
-static bool ensure_evbuf() {
-    if (s_evbuf) return true;
-    s_evbuf = (RawEvt*)heap_caps_malloc(sizeof(RawEvt) * MIDI_EVENT_BUF,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_evbuf) s_evbuf = (RawEvt*)malloc(sizeof(RawEvt) * MIDI_EVENT_BUF);
-    return s_evbuf != nullptr;
+static RawEvt* alloc_event_buffer(int capacity) {
+    RawEvt* p = (RawEvt*)heap_caps_malloc(sizeof(RawEvt) * capacity,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = (RawEvt*)malloc(sizeof(RawEvt) * capacity);
+    return p;
+}
+
+static bool ensure_evbuf_capacity(int needed = MIDI_EVENT_BUF_INITIAL) {
+    if (needed <= s_evcap && s_evbuf) return true;
+    int next_cap = s_evcap > 0 ? s_evcap : MIDI_EVENT_BUF_INITIAL;
+    while (next_cap < needed && next_cap < MIDI_EVENT_BUF_MAX) next_cap *= 2;
+    if (next_cap > MIDI_EVENT_BUF_MAX) next_cap = MIDI_EVENT_BUF_MAX;
+    if (next_cap < needed) return false;
+
+    RawEvt* next = alloc_event_buffer(next_cap);
+    if (!next) return false;
+    if (s_evbuf && s_evcount > 0) {
+        memcpy(next, s_evbuf, sizeof(RawEvt) * s_evcount);
+    }
+    if (s_evbuf) heap_caps_free(s_evbuf);
+    s_evbuf = next;
+    s_evcap = next_cap;
+    return true;
+}
+
+static bool append_event(uint32_t tick, uint8_t track) {
+    if (s_evcount >= s_evcap && !ensure_evbuf_capacity(s_evcount + 1)) {
+        s_evbuf_overflow = true;
+        s_err = true;
+        log_e("[MEM-MIDI] event limit reached (%d)", MIDI_EVENT_BUF_MAX);
+        return false;
+    }
+    s_evbuf[s_evcount++] = {tick, track};
+    return true;
 }
 
 // Parse one MTrk chunk — identical logic to the S3 parser.
 static void parseTrack(uint32_t len, int tpq, uint32_t* tempo_us_out, int midi_channel) {
     (void)tpq;
-    uint32_t end = (uint32_t)s_f.position() + len;
+    uint32_t start = (uint32_t)s_f.position();
+    uint32_t file_limit = s_read_limit;
+    if (len > file_limit - start) {
+        s_err = true;
+        return;
+    }
+    uint32_t end = start + len;
+    s_read_limit = end;
     uint32_t tick = 0;
     uint8_t  status = 0;
 
     while (!s_err && (uint32_t)s_f.position() < end) {
         if (parse_timed_out()) { s_err = true; break; }
-        tick += readVLQ();
+        uint32_t delta = readVLQ();
+        if (UINT32_MAX - tick < delta) { s_err = true; break; }
+        tick += delta;
         if (s_err) break;
 
         uint8_t b = readU8();
@@ -130,7 +180,10 @@ static void parseTrack(uint32_t len, int tpq, uint32_t* tempo_us_out, int midi_c
         if (b == 0xFF) {
             uint8_t meta_type = readU8();
             uint32_t ml = readVLQ();
-            if (meta_type == 0x51 && ml == 3 && tempo_us_out && *tempo_us_out == 0) {
+            if (meta_type == 0x2F) {
+                skipN(ml);
+                break;
+            } else if (meta_type == 0x51 && ml == 3 && tempo_us_out && *tempo_us_out == 0) {
                 uint32_t t = (uint32_t)readU8() << 16;
                 t |= (uint32_t)readU8() << 8;
                 t |= (uint32_t)readU8();
@@ -145,7 +198,10 @@ static void parseTrack(uint32_t len, int tpq, uint32_t* tempo_us_out, int midi_c
 
         uint8_t d1;
         if (b & 0x80) { status = b; d1 = readU8(); }
-        else           { d1 = b; }
+        else {
+            if (status == 0) { s_err = true; break; }
+            d1 = b;
+        }
 
         uint8_t ev = status & 0xF0;
         uint8_t ch = status & 0x0F;
@@ -165,18 +221,15 @@ static void parseTrack(uint32_t len, int tpq, uint32_t* tempo_us_out, int midi_c
                         trk = channel_to_track(ch);
                 }
             }
-            if (trk != 0xFF && s_evcount < MIDI_EVENT_BUF) {
-                s_evbuf[s_evcount++] = {tick, trk};
-            } else if (trk != 0xFF) {
-                s_evbuf_overflow = true;
-            }
+            if (trk != 0xFF) append_event(tick, trk);
         } else if (ev == 0xA0 || ev == 0xB0 || ev == 0xE0) {
             readU8();
         }
         // 0xC0, 0xD0: single data byte already consumed in d1
     }
 
-    s_f.seek(end);
+    s_read_limit = file_limit;
+    if (!s_err && !s_f.seek(end)) s_err = true;
 }
 
 // Fold collected events onto a 16×16 grid. Returns the raw length (16/32/48/64)
@@ -209,7 +262,7 @@ static int foldEventsTo16(int tpq, bool steps[16][16]) {
     for (int i = 0; i < s_evcount; i++) {
         if (s_evbuf[i].tick < bar_start) continue;
         uint32_t rel  = s_evbuf[i].tick - bar_start;
-        uint32_t step = (rel * 16u) / bar_ticks;   // 16th-note steps within raw
+        uint32_t step = (uint32_t)(((uint64_t)rel * 16u) / bar_ticks);   // 16th-note steps within raw
         if ((int)step < raw_len) {
             // Fold: step % 16 brings bar 2/3/4 hits onto bar 1
             int folded = (int)(step % 16);
@@ -248,7 +301,7 @@ static int expandEventsTo64(int tpq, bool raw[16][64]) {
     for (int i = 0; i < s_evcount; i++) {
         if (s_evbuf[i].tick < bar_start) continue;
         uint32_t rel  = s_evbuf[i].tick - bar_start;
-        uint32_t step = (rel * 16u) / bar_ticks;
+        uint32_t step = (uint32_t)(((uint64_t)rel * 16u) / bar_ticks);
         if ((int)step < raw_len) {
             int trk = s_evbuf[i].trk;
             if (trk >= 0 && trk < 16) raw[trk][step] = true;
@@ -266,6 +319,12 @@ static uint16_t parseFile(fs::FS& storage, const char* path, int midi_channel, u
     s_err = false;
     s_parse_start_ms = millis();
     if (!s_f) return 0;
+    size_t file_size = s_f.size();
+    if (file_size < 14 || file_size > UINT32_MAX) {
+        s_f.close();
+        return 0;
+    }
+    s_read_limit = (uint32_t)file_size;
 
     uint16_t result_tpq = 0;
     char magic[4];
@@ -273,10 +332,10 @@ static uint16_t parseFile(fs::FS& storage, const char* path, int midi_channel, u
 
     if (ok) {
         uint32_t hdr_len = readU32();
-        uint16_t fmt     = readU16(); (void)fmt;
+        uint16_t fmt     = readU16();
         uint16_t ntracks = readU16();
         uint16_t tpq     = readU16();
-        if (!s_err && !(tpq & 0x8000)) {
+        if (!s_err && hdr_len >= 6 && fmt <= 1 && ntracks > 0 && !(tpq & 0x8000)) {
             if (tpq == 0) tpq = 96;
             if (hdr_len > 6) skipN(hdr_len - 6);
 
@@ -287,6 +346,8 @@ static uint16_t parseFile(fs::FS& storage, const char* path, int midi_channel, u
                 if (strncmp(tmagic, "MTrk", 4) != 0) break;
                 uint32_t tlen = readU32();
                 if (s_err) break;
+                uint32_t pos = (uint32_t)s_f.position();
+                if (tlen > s_read_limit - pos) { s_err = true; break; }
                 parseTrack(tlen, (int)tpq, tempo_us_out, midi_channel);
             }
             result_tpq = tpq;
@@ -325,7 +386,7 @@ bool load_pattern(const char* path,
     uint32_t tempo_us = 0;
     s_evcount = 0;
     s_evbuf_overflow = false;
-    if (!ensure_evbuf()) {
+    if (!ensure_evbuf_capacity()) {
         log_e("[MEM-MIDI] cannot allocate event buffer");
         return false;
     }
@@ -390,7 +451,7 @@ bool load_pattern_raw(const char* path,
     uint32_t tempo_us = 0;
     s_evcount = 0;
     s_evbuf_overflow = false;
-    if (!ensure_evbuf()) {
+    if (!ensure_evbuf_capacity()) {
         log_e("[MEM-MIDI] cannot allocate event buffer");
         return false;
     }
@@ -455,7 +516,7 @@ bool load_pattern_raw_from_fs(fs::FS& storage,
     uint32_t tempo_us = 0;
     s_evcount = 0;
     s_evbuf_overflow = false;
-    if (!ensure_evbuf()) {
+    if (!ensure_evbuf_capacity()) {
         log_e("[MEM-MIDI] cannot allocate event buffer");
         return false;
     }
@@ -509,7 +570,20 @@ int list_midi_files_from_fs(fs::FS& storage, const char* dir, char names[][48], 
                     count++;
                 }
             }
+            f.close();
             f = root.openNextFile();
+        }
+        if (f) f.close();
+        root.close();
+        for (int i = 1; i < count; i++) {
+            char key[48];
+            memcpy(key, names[i], sizeof(key));
+            int j = i - 1;
+            while (j >= 0 && strcasecmp(names[j], key) > 0) {
+                memcpy(names[j + 1], names[j], sizeof(names[j + 1]));
+                j--;
+            }
+            memcpy(names[j + 1], key, sizeof(names[j + 1]));
         }
         return count;
     }
@@ -528,7 +602,20 @@ int list_midi_files_from_fs(fs::FS& storage, const char* dir, char names[][48], 
                 count++;
             }
         }
+        f.close();
         f = d.openNextFile();
+    }
+    if (f) f.close();
+    d.close();
+    for (int i = 1; i < count; i++) {
+        char key[48];
+        memcpy(key, names[i], sizeof(key));
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(names[j], key) > 0) {
+            memcpy(names[j + 1], names[j], sizeof(names[j + 1]));
+            j--;
+        }
+        memcpy(names[j + 1], key, sizeof(names[j + 1]));
     }
     return count;
 }
