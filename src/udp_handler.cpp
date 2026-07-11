@@ -377,8 +377,11 @@ static void decode_pattern_row_hex(const char* row, bool* dest, int stepCount) {
 static void apply_step_ownership_window(bool steps[16][64], int stepCount) {
     unsigned long nowMs = millis();
     int maxStep = clamp_int(stepCount, 16, 64);
+    // p4.steps only tracks the first 16 steps (page 1) — clamp the source
+    // read separately so steps 16..63 never index past p4.steps[t][16..].
+    int p4MaxStep = (maxStep < 16) ? maxStep : 16;
     for (int t = 0; t < 16; t++) {
-        for (int s = 0; s < maxStep; s++) {
+        for (int s = 0; s < p4MaxStep; s++) {
             unsigned long stamp = lastLocalStepMs[t][s];
             if (stamp != 0 && nowMs - stamp < LOCAL_STEP_OWNERSHIP_MS) {
                 steps[t][s] = p4.steps[t][s];

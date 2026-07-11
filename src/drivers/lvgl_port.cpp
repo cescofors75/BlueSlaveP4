@@ -17,6 +17,9 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <atomic>
+#if P4_ENABLE_PERF_LOG
+#include <esp_heap_caps.h>
+#endif
 
 // =============================================================================
 // TASK + SYNC PRIMITIVES
@@ -28,6 +31,14 @@ static volatile bool task_started = false;
 static std::atomic<uint32_t> s_refresh_seq{0};
 static_assert(std::atomic<uint32_t>::is_always_lock_free,
               "VSYNC counter must remain ISR-safe");
+
+#if P4_ENABLE_PERF_LOG
+// Perf counters — plain volatile ints are fine here: this is a diagnostic
+// aid (occasional off-by-one from a torn read doesn't matter), not state
+// the app depends on. touch_poll counter lives next to touch_task below.
+static volatile uint32_t s_frame_count = 0;         // physical panel flips
+static volatile uint32_t s_timer_handler_count = 0; // lv_timer_handler() calls
+#endif
 
 static lv_disp_draw_buf_t draw_buf;
 static lv_disp_drv_t disp_drv;
@@ -82,6 +93,10 @@ static void disp_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
     }
 
     esp_lcd_panel_handle_t panel = display_get_panel();
+
+#if P4_ENABLE_PERF_LOG
+    s_frame_count++;
+#endif
 
     // Step 1: swap active FB (DPI recognises internal pointer \u2192 zero-copy)
     esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_H_RES, LCD_V_RES, color_p);
@@ -226,13 +241,36 @@ static void gt911_poll_all(void) {
     Wire.endTransmission();
 }
 
+// Adaptive touch poll rate: full 200Hz while a finger is down (or was down
+// in the last TOUCH_WARM_MS — covers fast taps/drum rolls), backing off to
+// TOUCH_POLL_IDLE_MS the rest of the time. The GT911 has an INT line that
+// could gate this exactly, but its trigger polarity/mode isn't verified on
+// this board and touch is the primary input for a live instrument — a wrong
+// polarity guess would silently stop all touch input. This timing-based
+// backoff needs no assumption about GT911 interrupt behavior: idle backoff
+// only ever adds up to TOUCH_POLL_IDLE_MS of latency to the FIRST touch
+// after a pause, then jumps straight back to 200Hz for the rest of the
+// gesture, so it can't degrade in-progress tracking (drags/rolls) or make
+// missed touches — only worst case is behaving exactly like before.
+static constexpr uint32_t TOUCH_POLL_ACTIVE_MS = 5;    // 200Hz while warm
+static constexpr uint32_t TOUCH_POLL_IDLE_MS   = 20;   // 50Hz once cold
+static constexpr uint32_t TOUCH_WARM_MS        = 250;  // stay warm this long after last touch
+
+#if P4_ENABLE_PERF_LOG
+static volatile uint32_t s_touch_poll_count = 0;
+#endif
+
 // Touch FreeRTOS task — Core 0, polls I2C independently of LVGL rendering.
 // Aggregates up to 5 touch points into a per-pad pressed[] + velocity[] frame
 // and delegates press/release/repeat logic to ui_screens (ui_pad_frame_update).
 static void touch_task(void* arg) {
     (void)arg;
+    uint32_t last_active_ms = 0;
     while (true) {
         gt911_poll_all();
+#if P4_ENABLE_PERF_LOG
+        s_touch_poll_count++;
+#endif
 
         TouchPointState points[MAX_TOUCH_POINTS];
         portENTER_CRITICAL(&s_touch_mux);
@@ -248,8 +286,10 @@ static void touch_task(void* arg) {
             cell_y[p] = 64;
         }
 
+        bool any_touch = false;
         for (int i = 0; i < MAX_TOUCH_POINTS; i++) {
             if (points[i].state != LV_INDEV_STATE_PR) continue;
+            any_touch = true;
             uint8_t lx = 64;
             uint8_t ly = 64;
             int pad = ui_pad_from_xy((uint16_t)points[i].point.x,
@@ -272,7 +312,10 @@ static void touch_task(void* arg) {
 
         ui_pad_frame_update(pressed, velocity, cell_x, cell_y);
 
-        vTaskDelay(pdMS_TO_TICKS(5));   // 200Hz touch polling
+        uint32_t now = millis();
+        if (any_touch) last_active_ms = now;
+        bool warm = (now - last_active_ms) < TOUCH_WARM_MS;
+        vTaskDelay(pdMS_TO_TICKS(warm ? TOUCH_POLL_ACTIVE_MS : TOUCH_POLL_IDLE_MS));
     }
 }
 
@@ -285,6 +328,40 @@ static void touch_read_cb(lv_indev_drv_t* drv, lv_indev_data_t* data) {
     data->point = point.point;
     data->state = point.state;
 }
+
+#if P4_ENABLE_PERF_LOG
+// Prints once every PERF_LOG_INTERVAL_MS: real panel FPS (frames actually
+// flushed, i.e. keeping up with vsync — the number that matters), LVGL task
+// iteration rate, touch poll rate (confirms the idle backoff is working),
+// and free heap split internal/PSRAM (watches for fragmentation over long
+// sessions). Deliberately NOT per-task CPU%: that needs
+// configGENERATE_RUN_TIME_STATS, which the prebuilt Arduino core's sdkconfig
+// doesn't enable (same limitation noted for the watchdog config in
+// main.cpp) — these counters use only always-available Arduino/heap APIs.
+static constexpr uint32_t PERF_LOG_INTERVAL_MS = 2000;
+
+static void perf_log_tick(void) {
+    static uint32_t last_report_ms = 0;
+    uint32_t now = millis();
+    if (now - last_report_ms < PERF_LOG_INTERVAL_MS) return;
+    uint32_t elapsed_ms = now - last_report_ms;
+    last_report_ms = now;
+
+    uint32_t frames = s_frame_count; s_frame_count = 0;
+    uint32_t ticks   = s_timer_handler_count; s_timer_handler_count = 0;
+    uint32_t touches = s_touch_poll_count; s_touch_poll_count = 0;
+
+    float fps        = frames * 1000.0f / elapsed_ms;
+    float tick_rate   = ticks * 1000.0f / elapsed_ms;
+    float touch_rate  = touches * 1000.0f / elapsed_ms;
+
+    Serial.printf("[PERF] fps=%.1f lvgl_tick=%.1f/s touch_poll=%.1f/s "
+                  "heap_int=%uK heap_psram=%uK\n",
+                  fps, tick_rate, touch_rate,
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+}
+#endif
 
 // =============================================================================
 // LVGL FREERTOS TASK — Core 0, priority 5
@@ -304,6 +381,10 @@ static void lvgl_task(void* arg) {
         // The panel refreshes at 60 Hz and touch/pad delivery has its own
         // 200 Hz task. Running LVGL at 125 Hz added wakeups without producing
         // extra visible frames; align UI work with the physical display.
+#if P4_ENABLE_PERF_LOG
+        s_timer_handler_count++;
+        perf_log_tick();
+#endif
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(16));
     }
 }
