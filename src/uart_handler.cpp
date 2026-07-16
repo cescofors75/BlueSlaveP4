@@ -306,7 +306,7 @@ void uart_send_to_s3(uint8_t type, uint8_t id, uint8_t value) {
 // SEND PATTERN DATA TO S3 (extended packet)
 // =============================================================================
 void uart_send_pattern_to_s3(int pattern, const bool steps[16][16]) {
-    remember_master_pattern((uint8_t)constrain(pattern, 0, 15), steps);
+    remember_master_pattern((uint8_t)constrain(pattern, 0, Config::MAX_PATTERNS - 1), steps);
 
 #if P4_STANDALONE_MASTER_ONLY
     (void)pattern;
@@ -334,7 +334,7 @@ void uart_send_pattern_to_s3(int pattern, const bool steps[16][16]) {
     uint8_t hdr[UART_EXT_HEADER_LEN];
     hdr[0] = UART_START_EXTENDED;
     hdr[1] = MSG_PATTERN_DATA;
-    hdr[2] = (uint8_t)constrain(pattern, 0, 15);
+    hdr[2] = (uint8_t)constrain(pattern, 0, Config::MAX_PATTERNS - 1);
     hdr[3] = (plen >> 8) & 0xFF;
     hdr[4] = plen & 0xFF;
     uint8_t cs = 0;

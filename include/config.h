@@ -181,7 +181,9 @@ namespace Config {
     constexpr int MAX_STEPS     = 16;
     constexpr int MAX_TRACKS    = 16;
     constexpr int TRACKS_PER_PAGE = 8;
-    constexpr int MAX_PATTERNS  = 16;
+    // 128 = MAX_PATTERNS del master RedMaster ESP32-S3. Con 16, el P4 no podía
+    // navegar los bancos de 20+ patrones (se quedaba en el 15).
+    constexpr int MAX_PATTERNS  = 128;
     constexpr int MAX_SAMPLES   = 16;
     constexpr int MAX_VOLUME    = 150;
     constexpr int DEFAULT_BPM   = 120;

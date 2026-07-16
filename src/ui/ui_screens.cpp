@@ -239,10 +239,12 @@ static lv_obj_t* hdr_step_dots[16] = {};
 static int active_screen = 0;
 static int prev_active_screen = 0;
 
-// Track names
+// Track names — orden CANÓNICO del master/web (RedMaster app.js / carpetas de
+// samples): debe coincidir posición a posición o los pads del P4 muestran
+// etiquetas distintas a la web para el mismo track.
 static const char* trackNames[] = {
-    "BD", "SD", "CH", "OH", "CP", "CB", "RS", "CL",
-    "MA", "CY", "HT", "LT", "MC", "MT", "HC", "LC"
+    "BD", "SD", "CH", "OH", "CY", "CP", "RS", "CB",
+    "LT", "MT", "HT", "MA", "CL", "HC", "MC", "LC"
 };
 
 static int ui_layout_w(void) {
@@ -649,9 +651,19 @@ static void create_boot_screen(void) {
         lv_obj_set_style_text_color(*out, theme_text_dim(), 0);
         lv_obj_center(*out);
     };
-    make_status(-170, "●  WIFI", &s_boot_net_lbl);
-    make_status(0, "●  MASTER", &s_boot_master_lbl);
-    make_status(170, "●  AUX", &s_boot_aux_lbl);
+    // Solo WIFI y MASTER: el enlace AUX (UART a S3) no se usa en este montaje
+    // y su pill siempre-gris hacía parecer que algo fallaba en cada arranque.
+    make_status(-85, "○  WIFI", &s_boot_net_lbl);
+    make_status(85, "○  MASTER", &s_boot_master_lbl);
+    s_boot_aux_lbl = NULL;
+
+    // Firma de versión discreta (esquina inferior): confirma de un vistazo
+    // qué build corre el panel — clave en demos con varios flasheos.
+    lv_obj_t* ver = lv_label_create(scr_boot);
+    lv_label_set_text(ver, "RED808 P4 · build " __DATE__);
+    lv_obj_set_style_text_font(ver, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ver, RED808_TEXT_DIM, 0);
+    lv_obj_align(ver, LV_ALIGN_BOTTOM_RIGHT, -10, -6);
 }
 
 // =============================================================================
@@ -2616,7 +2628,7 @@ static void create_live_screen(void) {
     lv_obj_t* home_cell = create_info_cell(scr_live, COL_X(7), ROW_Y(0), CW, CH,
                                            "STATUS", "P01", RED808_WARNING, &grid_bpm_lbl);
     grid_home_vol_lbl = lv_label_create(home_cell);
-    lv_label_set_text(grid_home_vol_lbl, "MSTR --  AUX --");
+    lv_label_set_text(grid_home_vol_lbl, "MASTER --");
     lv_obj_set_style_text_font(grid_home_vol_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(grid_home_vol_lbl, RED808_CYAN, 0);
     lv_obj_align(grid_home_vol_lbl, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -3065,17 +3077,15 @@ static void update_live_screen(void) {
         lv_label_set_text_fmt(grid_bpm_lbl, "P%02d", p4.current_pattern + 1);
     }
 
+    // AUX (UART a S3) retirado del status: ese transporte no se usa en este
+    // montaje y el "AUX --" permanente solo confundía.
     static int8_t gp_prev_mstr_top = -1;
-    static int8_t gp_prev_aux_top = -1;
     bool mstr_on = ui_master_link_display_on();
-    bool aux_on  = p4.s3_connected;
-    if (grid_home_vol_lbl && ((int8_t)mstr_on != gp_prev_mstr_top || (int8_t)aux_on != gp_prev_aux_top)) {
+    if (grid_home_vol_lbl && (int8_t)mstr_on != gp_prev_mstr_top) {
         gp_prev_mstr_top = (int8_t)mstr_on;
-        gp_prev_aux_top = (int8_t)aux_on;
-        lv_label_set_text_fmt(grid_home_vol_lbl, "MSTR %s  AUX %s",
-                              mstr_on ? "OK" : "--", aux_on ? "OK" : "--");
+        lv_label_set_text_fmt(grid_home_vol_lbl, "MASTER %s", mstr_on ? "OK" : "--");
         lv_obj_set_style_text_color(grid_home_vol_lbl,
-            (mstr_on && aux_on) ? RED808_SUCCESS : (mstr_on || aux_on) ? RED808_CYAN : RED808_TEXT_DIM, 0);
+            mstr_on ? RED808_SUCCESS : RED808_TEXT_DIM, 0);
     }
 
     // Dedicated HOME controls labels
@@ -10051,9 +10061,8 @@ void ui_update_current_screen(void) {
         if (boot_enter_ms == 0) boot_enter_ms = now;
         uint32_t elapsed = now - boot_enter_ms;
         int progress = (int)constrain((int)(elapsed / 50U), 4, 96);
-        if (p4.wifi_connected) progress = max(progress, 38);
-        if (p4.master_connected) progress = max(progress, 88);
-        if (p4.s3_connected) progress = max(progress, 96);
+        if (p4.wifi_connected) progress = max(progress, 45);
+        if (p4.master_connected) progress = max(progress, 96);
         if (s_boot_progress) lv_bar_set_value(s_boot_progress, progress, LV_ANIM_ON);
         auto boot_link = [](lv_obj_t* lbl, bool on, const char* name) {
             if (!lbl) return;
@@ -10062,7 +10071,6 @@ void ui_update_current_screen(void) {
         };
         boot_link(s_boot_net_lbl, p4.wifi_connected, "WIFI");
         boot_link(s_boot_master_lbl, p4.master_connected, "MASTER");
-        boot_link(s_boot_aux_lbl, p4.s3_connected, "AUX");
         if (s_boot_status_lbl) {
             if (p4.master_connected) lv_label_set_text(s_boot_status_lbl, "MASTER READY · LOADING LIVE DECK");
             else if (p4.wifi_connected) lv_label_set_text(s_boot_status_lbl, "NETWORK READY · SYNCING MASTER");

@@ -591,7 +591,7 @@ static bool apply_pattern_http_payload(int pattern, const char* payload) {
         if (step > raw_len) raw_len = step;
     }
 
-    p4.current_pattern = clamp_int(pattern, 0, 15);
+    p4.current_pattern = clamp_int(pattern, 0, Config::MAX_PATTERNS - 1);
     ui_sequencer_load_external_pattern(raw_steps, clamp_int(raw_len, 16, 64));
     pendingPatternRequest = -1;
     pendingPatternRetries = 0;
@@ -621,7 +621,7 @@ static bool apply_master_state_http_payload(const char* payload) {
     p4.master_connected = true;
     lastMasterPacket = millis();
 
-    int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, 15);
+    int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, Config::MAX_PATTERNS - 1);
     // Don't let a periodic state poll overwrite a just-made local pattern pick.
     if (!is_pattern_owned_recent(millis())) {
         p4.current_pattern = pat;
@@ -1425,7 +1425,7 @@ static void processJsonVariant(JsonVariant doc) {
         return;
     }
     if (strcmp(eventType, "songPattern") == 0) {
-        int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, 15);
+        int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, Config::MAX_PATTERNS - 1);
         p4.current_pattern = pat;
         p4.current_step = 0;
         uart_send_to_s3(MSG_SYSTEM, SYS_PATTERN, (uint8_t)pat);
@@ -1442,7 +1442,7 @@ static void processJsonVariant(JsonVariant doc) {
     if (!cmd) return;
 
     if (strcmp(cmd, "state_sync") == 0) {
-        int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, 15);
+        int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, Config::MAX_PATTERNS - 1);
         // Suppress a stale master pattern right after a local switch. The
         // periodic state_sync can still carry the previous pattern for a cycle
         // or two; applying it would snap the UI back to the old pattern.
@@ -1570,7 +1570,7 @@ static void processJsonVariant(JsonVariant doc) {
 
     // ----- Pattern sync -----
     if (strcmp(cmd, "pattern_sync") == 0) {
-        int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, 15);
+        int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, Config::MAX_PATTERNS - 1);
         bool requested_pattern = (pendingPatternRequest == pat);
         bool matches_current   = (pat == p4.current_pattern);
         bool active_hint       = doc["active"] | false;
@@ -1677,7 +1677,7 @@ static void processJsonVariant(JsonVariant doc) {
         uart_send_pattern_to_s3(pat, p4.steps);
     }
     else if (strcmp(cmd, "pattern_row") == 0) {
-        int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, 15);
+        int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, Config::MAX_PATTERNS - 1);
         int track = clamp_int(doc["track"] | -1, -1, 15);
         int raw_len = clamp_int(doc["stepCount"] | 16, 16, 64);
         const char* row = doc["row"] | "";
@@ -1853,7 +1853,7 @@ static void processJsonVariant(JsonVariant doc) {
     // ----- Pattern selection -----
     else if (strcmp(cmd, "selectPattern") == 0 || strcmp(cmd, "pattern_select") == 0 ||
              strcmp(cmd, "current_pattern") == 0) {
-        int idx = clamp_int(doc["index"] | doc["pattern"] | 0, 0, 15);
+        int idx = clamp_int(doc["index"] | doc["pattern"] | 0, 0, Config::MAX_PATTERNS - 1);
         if (idx != p4.current_pattern) {
             p4.current_pattern = idx;
             extern void ui_sequencer_sync_from_current_pattern(void);
@@ -2068,12 +2068,15 @@ void udp_handler_process(void) {
     // --- Pattern request watchdog ---
     // If the selected pattern wasn't confirmed via pattern_sync, re-request it
     // at a controlled rate so UI/audio don't stay stuck on old steps.
+    // IMPORTANTE: solo RE-PEDIR datos (get_pattern), NUNCA re-enviar
+    // selectPattern desde aquí. El reselect convertía un watchdog de datos en
+    // una orden al master: si la web cambiaba de patrón y el pattern_sync al
+    // P4 se retrasaba/perdía, el P4 devolvía al master a su patrón pendiente
+    // (guerra de selección; la web "hacía cosas raras" con el P4 encendido).
+    // La selección solo debe salir del P4 cuando el usuario toca SU pantalla.
     if (udpStarted && masterAlive && pendingPatternRequest >= 0) {
         if (now - pendingPatternLastTxMs >= 250 && pendingPatternRetries < 12) {
             int target = pendingPatternRequest;
-            if ((pendingPatternRetries % 3) == 0) {
-                udp_send_select_pattern(target);
-            }
             udp_send_get_pattern(target);
             // UDP reply for the pending pattern is overdue (>=250 ms): fall back
             // to a rate-limited, short-timeout HTTP fetch so the grid still
