@@ -66,6 +66,9 @@
 #define LV_FONT_MONTSERRAT_36  0
 #define LV_FONT_MONTSERRAT_40  1
 #define LV_FONT_MONTSERRAT_48  0
+// Fuente pixel monospace retro (terminal 90s) — usada por la pantalla de boot.
+#define LV_FONT_UNSCII_8   1
+#define LV_FONT_UNSCII_16  1
 #define LV_FONT_DEFAULT &lv_font_montserrat_14
 
 // =============================================================================

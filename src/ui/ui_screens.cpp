@@ -566,104 +566,95 @@ void ui_update_header(void) {
 // =============================================================================
 // BOOT SCREEN
 // =============================================================================
-static lv_obj_t* s_boot_status_lbl = NULL;
+// ── Boot estilo terminal 90s (BIOS/POST) pero moderno ────────────────────────
+// Líneas que van apareciendo tipo consola con estados dinámicos ([....]→ OK)
+// y cursor de bloque parpadeante. Fuente pixel UNSCII_16 (mono retro).
+#define BOOT_TERM_LINES 8
+static lv_obj_t* s_boot_term[BOOT_TERM_LINES] = {};
+static lv_obj_t* s_boot_cursor = NULL;
 static lv_obj_t* s_boot_progress = NULL;
+// Compat: punteros antiguos, ahora sin widgets propios (líneas del terminal).
+static lv_obj_t* s_boot_status_lbl = NULL;
 static lv_obj_t* s_boot_net_lbl = NULL;
 static lv_obj_t* s_boot_master_lbl = NULL;
 static lv_obj_t* s_boot_aux_lbl = NULL;
 
+// Verde fósforo clásico, ligeramente modernizado (menos saturado que #00FF00)
+static inline lv_color_t boot_phosphor(void)     { return lv_color_hex(0x4DE87C); }
+static inline lv_color_t boot_phosphor_dim(void) { return lv_color_hex(0x2A6B44); }
+
 static void create_boot_screen(void) {
     scr_boot = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_boot, RED808_BG, 0);
-    lv_obj_set_style_bg_grad_color(scr_boot, lv_color_mix(theme_accent2(), RED808_BG, 230), 0);
-    lv_obj_set_style_bg_grad_dir(scr_boot, LV_GRAD_DIR_VER, 0);
+    // Negro CRT con un tinte verde casi imperceptible
+    lv_obj_set_style_bg_color(scr_boot, lv_color_hex(0x040906), 0);
     lv_obj_clear_flag(scr_boot, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t* halo = lv_obj_create(scr_boot);
-    lv_obj_set_size(halo, 310, 310);
-    lv_obj_align(halo, LV_ALIGN_CENTER, 0, -58);
-    lv_obj_set_style_radius(halo, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(halo, theme_accent(), 0);
-    lv_obj_set_style_bg_opa(halo, LV_OPA_10, 0);
-    lv_obj_set_style_border_color(halo, theme_accent2(), 0);
-    lv_obj_set_style_border_opa(halo, LV_OPA_30, 0);
-    lv_obj_set_style_border_width(halo, 2, 0);
-    lv_obj_set_style_shadow_color(halo, theme_accent(), 0);
-    lv_obj_set_style_shadow_width(halo, 48, 0);
-    lv_obj_set_style_shadow_opa(halo, LV_OPA_20, 0);
-    lv_obj_clear_flag(halo, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(halo, LV_OBJ_FLAG_CLICKABLE);
+    // "Scanlines" sutiles: banda superior degradada que insinúa fósforo CRT
+    lv_obj_t* glow = lv_obj_create(scr_boot);
+    lv_obj_set_size(glow, LCD_H_RES, 110);
+    lv_obj_align(glow, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(glow, boot_phosphor(), 0);
+    lv_obj_set_style_bg_opa(glow, LV_OPA_10, 0);
+    lv_obj_set_style_bg_grad_color(glow, lv_color_hex(0x040906), 0);
+    lv_obj_set_style_bg_grad_dir(glow, LV_GRAD_DIR_VER, 0);
+    lv_obj_set_style_border_width(glow, 0, 0);
+    lv_obj_clear_flag(glow, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(glow, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t* mark = lv_label_create(scr_boot);
-    lv_label_set_text(mark, "808");
-    lv_obj_set_style_text_font(mark, &lv_font_montserrat_40, 0);
-    lv_obj_set_style_text_color(mark, lv_color_mix(theme_accent(), lv_color_white(), 45), 0);
-    lv_obj_align(mark, LV_ALIGN_CENTER, 0, -86);
+    // Cabecera BIOS
+    lv_obj_t* hdr = lv_label_create(scr_boot);
+    lv_label_set_text(hdr, "RED808 BIOS v4.0 - PERFORMANCE CONTROL SURFACE");
+    lv_obj_set_style_text_font(hdr, &lv_font_unscii_16, 0);
+    lv_obj_set_style_text_color(hdr, boot_phosphor(), 0);
+    lv_obj_align(hdr, LV_ALIGN_TOP_LEFT, 36, 30);
 
-    lv_obj_t* title = lv_label_create(scr_boot);
-    lv_label_set_text(title, "RED808  ·  P4");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_40, 0);
-    lv_obj_set_style_text_color(title, theme_text(), 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, -25);
+    lv_obj_t* hr = lv_obj_create(scr_boot);
+    lv_obj_set_size(hr, LCD_H_RES - 72, 2);
+    lv_obj_align(hr, LV_ALIGN_TOP_LEFT, 36, 58);
+    lv_obj_set_style_bg_color(hr, boot_phosphor_dim(), 0);
+    lv_obj_set_style_border_width(hr, 0, 0);
+    lv_obj_clear_flag(hr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(hr, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t* sub = lv_label_create(scr_boot);
-    lv_label_set_text(sub, "PERFORMANCE CONTROL SURFACE");
-    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(sub, RED808_TEXT_DIM, 0);
-    lv_obj_align(sub, LV_ALIGN_CENTER, 0, 18);
+    // Líneas del terminal (ocultas; el loop de boot las revela en secuencia)
+    for (int i = 0; i < BOOT_TERM_LINES; i++) {
+        s_boot_term[i] = lv_label_create(scr_boot);
+        lv_label_set_text(s_boot_term[i], "");
+        lv_obj_set_style_text_font(s_boot_term[i], &lv_font_unscii_16, 0);
+        lv_obj_set_style_text_color(s_boot_term[i], boot_phosphor(), 0);
+        lv_obj_align(s_boot_term[i], LV_ALIGN_TOP_LEFT, 36, 92 + i * 34);
+        lv_obj_add_flag(s_boot_term[i], LV_OBJ_FLAG_HIDDEN);
+    }
 
-    lv_obj_t* spinner = lv_spinner_create(scr_boot, 1000, 60);
-    lv_obj_set_size(spinner, 46, 46);
-    lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 77);
-    lv_obj_set_style_arc_color(spinner, theme_border(), LV_PART_MAIN);
-    lv_obj_set_style_arc_color(spinner, theme_accent(), LV_PART_INDICATOR);
+    // Cursor de bloque parpadeante (siempre bajo la última línea visible)
+    s_boot_cursor = lv_label_create(scr_boot);
+    lv_label_set_text(s_boot_cursor, "\xE2\x96\x88");  /* █ */
+    lv_obj_set_style_text_font(s_boot_cursor, &lv_font_unscii_16, 0);
+    lv_obj_set_style_text_color(s_boot_cursor, boot_phosphor(), 0);
+    lv_obj_align(s_boot_cursor, LV_ALIGN_TOP_LEFT, 36, 92);
 
-    s_boot_status_lbl = lv_label_create(scr_boot);
-    lv_label_set_text(s_boot_status_lbl, "INITIALIZING AUDIO NETWORK");
-    lv_obj_set_style_text_font(s_boot_status_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(s_boot_status_lbl, theme_accent(), 0);
-    lv_obj_align(s_boot_status_lbl, LV_ALIGN_CENTER, 0, 121);
-
+    // Barra de progreso fina, estilo carga retro
     s_boot_progress = lv_bar_create(scr_boot);
-    lv_obj_set_size(s_boot_progress, 430, 8);
-    lv_obj_align(s_boot_progress, LV_ALIGN_CENTER, 0, 154);
+    lv_obj_set_size(s_boot_progress, LCD_H_RES - 72, 6);
+    lv_obj_align(s_boot_progress, LV_ALIGN_BOTTOM_LEFT, 36, -46);
     lv_bar_set_range(s_boot_progress, 0, 100);
     lv_bar_set_value(s_boot_progress, 4, LV_ANIM_OFF);
-    lv_obj_set_style_radius(s_boot_progress, 4, LV_PART_MAIN);
-    lv_obj_set_style_radius(s_boot_progress, 4, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_boot_progress, RED808_SURFACE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_boot_progress, theme_accent(), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_boot_progress, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_boot_progress, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_boot_progress, lv_color_hex(0x0B1A10), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_boot_progress, boot_phosphor(), LV_PART_INDICATOR);
 
-    auto make_status = [&](int x, const char* text, lv_obj_t** out) {
-        lv_obj_t* pill = lv_obj_create(scr_boot);
-        lv_obj_set_size(pill, 152, 42);
-        lv_obj_align(pill, LV_ALIGN_BOTTOM_MID, x, -22);
-        lv_obj_set_style_radius(pill, 21, 0);
-        lv_obj_set_style_bg_color(pill, RED808_SURFACE, 0);
-        lv_obj_set_style_bg_opa(pill, LV_OPA_80, 0);
-        lv_obj_set_style_border_color(pill, theme_border(), 0);
-        lv_obj_set_style_border_width(pill, 1, 0);
-        lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_clear_flag(pill, LV_OBJ_FLAG_CLICKABLE);
-        *out = lv_label_create(pill);
-        lv_label_set_text(*out, text);
-        lv_obj_set_style_text_font(*out, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(*out, theme_text_dim(), 0);
-        lv_obj_center(*out);
-    };
-    // Solo WIFI y MASTER: el enlace AUX (UART a S3) no se usa en este montaje
-    // y su pill siempre-gris hacía parecer que algo fallaba en cada arranque.
-    make_status(-85, "○  WIFI", &s_boot_net_lbl);
-    make_status(85, "○  MASTER", &s_boot_master_lbl);
-    s_boot_aux_lbl = NULL;
-
-    // Firma de versión discreta (esquina inferior): confirma de un vistazo
-    // qué build corre el panel — clave en demos con varios flasheos.
+    // Firma de build (confirma qué firmware corre — útil con varios flasheos)
     lv_obj_t* ver = lv_label_create(scr_boot);
-    lv_label_set_text(ver, "RED808 P4 · build " __DATE__);
-    lv_obj_set_style_text_font(ver, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ver, RED808_TEXT_DIM, 0);
-    lv_obj_align(ver, LV_ALIGN_BOTTOM_RIGHT, -10, -6);
+    lv_label_set_text(ver, "BUILD " __DATE__);
+    lv_obj_set_style_text_font(ver, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(ver, boot_phosphor_dim(), 0);
+    lv_obj_align(ver, LV_ALIGN_BOTTOM_RIGHT, -36, -24);
+
+    s_boot_status_lbl = NULL;
+    s_boot_net_lbl    = NULL;
+    s_boot_master_lbl = NULL;
+    s_boot_aux_lbl    = NULL;
 }
 
 // =============================================================================
@@ -10056,7 +10047,9 @@ void ui_update_current_screen(void) {
     sd_upload_consume_result();
     pad_inst_unload_consume_result();
 
-    // Auto-navigate from boot to live when Master or optional S3 connects
+    // Auto-navigate from boot to live when Master or optional S3 connects.
+    // Boot "terminal 90s": las líneas se revelan en secuencia temporal (POST)
+    // y las de red muestran estado vivo ([SCAN..]/[SYNC..] → OK).
     if (active_screen == 0) {
         if (boot_enter_ms == 0) boot_enter_ms = now;
         uint32_t elapsed = now - boot_enter_ms;
@@ -10064,18 +10057,53 @@ void ui_update_current_screen(void) {
         if (p4.wifi_connected) progress = max(progress, 45);
         if (p4.master_connected) progress = max(progress, 96);
         if (s_boot_progress) lv_bar_set_value(s_boot_progress, progress, LV_ANIM_ON);
-        auto boot_link = [](lv_obj_t* lbl, bool on, const char* name) {
-            if (!lbl) return;
-            lv_label_set_text_fmt(lbl, "%s  %s", on ? "●" : "○", name);
-            lv_obj_set_style_text_color(lbl, on ? theme_success() : theme_text_dim(), 0);
-        };
-        boot_link(s_boot_net_lbl, p4.wifi_connected, "WIFI");
-        boot_link(s_boot_master_lbl, p4.master_connected, "MASTER");
-        if (s_boot_status_lbl) {
-            if (p4.master_connected) lv_label_set_text(s_boot_status_lbl, "MASTER READY · LOADING LIVE DECK");
-            else if (p4.wifi_connected) lv_label_set_text(s_boot_status_lbl, "NETWORK READY · SYNCING MASTER");
-            else lv_label_set_text(s_boot_status_lbl, "SEARCHING RED808 NETWORK");
+
+        // Cada línea aparece a su tiempo, como un POST de BIOS.
+        static const uint32_t revealMs[BOOT_TERM_LINES] =
+            { 100, 350, 600, 850, 1100, 1500, 1900, 2300 };
+        int lastVisible = -1;
+        for (int i = 0; i < BOOT_TERM_LINES; i++) {
+            if (!s_boot_term[i]) continue;
+            if (elapsed >= revealMs[i]) {
+                lv_obj_clear_flag(s_boot_term[i], LV_OBJ_FLAG_HIDDEN);
+                lastVisible = i;
+            }
         }
+        // Contenido (las estáticas solo se pintan una vez; las de red, al cambiar)
+        static int8_t prevWifi = -1, prevMaster = -1;
+        static bool textInit = false;
+        if (!textInit && s_boot_term[0]) {
+            textInit = true;
+            lv_label_set_text(s_boot_term[0], "> CPU  ESP32-P4 RISC-V DUAL ........ OK");
+            lv_label_set_text(s_boot_term[1], "> MEM  PSRAM 32MB .................. OK");
+            lv_label_set_text(s_boot_term[2], "> GFX  LVGL 1024x600 ............... OK");
+            lv_label_set_text(s_boot_term[3], "> SND  RED808 DRUM ENGINE .......... OK");
+            lv_label_set_text(s_boot_term[4], "> PAD  16 TRACKS / 128 PATTERNS .... OK");
+            lv_label_set_text(s_boot_term[7], "> SYS  LAUNCHING LIVE DECK _");
+        }
+        if (s_boot_term[5] && (int8_t)p4.wifi_connected != prevWifi) {
+            prevWifi = (int8_t)p4.wifi_connected;
+            lv_label_set_text(s_boot_term[5], p4.wifi_connected
+                ? "> NET  WIFI RED808 ................. OK"
+                : "> NET  WIFI RED808 ................. [SCAN..]");
+        }
+        if (s_boot_term[6] && (int8_t)p4.master_connected != prevMaster) {
+            prevMaster = (int8_t)p4.master_connected;
+            lv_label_set_text(s_boot_term[6], p4.master_connected
+                ? "> LNK  MASTER S3 ................... OK"
+                : "> LNK  MASTER S3 ................... [SYNC..]");
+        }
+        // Cursor de bloque parpadeante bajo la última línea visible
+        if (s_boot_cursor) {
+            int row = lastVisible + 1;
+            lv_obj_align(s_boot_cursor, LV_ALIGN_TOP_LEFT, 36, 92 + row * 34);
+            bool on = ((now / 400U) & 1U) != 0U;
+            lv_obj_set_style_opa(s_boot_cursor, on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+        }
+        // La última línea solo tiene sentido con el master listo (o timeout)
+        if (s_boot_term[7] && !(p4.master_connected || elapsed > 4600UL))
+            lv_obj_add_flag(s_boot_term[7], LV_OBJ_FLAG_HIDDEN);
+
         if (p4.master_connected || p4.s3_connected || (now - boot_enter_ms) > 5000UL) {
             if (s_boot_progress) lv_bar_set_value(s_boot_progress, 100, LV_ANIM_OFF);
             ui_navigate_to(2);  // SCREEN_LIVE
