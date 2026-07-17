@@ -123,6 +123,23 @@ static inline bool is_pattern_owned_recent(unsigned long nowMs) {
     return lastLocalPatternMs != 0 && (nowMs - lastLocalPatternMs) < LOCAL_OWNERSHIP_MS;
 }
 
+// Arbitraje del patrón que reporta el master (state_sync UDP y poll HTTP).
+// La ventana de ownership local tapa el lag del master justo tras un cambio
+// nuestro, pero no puede ganar para siempre — con 2 slaves conectados dejaba
+// el número de patrón "haciendo el tonto". Devuelve true si hay que aplicar:
+//  - sin ownership activo → aplicar siempre;
+//  - el master confirma nuestro patrón → soltar la ventana ya, así el próximo
+//    cambio del OTRO slave entra al momento en vez de ignorarse 4 s;
+//  - el master insiste 2 veces seguidas en otro patrón → nuestro selectPattern
+//    se perdió por el camino (UDP) o el otro slave cambió: manda el master.
+static bool master_pattern_report_should_apply(int pat) {
+    static uint8_t disagree = 0;
+    if (!is_pattern_owned_recent(millis())) { disagree = 0; return true; }
+    if (pat == p4.current_pattern)  { lastLocalPatternMs = 0; disagree = 0; return true; }
+    if (++disagree >= 2)            { lastLocalPatternMs = 0; disagree = 0; return true; }
+    return false;
+}
+
 static inline bool is_fx_owned_recent(FxOwnershipIndex idx, unsigned long nowMs) {
     unsigned long stamp = lastLocalFxMs[(int)idx];
     return stamp != 0 && (nowMs - stamp) < LOCAL_OWNERSHIP_MS;
@@ -623,7 +640,7 @@ static bool apply_master_state_http_payload(const char* payload) {
 
     int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, Config::MAX_PATTERNS - 1);
     // Don't let a periodic state poll overwrite a just-made local pattern pick.
-    if (!is_pattern_owned_recent(millis())) {
+    if (master_pattern_report_should_apply(pat)) {
         p4.current_pattern = pat;
         uart_send_to_s3(MSG_SYSTEM, SYS_PATTERN, (uint8_t)pat);
     }
@@ -1446,7 +1463,7 @@ static void processJsonVariant(JsonVariant doc) {
         // Suppress a stale master pattern right after a local switch. The
         // periodic state_sync can still carry the previous pattern for a cycle
         // or two; applying it would snap the UI back to the old pattern.
-        if (!is_pattern_owned_recent(millis())) {
+        if (master_pattern_report_should_apply(pat)) {
             bool patternChanged = (pat != p4.current_pattern);
             p4.current_pattern = pat;
             uart_send_to_s3(MSG_SYSTEM, SYS_PATTERN, (uint8_t)pat);

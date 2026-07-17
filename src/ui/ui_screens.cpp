@@ -573,15 +573,17 @@ void ui_update_header(void) {
 static lv_obj_t* s_boot_term[BOOT_TERM_LINES] = {};
 static lv_obj_t* s_boot_cursor = NULL;
 static lv_obj_t* s_boot_progress = NULL;
-// Compat: punteros antiguos, ahora sin widgets propios (líneas del terminal).
 static lv_obj_t* s_boot_status_lbl = NULL;
-static lv_obj_t* s_boot_net_lbl = NULL;
-static lv_obj_t* s_boot_master_lbl = NULL;
-static lv_obj_t* s_boot_aux_lbl = NULL;
+static lv_obj_t* s_boot_continue_btn = NULL;
 
 // Verde fósforo clásico, ligeramente modernizado (menos saturado que #00FF00)
 static inline lv_color_t boot_phosphor(void)     { return lv_color_hex(0x4DE87C); }
 static inline lv_color_t boot_phosphor_dim(void) { return lv_color_hex(0x2A6B44); }
+
+static void boot_continue_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    ui_navigate_to(2);  // SCREEN_LIVE
+}
 
 static void create_boot_screen(void) {
     scr_boot = lv_obj_create(NULL);
@@ -601,16 +603,42 @@ static void create_boot_screen(void) {
     lv_obj_clear_flag(glow, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(glow, LV_OBJ_FLAG_CLICKABLE);
 
-    // Cabecera BIOS
+    // Marco perimetral fino, rollo consola de rack
+    lv_obj_t* frame = lv_obj_create(scr_boot);
+    lv_obj_set_size(frame, LCD_H_RES - 20, LCD_V_RES - 20);
+    lv_obj_center(frame);
+    lv_obj_set_style_bg_opa(frame, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(frame, boot_phosphor_dim(), 0);
+    lv_obj_set_style_border_opa(frame, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(frame, 1, 0);
+    lv_obj_set_style_radius(frame, 2, 0);
+    lv_obj_clear_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(frame, LV_OBJ_FLAG_CLICKABLE);
+
+    // Cabecera: identidad arriba a la izquierda, build a la derecha
     lv_obj_t* hdr = lv_label_create(scr_boot);
-    lv_label_set_text(hdr, "RED808 BIOS v4.0 - PERFORMANCE CONTROL SURFACE");
+    lv_label_set_text(hdr, "RED808 PERFORMANCE SYSTEM");
     lv_obj_set_style_text_font(hdr, &lv_font_unscii_16, 0);
+    lv_obj_set_style_text_letter_space(hdr, 2, 0);
     lv_obj_set_style_text_color(hdr, boot_phosphor(), 0);
-    lv_obj_align(hdr, LV_ALIGN_TOP_LEFT, 36, 30);
+    lv_obj_align(hdr, LV_ALIGN_TOP_LEFT, 44, 32);
+
+    lv_obj_t* hdr2 = lv_label_create(scr_boot);
+    lv_label_set_text(hdr2, "BIOS v4.0 - ESP32-P4 CONTROL SURFACE");
+    lv_obj_set_style_text_font(hdr2, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(hdr2, boot_phosphor_dim(), 0);
+    lv_obj_align(hdr2, LV_ALIGN_TOP_LEFT, 44, 56);
+
+    // Firma de build (confirma qué firmware corre — útil con varios flasheos)
+    lv_obj_t* ver = lv_label_create(scr_boot);
+    lv_label_set_text(ver, "BUILD " __DATE__);
+    lv_obj_set_style_text_font(ver, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(ver, boot_phosphor_dim(), 0);
+    lv_obj_align(ver, LV_ALIGN_TOP_RIGHT, -44, 56);
 
     lv_obj_t* hr = lv_obj_create(scr_boot);
-    lv_obj_set_size(hr, LCD_H_RES - 72, 2);
-    lv_obj_align(hr, LV_ALIGN_TOP_LEFT, 36, 58);
+    lv_obj_set_size(hr, LCD_H_RES - 88, 2);
+    lv_obj_align(hr, LV_ALIGN_TOP_LEFT, 44, 74);
     lv_obj_set_style_bg_color(hr, boot_phosphor_dim(), 0);
     lv_obj_set_style_border_width(hr, 0, 0);
     lv_obj_clear_flag(hr, LV_OBJ_FLAG_SCROLLABLE);
@@ -622,7 +650,7 @@ static void create_boot_screen(void) {
         lv_label_set_text(s_boot_term[i], "");
         lv_obj_set_style_text_font(s_boot_term[i], &lv_font_unscii_16, 0);
         lv_obj_set_style_text_color(s_boot_term[i], boot_phosphor(), 0);
-        lv_obj_align(s_boot_term[i], LV_ALIGN_TOP_LEFT, 36, 92 + i * 34);
+        lv_obj_align(s_boot_term[i], LV_ALIGN_TOP_LEFT, 44, 100 + i * 34);
         lv_obj_add_flag(s_boot_term[i], LV_OBJ_FLAG_HIDDEN);
     }
 
@@ -631,30 +659,52 @@ static void create_boot_screen(void) {
     lv_label_set_text(s_boot_cursor, "\xE2\x96\x88");  /* █ */
     lv_obj_set_style_text_font(s_boot_cursor, &lv_font_unscii_16, 0);
     lv_obj_set_style_text_color(s_boot_cursor, boot_phosphor(), 0);
-    lv_obj_align(s_boot_cursor, LV_ALIGN_TOP_LEFT, 36, 92);
+    lv_obj_align(s_boot_cursor, LV_ALIGN_TOP_LEFT, 44, 100);
 
-    // Barra de progreso fina, estilo carga retro
+    // Botón CONTINUE: oculto hasta que el self-test termina. El boot ya no
+    // salta solo al LIVE — así el POST se puede leer con calma.
+    s_boot_continue_btn = lv_btn_create(scr_boot);
+    lv_obj_set_size(s_boot_continue_btn, 280, 56);
+    lv_obj_align(s_boot_continue_btn, LV_ALIGN_BOTTOM_MID, 0, -118);
+    lv_obj_set_style_radius(s_boot_continue_btn, 0, 0);
+    lv_obj_set_style_bg_color(s_boot_continue_btn, boot_phosphor(), 0);
+    lv_obj_set_style_bg_opa(s_boot_continue_btn, LV_OPA_10, 0);
+    lv_obj_set_style_bg_opa(s_boot_continue_btn, LV_OPA_30, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(s_boot_continue_btn, boot_phosphor(), 0);
+    lv_obj_set_style_border_width(s_boot_continue_btn, 2, 0);
+    lv_obj_set_style_shadow_width(s_boot_continue_btn, 0, 0);
+    lv_obj_add_event_cb(s_boot_continue_btn, boot_continue_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_boot_continue_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t* cont_lbl = lv_label_create(s_boot_continue_btn);
+    lv_label_set_text(cont_lbl, "[ CONTINUE ]");
+    lv_obj_set_style_text_font(cont_lbl, &lv_font_unscii_16, 0);
+    lv_obj_set_style_text_color(cont_lbl, boot_phosphor(), 0);
+    lv_obj_center(cont_lbl);
+
+    // Pie: separador + estado + barra de progreso fina estilo carga retro
+    lv_obj_t* hr2 = lv_obj_create(scr_boot);
+    lv_obj_set_size(hr2, LCD_H_RES - 88, 1);
+    lv_obj_align(hr2, LV_ALIGN_BOTTOM_LEFT, 44, -92);
+    lv_obj_set_style_bg_color(hr2, boot_phosphor_dim(), 0);
+    lv_obj_set_style_border_width(hr2, 0, 0);
+    lv_obj_clear_flag(hr2, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(hr2, LV_OBJ_FLAG_CLICKABLE);
+
+    s_boot_status_lbl = lv_label_create(scr_boot);
+    lv_label_set_text(s_boot_status_lbl, "SELF-TEST IN PROGRESS ...");
+    lv_obj_set_style_text_font(s_boot_status_lbl, &lv_font_unscii_8, 0);
+    lv_obj_set_style_text_color(s_boot_status_lbl, boot_phosphor_dim(), 0);
+    lv_obj_align(s_boot_status_lbl, LV_ALIGN_BOTTOM_LEFT, 44, -66);
+
     s_boot_progress = lv_bar_create(scr_boot);
-    lv_obj_set_size(s_boot_progress, LCD_H_RES - 72, 6);
-    lv_obj_align(s_boot_progress, LV_ALIGN_BOTTOM_LEFT, 36, -46);
+    lv_obj_set_size(s_boot_progress, LCD_H_RES - 88, 6);
+    lv_obj_align(s_boot_progress, LV_ALIGN_BOTTOM_LEFT, 44, -42);
     lv_bar_set_range(s_boot_progress, 0, 100);
     lv_bar_set_value(s_boot_progress, 4, LV_ANIM_OFF);
     lv_obj_set_style_radius(s_boot_progress, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(s_boot_progress, 0, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(s_boot_progress, lv_color_hex(0x0B1A10), LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_boot_progress, boot_phosphor(), LV_PART_INDICATOR);
-
-    // Firma de build (confirma qué firmware corre — útil con varios flasheos)
-    lv_obj_t* ver = lv_label_create(scr_boot);
-    lv_label_set_text(ver, "BUILD " __DATE__);
-    lv_obj_set_style_text_font(ver, &lv_font_unscii_8, 0);
-    lv_obj_set_style_text_color(ver, boot_phosphor_dim(), 0);
-    lv_obj_align(ver, LV_ALIGN_BOTTOM_RIGHT, -36, -24);
-
-    s_boot_status_lbl = NULL;
-    s_boot_net_lbl    = NULL;
-    s_boot_master_lbl = NULL;
-    s_boot_aux_lbl    = NULL;
 }
 
 // =============================================================================
@@ -2459,11 +2509,18 @@ static void grid_pad_mode_cb(lv_event_t* e) {
     }
 }
 
+// Fondo con identidad de tema: degradado horizontal bg → acento secundario.
+// Es el tratamiento que estrenó el LIVE deck; ahora lo comparten todas las
+// pantallas para que el tema se sienta uno solo al navegar.
+static void apply_screen_theme_bg(lv_obj_t* scr) {
+    lv_obj_set_style_bg_color(scr, RED808_BG, 0);
+    lv_obj_set_style_bg_grad_color(scr, lv_color_mix(theme_accent2(), RED808_BG, 238), 0);
+    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_HOR, 0);
+}
+
 static void create_live_screen(void) {
     scr_live = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_live, RED808_BG, 0);
-    lv_obj_set_style_bg_grad_color(scr_live, lv_color_mix(theme_accent2(), RED808_BG, 238), 0);
-    lv_obj_set_style_bg_grad_dir(scr_live, LV_GRAD_DIR_HOR, 0);
+    apply_screen_theme_bg(scr_live);
     lv_obj_clear_flag(scr_live, LV_OBJ_FLAG_SCROLLABLE);
 
     // 8×4 full-screen grid: 1024×600
@@ -3671,7 +3728,7 @@ static void fx_xy_open_cb(lv_event_t* e) {
 
 static void create_fx_screen(void) {
     scr_fx = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_fx, RED808_BG, 0);
+    apply_screen_theme_bg(scr_fx);
     lv_obj_clear_flag(scr_fx, LV_OBJ_FLAG_SCROLLABLE);
     ui_create_header(scr_fx);
 
@@ -4058,7 +4115,7 @@ static void fxxy_back_cb(lv_event_t* e) {
 
 static void create_fx_xy_screen(void) {
     scr_fx_xy = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_fx_xy, RED808_BG, 0);
+    apply_screen_theme_bg(scr_fx_xy);
     lv_obj_clear_flag(scr_fx_xy, LV_OBJ_FLAG_SCROLLABLE);
 
     // Header row: BACK · title · mode toggle
@@ -4495,7 +4552,7 @@ void ui_sequencer_load_external_pattern(const bool steps[16][64], int raw_len) {
 
 static void create_sequencer_screen(void) {
     scr_sequencer = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_sequencer, RED808_BG, 0);
+    apply_screen_theme_bg(scr_sequencer);
     lv_obj_clear_flag(scr_sequencer, LV_OBJ_FLAG_SCROLLABLE);
     ui_create_header(scr_sequencer);
 
@@ -5330,7 +5387,7 @@ static void vol_slider_cb(lv_event_t* e) {
 
 static void create_volumes_screen(void) {
     scr_volumes = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_volumes, RED808_BG, 0);
+    apply_screen_theme_bg(scr_volumes);
     lv_obj_clear_flag(scr_volumes, LV_OBJ_FLAG_SCROLLABLE);
     ui_create_header(scr_volumes);
 
@@ -5592,6 +5649,31 @@ static void update_volumes_screen(void) {
         }
     }
     prev_init = true;
+
+    // Heartbeat: cada strip late al ritmo del patrón. Cuando su track dispara
+    // en el step actual, el borde sube a tope en su color y el fondo se
+    // ilumina un punto; luego decae en unos frames. Al llegar a cero se
+    // escribe exactamente el estilo base (OPA_40) y se deja de tocar el strip.
+    static uint8_t beat_glow[16] = {};
+    static int prev_beat_step = -1;
+    if (p4.is_playing && p4.current_step != prev_beat_step) {
+        prev_beat_step = p4.current_step;
+        for (int i = 0; i < 16; i++) {
+            if (!p4.track_muted[i] && p4.steps[i][p4.current_step]) beat_glow[i] = 255;
+        }
+    }
+    if (!p4.is_playing) prev_beat_step = -1;
+    for (int i = 0; i < 16; i++) {
+        if (!vol_strip_panels[i] || beat_glow[i] == 0) continue;
+        if (p4.track_muted[i]) { beat_glow[i] = 0; continue; }  // mute pinta su propio estado
+        int next = (int)beat_glow[i] - 40;
+        if (next < 0) next = 0;
+        beat_glow[i] = (uint8_t)next;
+        lv_obj_set_style_border_opa(vol_strip_panels[i],
+            (lv_opa_t)max((int)LV_OPA_40, next), 0);
+        lv_obj_set_style_bg_opa(vol_strip_panels[i],
+            (lv_opa_t)(LV_OPA_40 + ((next * 60) >> 8)), 0);
+    }
 }
 
 // =============================================================================
@@ -6730,7 +6812,7 @@ static void sd_refresh_ui(void) {
 
 static void create_sdcard_screen(void) {
     scr_sdcard = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_sdcard, RED808_BG, 0);
+    apply_screen_theme_bg(scr_sdcard);
     lv_obj_clear_flag(scr_sdcard, LV_OBJ_FLAG_SCROLLABLE);
 
     // Landscape layout: 1024×600
@@ -8217,7 +8299,7 @@ static void create_piano_screen(void) {
     int W = ui_layout_w();
     int H = ui_layout_h();
     scr_piano = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_piano, RED808_BG, 0);
+    apply_screen_theme_bg(scr_piano);
     lv_obj_clear_flag(scr_piano, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t* top_deck = lv_obj_create(scr_piano);
@@ -9212,7 +9294,7 @@ static void create_piano_params_screen(void) {
     }
 
     scr_piano_params = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_piano_params, RED808_BG, 0);
+    apply_screen_theme_bg(scr_piano_params);
     lv_obj_clear_flag(scr_piano_params, LV_OBJ_FLAG_SCROLLABLE);
     ui_create_header(scr_piano_params);
 
@@ -9332,7 +9414,7 @@ static void create_piano_params_screen(void) {
 // =============================================================================
 static void create_performance_screen(void) {
     scr_performance = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_performance, RED808_BG, 0);
+    apply_screen_theme_bg(scr_performance);
     lv_obj_clear_flag(scr_performance, LV_OBJ_FLAG_SCROLLABLE);
     ui_create_header(scr_performance);
 
@@ -9450,6 +9532,43 @@ void ui_create_all_screens(void) {
 // =============================================================================
 // THEME RELOAD — delete and recreate all themed screens with new colors
 // =============================================================================
+// Pantalla de aparcamiento durante el rebuild. Antes se aparcaba en scr_boot
+// y el terminal BIOS aparecía en cada cambio de tema como si fuera un glitch;
+// ahora se muestra una tarjeta mínima con los colores del tema NUEVO.
+static void theme_transition_del_cb(lv_timer_t* t) {
+    lv_obj_t* scr = (lv_obj_t*)t->user_data;
+    if (scr && scr != lv_scr_act()) lv_obj_del(scr);
+}
+
+static lv_obj_t* create_theme_transition_screen(void) {
+    lv_obj_t* scr = lv_obj_create(NULL);
+    apply_screen_theme_bg(scr);
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* tag = lv_label_create(scr);
+    lv_label_set_text(tag, "VISUAL THEME");
+    lv_obj_set_style_text_font(tag, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_letter_space(tag, 4, 0);
+    lv_obj_set_style_text_color(tag, RED808_TEXT_DIM, 0);
+    lv_obj_align(tag, LV_ALIGN_CENTER, 0, -38);
+
+    lv_obj_t* name = lv_label_create(scr);
+    lv_label_set_text(name, theme_presets[currentTheme].name);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_40, 0);
+    lv_obj_set_style_text_letter_space(name, 6, 0);
+    lv_obj_set_style_text_color(name, RED808_ACCENT, 0);
+    lv_obj_align(name, LV_ALIGN_CENTER, 0, 4);
+
+    lv_obj_t* bar = lv_obj_create(scr);
+    lv_obj_set_size(bar, 220, 4);
+    lv_obj_align(bar, LV_ALIGN_CENTER, 0, 44);
+    lv_obj_set_style_bg_color(bar, RED808_ACCENT2, 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_radius(bar, 2, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    return scr;
+}
+
 static void ui_reload_themed_screens(void) {
     int saved_screen = active_screen;
 
@@ -9475,8 +9594,10 @@ static void ui_reload_themed_screens(void) {
     s_ui_toast_label = NULL;
     s_ui_toast_until_ms = 0;
 
-    // Navigate to boot temporarily so we can safely delete active screens
-    lv_scr_load(scr_boot);
+    // Park on a minimal screen (in the NEW theme) so the active screens can
+    // be deleted safely underneath — never scr_boot, see comment above.
+    lv_obj_t* trans_scr = create_theme_transition_screen();
+    lv_scr_load(trans_scr);
 
     // Delete all themed screens (nullify pointers before delete to avoid stale refs)
     if (scr_live)        { lv_obj_del(scr_live);        scr_live        = NULL; }
@@ -9639,6 +9760,12 @@ static void ui_reload_themed_screens(void) {
     if (saved_screen == 11) nav_to = 11;   /* PIANO PARAMS (synth editor) */
     if (saved_screen == 13) nav_to = 13;   /* FX XY PAD */
     ui_navigate_to(nav_to);
+
+    // ui_navigate_to() fades into the rebuilt screen over 200 ms with the
+    // parking screen as the anim's "old screen" — it can't be deleted
+    // synchronously here, so a one-shot timer reaps it once the fade is done.
+    lv_timer_t* reap = lv_timer_create(theme_transition_del_cb, 450, trans_scr);
+    lv_timer_set_repeat_count(reap, 1);
 }
 
 void ui_navigate_to(int screen_id) {
@@ -10053,9 +10180,12 @@ void ui_update_current_screen(void) {
     if (active_screen == 0) {
         if (boot_enter_ms == 0) boot_enter_ms = now;
         uint32_t elapsed = now - boot_enter_ms;
+        // Listo cuando hay enlace (o timeout): el POST queda en pantalla y el
+        // operador entra al LIVE con el botón CONTINUE — ya no salta solo.
+        bool ready = p4.master_connected || p4.s3_connected || elapsed > 5000UL;
         int progress = (int)constrain((int)(elapsed / 50U), 4, 96);
         if (p4.wifi_connected) progress = max(progress, 45);
-        if (p4.master_connected) progress = max(progress, 96);
+        if (ready) progress = 100;
         if (s_boot_progress) lv_bar_set_value(s_boot_progress, progress, LV_ANIM_ON);
 
         // Cada línea aparece a su tiempo, como un POST de BIOS.
@@ -10079,7 +10209,7 @@ void ui_update_current_screen(void) {
             lv_label_set_text(s_boot_term[2], "> GFX  LVGL 1024x600 ............... OK");
             lv_label_set_text(s_boot_term[3], "> SND  RED808 DRUM ENGINE .......... OK");
             lv_label_set_text(s_boot_term[4], "> PAD  16 TRACKS / 128 PATTERNS .... OK");
-            lv_label_set_text(s_boot_term[7], "> SYS  LAUNCHING LIVE DECK _");
+            lv_label_set_text(s_boot_term[7], "> SYS  WAITING FOR LINK ............ [....]");
         }
         if (s_boot_term[5] && (int8_t)p4.wifi_connected != prevWifi) {
             prevWifi = (int8_t)p4.wifi_connected;
@@ -10096,17 +10226,29 @@ void ui_update_current_screen(void) {
         // Cursor de bloque parpadeante bajo la última línea visible
         if (s_boot_cursor) {
             int row = lastVisible + 1;
-            lv_obj_align(s_boot_cursor, LV_ALIGN_TOP_LEFT, 36, 92 + row * 34);
+            lv_obj_align(s_boot_cursor, LV_ALIGN_TOP_LEFT, 44, 100 + row * 34);
             bool on = ((now / 400U) & 1U) != 0U;
             lv_obj_set_style_opa(s_boot_cursor, on ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
         }
-        // La última línea solo tiene sentido con el master listo (o timeout)
-        if (s_boot_term[7] && !(p4.master_connected || elapsed > 4600UL))
-            lv_obj_add_flag(s_boot_term[7], LV_OBJ_FLAG_HIDDEN);
 
-        if (p4.master_connected || p4.s3_connected || (now - boot_enter_ms) > 5000UL) {
-            if (s_boot_progress) lv_bar_set_value(s_boot_progress, 100, LV_ANIM_OFF);
-            ui_navigate_to(2);  // SCREEN_LIVE
+        // Self-test completo: cerrar el POST y revelar el botón CONTINUE.
+        // Se espera a que la secuencia de líneas termine (revealMs[7]) para
+        // que el botón no aparezca con el terminal a medio escribir.
+        static bool readyShown = false;
+        if (ready && !readyShown && elapsed >= revealMs[BOOT_TERM_LINES - 1] + 200) {
+            readyShown = true;
+            if (s_boot_term[7])
+                lv_label_set_text(s_boot_term[7], "> SYS  SELF-TEST COMPLETE .......... OK");
+            if (s_boot_status_lbl)
+                lv_label_set_text(s_boot_status_lbl, "SYSTEM READY - PRESS CONTINUE");
+            if (s_boot_continue_btn)
+                lv_obj_clear_flag(s_boot_continue_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        // Parpadeo suave del borde del botón mientras espera al operador
+        if (readyShown && s_boot_continue_btn) {
+            bool blink = ((now / 500U) & 1U) != 0U;
+            lv_obj_set_style_border_opa(s_boot_continue_btn,
+                blink ? LV_OPA_COVER : LV_OPA_40, 0);
         }
     } else {
         boot_enter_ms = 0;
