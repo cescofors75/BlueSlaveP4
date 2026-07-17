@@ -16,6 +16,10 @@ void udp_handler_process(void);
 bool udp_wifi_connected(void);
 bool udp_master_connected(void);
 
+// Absolute playing step (0..63) of the master pattern. p4.current_step is
+// folded to 0..15 for the 16-step widgets; multi-bar pad sync needs this.
+int udp_current_step_raw(void);
+
 // =============================================================================
 // Commands to Master (P4 → Master)
 // =============================================================================

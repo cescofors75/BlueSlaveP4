@@ -720,6 +720,10 @@ static lv_obj_t* live_spectrum_bars[16] = {};  // spectrum bar per pad (bottom o
 static lv_obj_t* live_home_panels[24] = {};
 static int       live_home_panel_count = 0;
 
+// Defined after the sequencer raw grid (multi-bar patterns): true when the
+// track has a hit on the step that is actually SOUNDING right now.
+static bool live_step_hit(int track);
+
 // Pad layout mode: 0=16 normal, 1=16 FS, 2=8 FS, 3=4 FS, 4=2 FS, 5=1 FS
 static int        s_pad_mode      = 0;
 static lv_obj_t*  s_pad_back_btn  = NULL;
@@ -2997,7 +3001,7 @@ static void update_live_screen(void) {
         }
         // Sequencer sync floor: if this pad is active on the current step,
         // render at mid brightness so the groove is always visible.
-        if (!muted && sync_pads_active && p4.is_playing && p4.steps[i][p4.current_step]) {
+        if (!muted && sync_pads_active && p4.is_playing && live_step_hit(i)) {
             if (band < 4) band = 4;
         }
         if (band == pad_prev_band[i]) continue;
@@ -3071,7 +3075,7 @@ static void update_live_screen(void) {
         if (!live_pad_btns[i]) continue;
         bool muted = p4.track_muted[i];
         bool solo = p4.track_solo[i];
-        bool step_lit = !muted && p4.is_playing && p4.steps[i][p4.current_step];
+        bool step_lit = !muted && p4.is_playing && live_step_hit(i);
         if (!force_refresh &&
             muted == prev_muted[i] && solo == prev_solo[i] &&
             step_lit == prev_step_lit[i] && p4.is_playing == prev_live_playing) {
@@ -4228,6 +4232,21 @@ static int        seq_step_x[16]        = {};  // precomputed step column X
 // ── Multi-bar pagination (populated by MEM-MIDI load with raw grid) ────────
 static bool       seq_raw_grid[16][64]  = {};   // up to 4 bars of raw steps
 static int        seq_raw_len           = 16;   // 16/32/48/64
+
+// Paso sonando de verdad para el sync de pads. p4.steps solo contiene la
+// página visible del sequencer y p4.current_step va plegado a 0..15, así que
+// con patrones de 2+ compases los golpes exclusivos del compás 2 (típicamente
+// las voces generadas: acordes, respuestas, vueltas de toms) sonaban sin
+// marcarse en los pads. Con la rejilla RAW y el paso absoluto del master, el
+// pad marca exactamente lo que suena.
+static bool live_step_hit(int track) {
+    if (track < 0 || track > 15) return false;
+    if (seq_raw_len > 16) {
+        int rs = udp_current_step_raw() % seq_raw_len;
+        return seq_raw_grid[track][rs];
+    }
+    return p4.steps[track][p4.current_step];
+}
 static int        seq_page              = 0;    // 0..3
 static bool       seq_force_refresh_cells = false; // force full cell repaint on next update_sequencer_screen
 static lv_obj_t*  seq_page_btns[4]      = {};

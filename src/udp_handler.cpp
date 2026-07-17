@@ -413,8 +413,16 @@ static inline void mark_local_step_edit(int track, int step) {
     lastLocalStepMs[track][step] = millis();
 }
 
+// Paso absoluto (0..63) del patrón sonando en el master. p4.current_step
+// va plegado a 0..15 para los widgets de 16 pasos; los pads en modo sync
+// necesitan el paso real para iluminar el compás 2+ de patrones largos.
+static int s_step_raw = 0;
+
+int udp_current_step_raw(void) { return s_step_raw; }
+
 static inline void apply_master_step_sync(int step) {
-    int normalized = clamp_int(step, 0, 63) % 16;
+    s_step_raw = clamp_int(step, 0, 63);
+    int normalized = s_step_raw % 16;
     p4.current_step = normalized;
     lastMasterStepSyncMs = millis();
     // Keep a phase-locked local clock and slightly compensate network lag
@@ -1445,6 +1453,7 @@ static void processJsonVariant(JsonVariant doc) {
         int pat = clamp_int(doc["pattern"] | p4.current_pattern, 0, Config::MAX_PATTERNS - 1);
         p4.current_pattern = pat;
         p4.current_step = 0;
+        s_step_raw = 0;
         uart_send_to_s3(MSG_SYSTEM, SYS_PATTERN, (uint8_t)pat);
         uart_send_to_s3(MSG_SYSTEM, SYS_STEP, 0);
         udp_send_get_pattern(pat);
@@ -1725,20 +1734,22 @@ static void processJsonVariant(JsonVariant doc) {
     // ----- Play state -----
     else if (strcmp(cmd, "play_state") == 0) {
         p4.is_playing = doc["playing"] | false;
-        if (p4.is_playing) p4.current_step = 0;
-        else p4.current_step = 0;
+        p4.current_step = 0;
+        s_step_raw = 0;
         uart_send_to_s3(MSG_SYSTEM, SYS_PLAY_STATE, p4.is_playing ? 1 : 0);
         uart_send_to_s3(MSG_SYSTEM, SYS_STEP, 0);
     }
     else if (strcmp(cmd, "start") == 0) {
         p4.is_playing = true;
         p4.current_step = 0;
+        s_step_raw = 0;
         uart_send_to_s3(MSG_SYSTEM, SYS_PLAY_STATE, 1);
         uart_send_to_s3(MSG_SYSTEM, SYS_STEP, 0);
     }
     else if (strcmp(cmd, "stop") == 0) {
         p4.is_playing = false;
         p4.current_step = 0;
+        s_step_raw = 0;
         uart_send_to_s3(MSG_SYSTEM, SYS_PLAY_STATE, 0);
         uart_send_to_s3(MSG_SYSTEM, SYS_STEP, 0);
     }
@@ -2021,6 +2032,9 @@ static void run_local_step_clock(unsigned long now) {
         do {
             lastStepUs += stepIntervalUs;
             p4.current_step = (p4.current_step + 1) % 16;
+            // 192 = mcm(16,32,48,64): el módulo por longitud real que hace
+            // la UI sigue en fase para cualquier largo de patrón.
+            s_step_raw = (s_step_raw + 1) % 192;
         } while ((uint32_t)(nowUs - lastStepUs) >= stepIntervalUs);
         uart_send_to_s3(MSG_SYSTEM, SYS_STEP, (uint8_t)p4.current_step);
     }
