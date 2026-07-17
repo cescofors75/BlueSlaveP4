@@ -81,6 +81,15 @@ static uint32_t s_last_solo_tx_ms[16] = {};
 static bool s_last_mute_tx_val[16] = {};
 static bool s_last_solo_tx_val[16] = {};
 
+// Same idea for the pattern number. After we push SYS_PATTERN to the S3, its
+// own periodic state can still cross ours on the wire carrying the OLD
+// pattern; relaying that back to the master re-selects the old slot and the
+// two P4s enter a visible new/old flip-flop war. Window is longer than the
+// track guard because the S3 applies pattern payloads slowly.
+static const uint32_t PATTERN_ECHO_GUARD_MS = 2000;
+static uint32_t s_last_pat_tx_ms = 0;
+static uint8_t  s_last_pat_tx_val = 0xFF;
+
 // Packed cross-core melody snapshot. Bit 31 is the pending marker.
 static std::atomic<uint32_t> s_pending_melody{0};
 
@@ -282,6 +291,9 @@ void uart_send_to_s3(uint8_t type, uint8_t id, uint8_t value) {
                 s_last_solo_tx_val[trk] = (value != 0);
             }
         }
+    } else if (type == MSG_SYSTEM && id == SYS_PATTERN) {
+        s_last_pat_tx_ms = millis();
+        s_last_pat_tx_val = value;
     }
 
 #if P4_USB_CDC_ENABLED
@@ -479,6 +491,26 @@ static void process_basic(const UartBasicPacket* pkt, bool from_usb) {
                     }
                     break;
                 case SYS_PATTERN:
+                    // Confirmation of what we already display. Serve the S3
+                    // the payload in case it is (re)syncing, but don't relay
+                    // a re-select to the master — that just churned it.
+                    if (val == p4.current_pattern) {
+                        if (uart_restore_cached_pattern(val)) {
+                            uart_send_pattern_to_s3(val, p4.steps);
+                        }
+                        break;
+                    }
+                    // Stale echo: right after WE pushed a pattern to the S3
+                    // (master-initiated switch), its periodic state can still
+                    // arrive carrying the OLD slot. Relaying that would order
+                    // the master back and start a new/old flip-flop war
+                    // between the connected P4s. Drop it; the S3 catches up
+                    // from the pattern payload already in flight.
+                    if (s_last_pat_tx_ms != 0 &&
+                        millis() - s_last_pat_tx_ms < PATTERN_ECHO_GUARD_MS &&
+                        val != s_last_pat_tx_val) {
+                        break;
+                    }
                     p4.current_pattern = val;
                     if (uart_restore_cached_pattern(val)) {
                         uart_send_pattern_to_s3(val, p4.steps);
