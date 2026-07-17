@@ -576,9 +576,11 @@ static lv_obj_t* s_boot_progress = NULL;
 static lv_obj_t* s_boot_status_lbl = NULL;
 static lv_obj_t* s_boot_continue_btn = NULL;
 
-// Verde fósforo clásico, ligeramente modernizado (menos saturado que #00FF00)
-static inline lv_color_t boot_phosphor(void)     { return lv_color_hex(0x4DE87C); }
-static inline lv_color_t boot_phosphor_dim(void) { return lv_color_hex(0x2A6B44); }
+// Colores del boot ligados al tema activo (currentTheme) — ui_theme_apply()
+// ya se llama con el tema persistido del usuario antes de crear esta pantalla
+// (ver main.cpp: settings_load() + ui_theme_apply() preceden a create_boot_screen()).
+static inline lv_color_t boot_phosphor(void)     { return theme_accent(); }
+static inline lv_color_t boot_phosphor_dim(void) { return theme_text_dim(); }
 
 static void boot_continue_cb(lv_event_t* e) {
     LV_UNUSED(e);
@@ -587,8 +589,8 @@ static void boot_continue_cb(lv_event_t* e) {
 
 static void create_boot_screen(void) {
     scr_boot = lv_obj_create(NULL);
-    // Negro CRT con un tinte verde casi imperceptible
-    lv_obj_set_style_bg_color(scr_boot, lv_color_hex(0x040906), 0);
+    // Fondo del tema activo del usuario (Ocean por defecto, ver settings_store.cpp)
+    lv_obj_set_style_bg_color(scr_boot, theme_bg(), 0);
     lv_obj_clear_flag(scr_boot, LV_OBJ_FLAG_SCROLLABLE);
 
     // "Scanlines" sutiles: banda superior degradada que insinúa fósforo CRT
@@ -597,7 +599,7 @@ static void create_boot_screen(void) {
     lv_obj_align(glow, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(glow, boot_phosphor(), 0);
     lv_obj_set_style_bg_opa(glow, LV_OPA_10, 0);
-    lv_obj_set_style_bg_grad_color(glow, lv_color_hex(0x040906), 0);
+    lv_obj_set_style_bg_grad_color(glow, theme_bg(), 0);
     lv_obj_set_style_bg_grad_dir(glow, LV_GRAD_DIR_VER, 0);
     lv_obj_set_style_border_width(glow, 0, 0);
     lv_obj_clear_flag(glow, LV_OBJ_FLAG_SCROLLABLE);
@@ -617,7 +619,7 @@ static void create_boot_screen(void) {
 
     // Cabecera: identidad arriba a la izquierda, build a la derecha
     lv_obj_t* hdr = lv_label_create(scr_boot);
-    lv_label_set_text(hdr, "RED808 PERFORMANCE SYSTEM");
+    lv_label_set_text(hdr, "BLUESLAVEP4 PERFORMANCE SYSTEM");
     lv_obj_set_style_text_font(hdr, &lv_font_unscii_16, 0);
     lv_obj_set_style_text_letter_space(hdr, 2, 0);
     lv_obj_set_style_text_color(hdr, boot_phosphor(), 0);
@@ -703,7 +705,7 @@ static void create_boot_screen(void) {
     lv_bar_set_value(s_boot_progress, 4, LV_ANIM_OFF);
     lv_obj_set_style_radius(s_boot_progress, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(s_boot_progress, 0, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(s_boot_progress, lv_color_hex(0x0B1A10), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_boot_progress, theme_panel(), LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_boot_progress, boot_phosphor(), LV_PART_INDICATOR);
 }
 
@@ -10227,7 +10229,7 @@ void ui_update_current_screen(void) {
             lv_label_set_text(s_boot_term[1], "> MEM  PSRAM 32MB .................. OK");
             lv_label_set_text(s_boot_term[2], "> GFX  LVGL 1024x600 ............... OK");
             lv_label_set_text(s_boot_term[3], "> SND  RED808 DRUM ENGINE .......... OK");
-            lv_label_set_text(s_boot_term[4], "> PAD  16 TRACKS / 128 PATTERNS .... OK");
+            lv_label_set_text(s_boot_term[4], "> PAD  20 TRACKS / 128 PATTERNS .... OK");
             lv_label_set_text(s_boot_term[7], "> SYS  WAITING FOR LINK ............ [....]");
         }
         if (s_boot_term[5] && (int8_t)p4.wifi_connected != prevWifi) {
