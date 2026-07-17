@@ -1,0 +1,13 @@
+{
+    "configurations": [
+        {
+            "name": "PlatformIO (BlueSlaveP4 / esp32p4-fs)",
+            "compileCommands": "${workspaceFolder}/.pio/build/esp32p4-fs/compile_commands.json",
+            "compilerPath": "C:/Users/cesco/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-gcc.exe",
+            "cStandard": "gnu17",
+            "cppStandard": "gnu++2b",
+            "intelliSenseMode": "linux-gcc-x86"
+        }
+    ],
+    "version": 4
+}
