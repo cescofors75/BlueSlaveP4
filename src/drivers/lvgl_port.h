@@ -20,6 +20,11 @@ lv_indev_t* lvgl_port_get_touch_indev(void);
 // Returns 0 when no finger is currently active.
 uint8_t lvgl_port_get_touch_velocity(void);
 
+// millis() timestamp of the last real touch (any point, anywhere on screen).
+// Reliable idle detector for the QR screensaver — updated from the touch task,
+// the single choke point for all GT911 input.
+uint32_t lvgl_port_last_touch_ms(void);
+
 // Thread safety — wrap LVGL API calls from outside the LVGL task
 bool lvgl_port_lock(int timeout_ms);
 void lvgl_port_unlock(void);

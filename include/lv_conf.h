@@ -116,6 +116,14 @@
 #define LV_USE_GRID       1
 
 // =============================================================================
+// EXTRA LIBRARIES
+// =============================================================================
+// PNG decoder (lodepng) — used by the QR screensaver, which loads
+// /Img/pantallaQR.png from SPIFFS into a PSRAM buffer and decodes it from
+// memory (no LVGL filesystem driver required).
+#define LV_USE_PNG              1
+
+// =============================================================================
 // MISC
 // =============================================================================
 #define LV_USE_THEME_DEFAULT    1

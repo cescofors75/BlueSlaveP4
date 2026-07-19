@@ -256,6 +256,11 @@ static constexpr uint32_t TOUCH_POLL_ACTIVE_MS = 5;    // 200Hz while warm
 static constexpr uint32_t TOUCH_POLL_IDLE_MS   = 20;   // 50Hz once cold
 static constexpr uint32_t TOUCH_WARM_MS        = 250;  // stay warm this long after last touch
 
+// millis() of the last real finger-down, updated from the touch task (the one
+// choke point for all GT911 input). Read by the QR screensaver's idle check.
+static volatile uint32_t s_last_touch_ms = 0;
+uint32_t lvgl_port_last_touch_ms(void) { return s_last_touch_ms; }
+
 #if P4_ENABLE_PERF_LOG
 static volatile uint32_t s_touch_poll_count = 0;
 #endif
@@ -314,6 +319,7 @@ static void touch_task(void* arg) {
 
         uint32_t now = millis();
         if (any_touch) last_active_ms = now;
+        if (any_touch) s_last_touch_ms = now;
         bool warm = (now - last_active_ms) < TOUCH_WARM_MS;
         vTaskDelay(pdMS_TO_TICKS(warm ? TOUCH_POLL_ACTIVE_MS : TOUCH_POLL_IDLE_MS));
     }

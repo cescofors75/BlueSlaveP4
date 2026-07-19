@@ -222,6 +222,7 @@ lv_obj_t* scr_performance = NULL;
 lv_obj_t* scr_piano = NULL;       /* v2.6 — PIANO live keyboard */
 lv_obj_t* scr_piano_params = NULL; /* v2.7 — synth engine parameter editor */
 lv_obj_t* scr_fx_xy = NULL;       /* v3.2 — FX XY performance pad */
+static lv_obj_t* scr_screensaver = NULL; /* QR screensaver (60s idle) */
 
 // Header widgets
 static lv_obj_t* header_bar = NULL;
@@ -1077,17 +1078,14 @@ static void xtra_param_save_tick(void) {
     }
 }
 
-static const char* xtra_slot_mode_label(int slot) {
-    if (slot < 0 || slot >= 4) return "SMP";
-    if (!s_xtra_slots[slot].synth_mode) return "SMP";
-    return XTRA_SYNTH_ENGINE_NAMES[s_xtra_slots[slot].synth_engine_idx & 0x07];
-}
-
 static void xtra_apply_default_slots(void) {
+    // XTRA pads: solo sampler — la selección de kit/instrumento/engine se
+    // quitó de la UI (ver xtra_change_cb), así que los slots ya no arrancan
+    // en modo synth por defecto.
     for (int i = 0; i < 4; i++) {
         s_xtra_slots[i].used = true;
         s_xtra_slots[i].pad = xtra_backing_pad_for_slot(i);
-        s_xtra_slots[i].synth_mode = true;
+        s_xtra_slots[i].synth_mode = false;
         s_xtra_slots[i].synth_engine_idx = (uint8_t)i;
         s_xtra_slots[i].preset_idx = 0;
         s_xtra_slots[i].trim_start_pct = 0;
@@ -1098,9 +1096,7 @@ static void xtra_apply_default_slots(void) {
         s_xtra_slots[i].sample_rate = 0;
         s_xtra_slots[i].channels = 0;
         s_xtra_slots[i].bits = 0;
-        snprintf(s_xtra_slots[i].name, sizeof(s_xtra_slots[i].name), "%s %s",
-                 XTRA_SYNTH_ENGINE_NAMES[s_xtra_slots[i].synth_engine_idx],
-                 XTRA_PRESET_LABELS[s_xtra_slots[i].preset_idx]);
+        s_xtra_slots[i].name[0] = '\0';
         xtra_reset_slot_params(i);
     }
 }
@@ -1405,7 +1401,11 @@ static void xtra_load_state(void) {
             s_xtra_slots[idx].used = (used != 0);
             // Enforce fixed XTRA backing slots (16..19) regardless of legacy file values.
             s_xtra_slots[idx].pad = xtra_backing_pad_for_slot(idx);
-            s_xtra_slots[idx].synth_mode = (parsed >= 4) ? (synth_mode != 0) : true;
+            // XTRA pads son solo sampler ahora (sin selección de kit/engine en
+            // la UI) — ignoramos el synth_mode guardado por configuraciones
+            // antiguas para que no reaparezca un slot en modo synth.
+            (void)synth_mode;
+            s_xtra_slots[idx].synth_mode = false;
             s_xtra_slots[idx].synth_engine_idx = (uint8_t)constrain((int)synth_engine_idx, 0, 7);
             s_xtra_slots[idx].preset_idx = (uint8_t)constrain((int)preset_idx, 0, 2);
             s_xtra_slots[idx].trim_start_pct = (uint8_t)constrain((int)trim_start, 0, 95);
@@ -1469,7 +1469,8 @@ static void xtra_refresh_panel(void) {
             lv_obj_set_style_border_color(grid_xtra_change_btns[i], accent, 0);
             lv_obj_t* lbl = lv_obj_get_child(grid_xtra_change_btns[i], 0);
             if (lbl) {
-                lv_label_set_text_fmt(lbl, "MODE\n%s", xtra_slot_mode_label(i));
+                // Sin selección de kit/engine: este botón solo sube un sample.
+                lv_label_set_text(lbl, "SUBIR\nWAV");
                 lv_obj_set_style_text_color(lbl, accent, 0);
             }
         }
@@ -1486,23 +1487,15 @@ static void xtra_refresh_panel(void) {
 }
 
 static void xtra_change_cb(lv_event_t* e) {
+    // XTRA pads: la selección de kit/instrumento/engine se quitó de la UI —
+    // este botón (antes "ENG"/"MODE") ahora es un segundo disparador de
+    // subida de sample, igual que el botón LOAD, para que XTRA PADS sea
+    // "solo subir samplers" como en la web.
     int slot = (int)(intptr_t)lv_event_get_user_data(e);
     if (slot < 0 || slot >= 4) return;
     s_xtra_slots[slot].used = true;
-    if (!s_xtra_slots[slot].synth_mode) {
-        s_xtra_slots[slot].synth_mode = true;
-        s_xtra_slots[slot].synth_engine_idx = 0;
-        s_xtra_slots[slot].preset_idx = 0;
-    } else if (s_xtra_slots[slot].synth_engine_idx >= 7) {
-        s_xtra_slots[slot].synth_mode = false;
-    } else {
-        s_xtra_slots[slot].synth_engine_idx = (uint8_t)(s_xtra_slots[slot].synth_engine_idx + 1);
-        s_xtra_slots[slot].preset_idx = 0;
-    }
-    xtra_reset_slot_params(slot);
-    xtra_slot_refresh_name(slot);
-    xtra_save_state();
-    xtra_refresh_panel();
+    s_xtra_slots[slot].synth_mode = false;
+    xtra_begin_load_for_slot(slot);
 }
 
 static void xtra_delete_cb(lv_event_t* e) {
@@ -5505,6 +5498,7 @@ static void create_volumes_screen(void) {
         lv_obj_set_style_border_width(vol_strip_panels[i], 1, 0);
         lv_obj_set_style_border_color(vol_strip_panels[i], tc, 0);
         lv_obj_set_style_border_opa(vol_strip_panels[i], LV_OPA_40, 0);
+        lv_obj_set_style_shadow_width(vol_strip_panels[i], 0, 0);
         lv_obj_set_style_pad_all(vol_strip_panels[i], 0, 0);
         lv_obj_clear_flag(vol_strip_panels[i], LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(vol_strip_panels[i], LV_OBJ_FLAG_CLICKABLE);
@@ -5672,28 +5666,44 @@ static void update_volumes_screen(void) {
     prev_init = true;
 
     // Heartbeat: cada strip late al ritmo del patrón. Cuando su track dispara
-    // en el step actual, el borde sube a tope en su color y el fondo se
-    // ilumina un punto; luego decae en unos frames. Al llegar a cero se
-    // escribe exactamente el estilo base (OPA_40) y se deja de tocar el strip.
+    // en el step actual, el borde sube a tope en su color, el fondo se
+    // ilumina y ahora además se añade un glow (shadow) en el color de la
+    // pista para que el golpe se note mucho más — antes solo subía opacidad
+    // de borde/fondo y era poco visible; luego decae en unos frames. Al
+    // llegar a cero se restaura el estilo base y se deja de tocar el strip.
+    // Usa live_step_hit() (no p4.steps[][] directo) para que patrones de 2+
+    // compases laten igual que el resto de pantallas sincronizadas por pads.
     static uint8_t beat_glow[16] = {};
     static int prev_beat_step = -1;
-    if (p4.is_playing && p4.current_step != prev_beat_step) {
-        prev_beat_step = p4.current_step;
+    int raw_step_now = udp_current_step_raw();
+    if (p4.is_playing && raw_step_now != prev_beat_step) {
+        prev_beat_step = raw_step_now;
         for (int i = 0; i < 16; i++) {
-            if (!p4.track_muted[i] && p4.steps[i][p4.current_step]) beat_glow[i] = 255;
+            if (!p4.track_muted[i] && live_step_hit(i)) beat_glow[i] = 255;
         }
     }
     if (!p4.is_playing) prev_beat_step = -1;
     for (int i = 0; i < 16; i++) {
         if (!vol_strip_panels[i] || beat_glow[i] == 0) continue;
-        if (p4.track_muted[i]) { beat_glow[i] = 0; continue; }  // mute pinta su propio estado
+        if (p4.track_muted[i]) {
+            beat_glow[i] = 0;
+            lv_obj_set_style_shadow_width(vol_strip_panels[i], 0, 0);
+            continue;  // mute pinta su propio estado
+        }
         int next = (int)beat_glow[i] - 40;
         if (next < 0) next = 0;
         beat_glow[i] = (uint8_t)next;
+        lv_color_t tc = lv_color_hex(theme_presets[currentTheme].track_colors[i]);
         lv_obj_set_style_border_opa(vol_strip_panels[i],
             (lv_opa_t)max((int)LV_OPA_40, next), 0);
         lv_obj_set_style_bg_opa(vol_strip_panels[i],
             (lv_opa_t)(LV_OPA_40 + ((next * 60) >> 8)), 0);
+        lv_coord_t shadow_w = (lv_coord_t)(4 + (next * 22) / 255);
+        lv_opa_t shadow_opa = (lv_opa_t)((next * 220) / 255);
+        lv_obj_set_style_shadow_color(vol_strip_panels[i], tc, 0);
+        lv_obj_set_style_shadow_width(vol_strip_panels[i], next > 0 ? shadow_w : 0, 0);
+        lv_obj_set_style_shadow_opa(vol_strip_panels[i], shadow_opa, 0);
+        lv_obj_set_style_shadow_spread(vol_strip_panels[i], next > 0 ? 2 : 0, 0);
     }
 }
 
@@ -6504,9 +6514,13 @@ static void sd_upload_task(void* arg) {
     client.stop();
 
     job.http_status = status;
-    if (!write_ok)           job.result = SD_UP_WRITE_CUT;
-    else if (status != 200)  job.result = SD_UP_HTTP_ERROR;
-    else                     job.result = SD_UP_OK;
+    // S3 /api/uploadDaisy replies 202 ("staged, streaming to Daisy...") on
+    // success, not 200 — the sample keeps streaming to the Daisy after the
+    // HTTP response. Treat both as success; anything else (400/409/...) is
+    // a real error.
+    if (!write_ok)                             job.result = SD_UP_WRITE_CUT;
+    else if (status != 200 && status != 202)   job.result = SD_UP_HTTP_ERROR;
+    else                                        job.result = SD_UP_OK;
     s_sd_upload_progress.store(job.result == SD_UP_OK ? 100 : 0, std::memory_order_release);
     s_sd_upload_state.store(2, std::memory_order_release);
     vTaskDelete(NULL);
@@ -9512,7 +9526,7 @@ static void create_performance_screen(void) {
         lv_obj_add_event_cb(grid_xtra_change_btns[i], xtra_change_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
         lv_obj_add_event_cb(grid_xtra_change_btns[i], xtra_edit_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)i);
         lv_obj_t* ch_lbl = lv_label_create(grid_xtra_change_btns[i]);
-        lv_label_set_text(ch_lbl, "ENG\n808");
+        lv_label_set_text(ch_lbl, "SUBIR\nWAV");
         lv_obj_set_style_text_font(ch_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_align(ch_lbl, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_center(ch_lbl);
@@ -10166,6 +10180,103 @@ void ui_pad_frame_update(const bool pressed[16], const uint8_t velocity[16],
     }
 }
 
+// =============================================================================
+// QR SCREENSAVER — muestra /Img/pantallaQR.png tras 60s sin tocar la pantalla.
+// El PNG se carga una vez desde SPIFFS a un buffer en PSRAM y se decodifica
+// desde memoria (lodepng, LV_USE_PNG), sin driver de filesystem de LVGL.
+// Cualquier toque restablece el contador de inactividad de LVGL y devuelve
+// a la pantalla anterior.
+// =============================================================================
+static const uint32_t SCREENSAVER_TIMEOUT_MS = 60000;   // 1 minuto
+static bool     s_screensaver_active = false;
+static int      s_screensaver_return = 2;               // pantalla a restaurar
+static uint8_t* s_qr_png_data = nullptr;                // PNG crudo en PSRAM
+static lv_img_dsc_t s_qr_img_dsc;                       // descriptor para LVGL
+
+static bool screensaver_load_png(void) {
+    if (s_qr_png_data) return true;
+    File f = SPIFFS.open("/Img/pantallaQR.png", "r");
+    if (!f) {
+        P4_LOG_PRINTLN("[SAVER] pantallaQR.png no encontrado en SPIFFS");
+        return false;
+    }
+    size_t sz = f.size();
+    if (sz == 0) { f.close(); return false; }
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(sz, MALLOC_CAP_SPIRAM);
+    if (!buf) { f.close(); return false; }
+    size_t rd = f.read(buf, sz);
+    f.close();
+    if (rd != sz) { heap_caps_free(buf); return false; }
+
+    s_qr_png_data = buf;
+    memset(&s_qr_img_dsc, 0, sizeof(s_qr_img_dsc));
+    s_qr_img_dsc.header.always_zero = 0;
+    // El decodificador PNG de LVGL decodifica a TRUE_COLOR_ALPHA (RGB565+alpha)
+    // y propaga este cf. Si se pone LV_IMG_CF_RAW, LVGL malinterpreta los datos
+    // decodificados (repetición/cizalladura/colores lavados). w/h = 0 → los lee
+    // del propio PNG.
+    s_qr_img_dsc.header.cf = LV_IMG_CF_TRUE_COLOR_ALPHA;
+    s_qr_img_dsc.data      = s_qr_png_data;
+    s_qr_img_dsc.data_size = sz;
+    return true;
+}
+
+static void create_screensaver_screen(void) {
+    if (scr_screensaver) return;
+
+    scr_screensaver = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_screensaver, lv_color_black(), 0);
+    lv_obj_clear_flag(scr_screensaver, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (screensaver_load_png()) {
+        lv_obj_t* img = lv_img_create(scr_screensaver);
+        lv_img_set_src(img, &s_qr_img_dsc);
+        // La imagen se genera ya a tamaño de pantalla (1024x600): sin zoom ni
+        // transform (la ruta de transformación de LVGL 8.3 sobre PNG decodificado
+        // distorsiona y lava los colores). Sin recolor para colores fieles.
+        lv_obj_set_style_img_recolor_opa(img, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_img_opa(img, LV_OPA_COVER, 0);
+        lv_obj_center(img);
+    } else {
+        // Sin imagen en SPIFFS (falta uploadfs): fallback de texto con los
+        // datos de conexión que codifica el QR, para que el salvapantallas
+        // funcione igualmente.
+        lv_obj_t* lbl = lv_label_create(scr_screensaver);
+        lv_label_set_text(lbl,
+            "RED808 DRUMMACHINE\n\n"
+            "WiFi:  RED808\n"
+            "Pass:  red808esp32\n\n"
+            "http://192.168.4.1/mobile\n\n"
+            "(toca para volver)");
+        lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
+        lv_obj_center(lbl);
+    }
+}
+
+static void screensaver_tick(void) {
+    // Nunca sobre el boot: tiene su propio flujo de arranque.
+    if (active_screen == 0) return;
+
+    uint32_t inact = millis() - lvgl_port_last_touch_ms();
+    if (!s_screensaver_active) {
+        if (inact >= SCREENSAVER_TIMEOUT_MS) {
+            if (!scr_screensaver) create_screensaver_screen();
+            if (scr_screensaver) {
+                s_screensaver_return = active_screen;
+                lv_scr_load_anim(scr_screensaver, LV_SCR_LOAD_ANIM_FADE_ON,
+                                 400, 0, false);
+                s_screensaver_active = true;
+            }
+        }
+    } else if (inact < SCREENSAVER_TIMEOUT_MS) {
+        // Un toque reinició el contador → volver a la pantalla previa.
+        s_screensaver_active = false;
+        ui_navigate_to(s_screensaver_return);
+    }
+}
+
 void ui_update_current_screen(void) {
     unsigned long now = millis();
     static unsigned long boot_enter_ms = 0;
@@ -10296,6 +10407,9 @@ void ui_update_current_screen(void) {
             ui_navigate_to(requested);
         }
     }
+
+    // QR screensaver: show after 60s idle, dismiss on the next touch.
+    screensaver_tick();
 
     ui_update_header();
 
