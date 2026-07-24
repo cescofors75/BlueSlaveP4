@@ -76,7 +76,6 @@ static int patternRowPattern = -1;
 static int patternRowStepCount = 16;
 static unsigned long lastLocalStepMs[16][64] = {};
 static unsigned long lastMasterStepSyncMs = 0;
-static unsigned long lastLocalFxMs[9] = {};
 static unsigned long lastRemoteMasterFxLogMs = 0;
 static unsigned long lastRemoteStateSyncFxLogMs = 0;
 static unsigned long lastRemoteHttpFxLogMs = 0;
@@ -111,7 +110,34 @@ enum FxOwnershipIndex : int {
     FX_OWN_DELAY,
     FX_OWN_REVERB,
     FX_OWN_PHASER,
+    FX_OWN_COUNT,
 };
+static unsigned long lastLocalFxMs[FX_OWN_COUNT] = {};
+static constexpr int RAYDRONE_FIELD_COUNT = 8;
+static constexpr uint32_t RAYDRONE_RETRY_MS = 250;
+
+struct RaydronePendingRequest {
+    bool active;
+    uint8_t updateMask;
+    uint32_t requestId;
+    uint32_t lastTxMs;
+    RaydroneConfigPayload state;
+};
+
+struct RaydroneTxWork {
+    uint8_t updateMask;
+    uint32_t requestId;
+    RaydroneConfigPayload state;
+};
+
+static RaydronePendingRequest s_raydrone_pending[RAYDRONE_FIELD_COUNT] = {};
+static uint32_t s_raydrone_request_counter = 0;
+static portMUX_TYPE s_raydrone_ownership_mux = portMUX_INITIALIZER_UNLOCKED;
+// Serializes the short "snapshot pending -> enqueue" section with local
+// invalidation. Without it, a retry copied just before a new gesture could be
+// enqueued after the newer request and make the master apply stale state last.
+// Pending/request ownership itself is always guarded by the portMUX above.
+static SemaphoreHandle_t s_raydrone_tx_mutex = NULL;
 
 static inline bool is_track_volume_owned_recent(int track, unsigned long nowMs) {
     if (track < 0 || track >= 16) return false;
@@ -152,6 +178,45 @@ static inline void mark_local_track_volume(int track) {
 
 static inline void mark_local_fx(FxOwnershipIndex idx) {
     lastLocalFxMs[(int)idx] = millis();
+}
+
+static int raydrone_field_index(uint8_t updateMask) {
+    for (int i = 0; i < RAYDRONE_FIELD_COUNT; ++i) {
+        if (updateMask == (uint8_t)(1u << i)) return i;
+    }
+    return -1;
+}
+
+// Caller holds s_raydrone_ownership_mux. RayDrone ownership is request based,
+// not time based: only the matching ACK may release the field.
+static bool is_raydrone_locally_owned(uint8_t updateMask) {
+    const int index = raydrone_field_index(updateMask);
+    return index >= 0 && s_raydrone_pending[index].active;
+}
+
+// Caller holds s_raydrone_ownership_mux.
+static bool begin_raydrone_request_locked(
+    uint8_t updateMask, const RaydroneConfigPayload& state, uint32_t nowMs,
+    RaydroneTxWork& work) {
+    const int index = raydrone_field_index(updateMask);
+    if (index < 0) return false;
+
+    // Zero is reserved as "no request". Wrap safely after UINT32_MAX.
+    do {
+        ++s_raydrone_request_counter;
+    } while (s_raydrone_request_counter == 0);
+
+    RaydronePendingRequest& pending = s_raydrone_pending[index];
+    pending.active = true;
+    pending.updateMask = updateMask;
+    pending.requestId = s_raydrone_request_counter;
+    pending.lastTxMs = nowMs;
+    pending.state = state;
+
+    work.updateMask = updateMask;
+    work.requestId = pending.requestId;
+    work.state = state;
+    return true;
 }
 
 static inline void forward_fx_filter_type_to_s3(int type) {
@@ -310,6 +375,216 @@ static void apply_remote_macro_fx_state(JsonObjectConst fx, const char* source, 
 
     udp_mark_fx_screen_dirty();
     log_remote_macro_fx_state(source, fx, lastLogMs);
+}
+
+static void apply_remote_raydrone_state(JsonObjectConst raydrone) {
+    if (raydrone.isNull()) return;
+
+    int version = raydrone["version"] | RAYDRONE_CONFIG_VERSION;
+    if (version != RAYDRONE_CONFIG_VERSION) {
+        P4_LOG_PRINTF("[RAYDRONE] unsupported state version %d\n", version);
+        return;
+    }
+
+    // A requestId identifies an ACK/reject for one locally-owned field. It is
+    // deliberately handled separately from unsolicited snapshots: a stale ACK
+    // must neither release ownership nor modify local state.
+    if (!raydrone["requestId"].isNull()) {
+        if (raydrone["updateMask"].isNull() || raydrone["ok"].isNull()) {
+            P4_LOG_PRINTLN("[RAYDRONE] malformed ACK");
+            return;
+        }
+
+        const uint8_t ackMask = raydrone["updateMask"].as<uint8_t>();
+        const int ackIndex = raydrone_field_index(ackMask);
+        const uint32_t requestId = raydrone["requestId"].as<uint32_t>();
+        const bool ok = raydrone["ok"].as<bool>();
+        if (ackIndex < 0 || requestId == 0) {
+            P4_LOG_PRINTLN("[RAYDRONE] invalid ACK identity");
+            return;
+        }
+
+        RaydroneConfigPayload authoritative = {};
+        authoritative.version = RAYDRONE_CONFIG_VERSION;
+        bool hasAuthoritativeField = false;
+        switch (ackMask) {
+            case RAYDRONE_UPDATE_ACTIVE:
+                if (!raydrone["active"].isNull()) {
+                    authoritative.flags = raydrone["active"].as<bool>()
+                                              ? RAYDRONE_FLAG_ACTIVE
+                                              : 0;
+                    hasAuthoritativeField = true;
+                } else if (!raydrone["flags"].isNull()) {
+                    authoritative.flags =
+                        raydrone["flags"].as<uint8_t>() & RAYDRONE_FLAG_ACTIVE;
+                    hasAuthoritativeField = true;
+                }
+                break;
+            case RAYDRONE_UPDATE_MATERIAL:
+                if (!raydrone["material"].isNull()) {
+                    authoritative.material = (uint8_t)clamp_int(
+                        raydrone["material"].as<int>(), 0,
+                        RAYDRONE_MATERIAL_COUNT - 1);
+                    hasAuthoritativeField = true;
+                }
+                break;
+            case RAYDRONE_UPDATE_CHARACTER:
+                if (!raydrone["character"].isNull()) {
+                    authoritative.character = (uint8_t)clamp_int(
+                        raydrone["character"].as<int>(), 0, RAYDRONE_CHARACTER_SAFE_MAX);
+                    hasAuthoritativeField = true;
+                }
+                break;
+            case RAYDRONE_UPDATE_MOTION:
+                if (!raydrone["motion"].isNull()) {
+                    authoritative.motion = (uint8_t)clamp_int(
+                        raydrone["motion"].as<int>(), 0, 100);
+                    hasAuthoritativeField = true;
+                }
+                break;
+            case RAYDRONE_UPDATE_SPACE:
+                if (!raydrone["space"].isNull()) {
+                    authoritative.space = (uint8_t)clamp_int(
+                        raydrone["space"].as<int>(), 0, 100);
+                    hasAuthoritativeField = true;
+                }
+                break;
+            case RAYDRONE_UPDATE_VOLUME:
+                if (!raydrone["volume"].isNull()) {
+                    authoritative.volume = (uint8_t)clamp_int(
+                        raydrone["volume"].as<int>(), 0, 100);
+                    hasAuthoritativeField = true;
+                }
+                break;
+            case RAYDRONE_UPDATE_MIX:
+                if (!raydrone["mix"].isNull()) {
+                    authoritative.mix = (uint8_t)clamp_int(
+                        raydrone["mix"].as<int>(), 0, 100);
+                    hasAuthoritativeField = true;
+                }
+                break;
+            case RAYDRONE_UPDATE_EVOLUTION:
+                if (!raydrone["evolution"].isNull()) {
+                    authoritative.evolution = (uint8_t)clamp_int(
+                        raydrone["evolution"].as<int>(), 0, 100);
+                    hasAuthoritativeField = true;
+                }
+                break;
+            default:
+                break;
+        }
+        if (!hasAuthoritativeField) {
+            P4_LOG_PRINTLN("[RAYDRONE] ACK missing authoritative field");
+            return;
+        }
+
+        bool matched = false;
+        portENTER_CRITICAL(&s_raydrone_ownership_mux);
+        RaydronePendingRequest& pending = s_raydrone_pending[ackIndex];
+        if (pending.active && pending.updateMask == ackMask &&
+            pending.requestId == requestId) {
+            matched = true;
+            pending = {};
+            // Both accepted and rejected commands use the master's returned
+            // value. A reject therefore rolls the optimistic UI value back.
+            p4_raydrone_update(authoritative, ackMask);
+        }
+        portEXIT_CRITICAL(&s_raydrone_ownership_mux);
+
+        if (!matched) {
+            P4_LOG_PRINTF("[RAYDRONE] stale ACK requestId=%lu ignored\n",
+                          (unsigned long)requestId);
+            return;
+        }
+        if (!ok) {
+            P4_LOG_PRINTF("[RAYDRONE] requestId=%lu rejected; state restored\n",
+                          (unsigned long)requestId);
+        }
+        udp_mark_fx_screen_dirty();
+        return;
+    }
+
+    portENTER_CRITICAL(&s_raydrone_ownership_mux);
+    const RaydroneConfigPayload current = p4_raydrone_snapshot();
+    RaydroneConfigPayload patch = current;
+    uint8_t updateMask = 0;
+
+    auto accept_field = [&](uint8_t field) {
+        return !is_raydrone_locally_owned(field);
+    };
+
+    if (!raydrone["flags"].isNull() || !raydrone["active"].isNull()) {
+        bool active = !raydrone["active"].isNull()
+                          ? raydrone["active"].as<bool>()
+                          : ((raydrone["flags"].as<uint8_t>()
+                              & RAYDRONE_FLAG_ACTIVE) != 0);
+        if (accept_field(RAYDRONE_UPDATE_ACTIVE)) {
+            patch.flags = active ? RAYDRONE_FLAG_ACTIVE : 0;
+            updateMask |= RAYDRONE_UPDATE_ACTIVE;
+        }
+    }
+    if (!raydrone["material"].isNull()) {
+        const int incoming = clamp_int(
+            raydrone["material"].as<int>(), 0, RAYDRONE_MATERIAL_COUNT - 1);
+        if (accept_field(RAYDRONE_UPDATE_MATERIAL)) {
+            patch.material = (uint8_t)incoming;
+            updateMask |= RAYDRONE_UPDATE_MATERIAL;
+        }
+    }
+    if (!raydrone["character"].isNull()) {
+        const int incoming =
+            clamp_int(raydrone["character"].as<int>(), 0, RAYDRONE_CHARACTER_SAFE_MAX);
+        if (accept_field(RAYDRONE_UPDATE_CHARACTER)) {
+            patch.character = (uint8_t)incoming;
+            updateMask |= RAYDRONE_UPDATE_CHARACTER;
+        }
+    }
+    if (!raydrone["motion"].isNull()) {
+        const int incoming =
+            clamp_int(raydrone["motion"].as<int>(), 0, 100);
+        if (accept_field(RAYDRONE_UPDATE_MOTION)) {
+            patch.motion = (uint8_t)incoming;
+            updateMask |= RAYDRONE_UPDATE_MOTION;
+        }
+    }
+    if (!raydrone["space"].isNull()) {
+        const int incoming =
+            clamp_int(raydrone["space"].as<int>(), 0, 100);
+        if (accept_field(RAYDRONE_UPDATE_SPACE)) {
+            patch.space = (uint8_t)incoming;
+            updateMask |= RAYDRONE_UPDATE_SPACE;
+        }
+    }
+    if (!raydrone["volume"].isNull()) {
+        const int incoming =
+            clamp_int(raydrone["volume"].as<int>(), 0, 100);
+        if (accept_field(RAYDRONE_UPDATE_VOLUME)) {
+            patch.volume = (uint8_t)incoming;
+            updateMask |= RAYDRONE_UPDATE_VOLUME;
+        }
+    }
+    if (!raydrone["mix"].isNull()) {
+        const int incoming =
+            clamp_int(raydrone["mix"].as<int>(), 0, 100);
+        if (accept_field(RAYDRONE_UPDATE_MIX)) {
+            patch.mix = (uint8_t)incoming;
+            updateMask |= RAYDRONE_UPDATE_MIX;
+        }
+    }
+    if (!raydrone["evolution"].isNull()) {
+        const int incoming = clamp_int(
+            raydrone["evolution"].as<int>(), 0, 100);
+        if (accept_field(RAYDRONE_UPDATE_EVOLUTION)) {
+            patch.evolution = (uint8_t)incoming;
+            updateMask |= RAYDRONE_UPDATE_EVOLUTION;
+        }
+    }
+
+    if (updateMask != 0) {
+        p4_raydrone_update(patch, updateMask);
+    }
+    portEXIT_CRITICAL(&s_raydrone_ownership_mux);
+    if (updateMask != 0) udp_mark_fx_screen_dirty();
 }
 
 static void apply_remote_master_fx_param(const char* param, JsonVariantConst value) {
@@ -790,6 +1065,7 @@ static bool apply_master_state_http_payload(const char* payload) {
             forward_fx_samplerate_to_s3(p4.sample_rate_hz);
         }
         apply_remote_macro_fx_state(fx, "http", lastRemoteHttpFxLogMs);
+        apply_remote_raydrone_state(fx["raydrone"].as<JsonObjectConst>());
     }
 
     const char* kit = doc["kit"] | "";
@@ -1226,6 +1502,180 @@ void udp_send_set_sample_rate(int rateHz) {
     sendJson(buf);
 }
 
+static bool apply_local_raydrone(
+    const RaydroneConfigPayload& patch, uint8_t updateMask,
+    RaydroneTxWork& work) {
+    portENTER_CRITICAL(&s_raydrone_ownership_mux);
+    const RaydroneConfigPayload state =
+        p4_raydrone_update(patch, updateMask);
+    const bool started = begin_raydrone_request_locked(
+        updateMask, state, millis(), work);
+    portEXIT_CRITICAL(&s_raydrone_ownership_mux);
+    if (started) udp_mark_fx_screen_dirty();
+    return started;
+}
+
+static void send_raydrone_field(uint8_t updateMask,
+                                uint32_t requestId,
+                                const RaydroneConfigPayload& state) {
+    char buf[160];
+    switch (updateMask) {
+        case RAYDRONE_UPDATE_ACTIVE:
+            snprintf(buf, sizeof(buf),
+                     "{\"cmd\":\"setRaydrone\",\"version\":%u,\"updateMask\":%u,"
+                     "\"requestId\":%lu,\"active\":%s}",
+                     (unsigned)state.version,
+                     (unsigned)updateMask, (unsigned long)requestId,
+                     (state.flags & RAYDRONE_FLAG_ACTIVE) ? "true" : "false");
+            break;
+        case RAYDRONE_UPDATE_MATERIAL:
+            snprintf(buf, sizeof(buf),
+                     "{\"cmd\":\"setRaydrone\",\"version\":%u,\"updateMask\":%u,"
+                     "\"requestId\":%lu,\"material\":%u}",
+                     (unsigned)state.version, (unsigned)updateMask,
+                     (unsigned long)requestId, (unsigned)state.material);
+            break;
+        case RAYDRONE_UPDATE_CHARACTER:
+            snprintf(buf, sizeof(buf),
+                     "{\"cmd\":\"setRaydrone\",\"version\":%u,\"updateMask\":%u,"
+                     "\"requestId\":%lu,\"character\":%u}",
+                     (unsigned)state.version, (unsigned)updateMask,
+                     (unsigned long)requestId, (unsigned)state.character);
+            break;
+        case RAYDRONE_UPDATE_MOTION:
+            snprintf(buf, sizeof(buf),
+                     "{\"cmd\":\"setRaydrone\",\"version\":%u,\"updateMask\":%u,"
+                     "\"requestId\":%lu,\"motion\":%u}",
+                     (unsigned)state.version, (unsigned)updateMask,
+                     (unsigned long)requestId, (unsigned)state.motion);
+            break;
+        case RAYDRONE_UPDATE_SPACE:
+            snprintf(buf, sizeof(buf),
+                     "{\"cmd\":\"setRaydrone\",\"version\":%u,\"updateMask\":%u,"
+                     "\"requestId\":%lu,\"space\":%u}",
+                     (unsigned)state.version, (unsigned)updateMask,
+                     (unsigned long)requestId, (unsigned)state.space);
+            break;
+        case RAYDRONE_UPDATE_VOLUME:
+            snprintf(buf, sizeof(buf),
+                     "{\"cmd\":\"setRaydrone\",\"version\":%u,\"updateMask\":%u,"
+                     "\"requestId\":%lu,\"volume\":%u}",
+                     (unsigned)state.version, (unsigned)updateMask,
+                     (unsigned long)requestId, (unsigned)state.volume);
+            break;
+        case RAYDRONE_UPDATE_MIX:
+            snprintf(buf, sizeof(buf),
+                     "{\"cmd\":\"setRaydrone\",\"version\":%u,\"updateMask\":%u,"
+                     "\"requestId\":%lu,\"mix\":%u}",
+                     (unsigned)state.version, (unsigned)updateMask,
+                     (unsigned long)requestId, (unsigned)state.mix);
+            break;
+        case RAYDRONE_UPDATE_EVOLUTION:
+            snprintf(buf, sizeof(buf),
+                     "{\"cmd\":\"setRaydrone\",\"version\":%u,\"updateMask\":%u,"
+                     "\"requestId\":%lu,\"evolution\":%u}",
+                     (unsigned)state.version, (unsigned)updateMask,
+                     (unsigned long)requestId, (unsigned)state.evolution);
+            break;
+        default:
+            return;
+    }
+    sendJson(buf);
+}
+
+static void retry_pending_raydrone(uint32_t nowMs, bool force) {
+    if (!udpStarted || !s_raydrone_tx_mutex) return;
+    const TickType_t waitTicks = force ? pdMS_TO_TICKS(5) : 0;
+    if (xSemaphoreTake(s_raydrone_tx_mutex, waitTicks) != pdTRUE) return;
+
+    RaydroneTxWork work[RAYDRONE_FIELD_COUNT] = {};
+    int workCount = 0;
+    portENTER_CRITICAL(&s_raydrone_ownership_mux);
+    for (int i = 0; i < RAYDRONE_FIELD_COUNT; ++i) {
+        RaydronePendingRequest& pending = s_raydrone_pending[i];
+        if (!pending.active) continue;
+        if (!force &&
+            (uint32_t)(nowMs - pending.lastTxMs) < RAYDRONE_RETRY_MS) {
+            continue;
+        }
+
+        pending.lastTxMs = nowMs;
+        RaydroneTxWork& tx = work[workCount++];
+        tx.updateMask = pending.updateMask;
+        tx.requestId = pending.requestId;
+        tx.state = pending.state;
+    }
+    portEXIT_CRITICAL(&s_raydrone_ownership_mux);
+
+    for (int i = 0; i < workCount; ++i) {
+        send_raydrone_field(
+            work[i].updateMask, work[i].requestId, work[i].state);
+    }
+    xSemaphoreGive(s_raydrone_tx_mutex);
+}
+
+void udp_raydrone_toggle_active(void) {
+    const bool txLocked = s_raydrone_tx_mutex &&
+        xSemaphoreTake(s_raydrone_tx_mutex, portMAX_DELAY) == pdTRUE;
+    RaydroneTxWork work = {};
+    portENTER_CRITICAL(&s_raydrone_ownership_mux);
+    RaydroneConfigPayload patch = p4_raydrone_snapshot();
+    patch.flags =
+        (patch.flags & RAYDRONE_FLAG_ACTIVE) ? 0 : RAYDRONE_FLAG_ACTIVE;
+    const RaydroneConfigPayload state =
+        p4_raydrone_update(patch, RAYDRONE_UPDATE_ACTIVE);
+    const bool started = begin_raydrone_request_locked(
+        RAYDRONE_UPDATE_ACTIVE, state, millis(), work);
+    portEXIT_CRITICAL(&s_raydrone_ownership_mux);
+    if (started) {
+        udp_mark_fx_screen_dirty();
+        send_raydrone_field(work.updateMask, work.requestId, work.state);
+    }
+    if (txLocked) xSemaphoreGive(s_raydrone_tx_mutex);
+}
+
+void udp_raydrone_cycle_material(void) {
+    const bool txLocked = s_raydrone_tx_mutex &&
+        xSemaphoreTake(s_raydrone_tx_mutex, portMAX_DELAY) == pdTRUE;
+    RaydroneTxWork work = {};
+    portENTER_CRITICAL(&s_raydrone_ownership_mux);
+    RaydroneConfigPayload patch = p4_raydrone_snapshot();
+    patch.material =
+        (uint8_t)((patch.material + 1u) % RAYDRONE_MATERIAL_COUNT);
+    const RaydroneConfigPayload state =
+        p4_raydrone_update(patch, RAYDRONE_UPDATE_MATERIAL);
+    const bool started = begin_raydrone_request_locked(
+        RAYDRONE_UPDATE_MATERIAL, state, millis(), work);
+    portEXIT_CRITICAL(&s_raydrone_ownership_mux);
+    if (started) {
+        udp_mark_fx_screen_dirty();
+        send_raydrone_field(work.updateMask, work.requestId, work.state);
+    }
+    if (txLocked) xSemaphoreGive(s_raydrone_tx_mutex);
+}
+
+void udp_set_raydrone_value(uint8_t updateMask, uint8_t value,
+                            bool transmit) {
+    RaydroneConfigPayload patch = {};
+    switch (updateMask) {
+        case RAYDRONE_UPDATE_CHARACTER: patch.character = value; break;
+        case RAYDRONE_UPDATE_MOTION:    patch.motion = value; break;
+        case RAYDRONE_UPDATE_SPACE:     patch.space = value; break;
+        case RAYDRONE_UPDATE_VOLUME:    patch.volume = value; break;
+        case RAYDRONE_UPDATE_MIX:       patch.mix = value; break;
+        case RAYDRONE_UPDATE_EVOLUTION: patch.evolution = value; break;
+        default: return;
+    }
+    const bool txLocked = s_raydrone_tx_mutex &&
+        xSemaphoreTake(s_raydrone_tx_mutex, portMAX_DELAY) == pdTRUE;
+    RaydroneTxWork work = {};
+    const bool started = apply_local_raydrone(patch, updateMask, work);
+    if (started && transmit) {
+        send_raydrone_field(work.updateMask, work.requestId, work.state);
+    }
+    if (txLocked) xSemaphoreGive(s_raydrone_tx_mutex);
+}
+
 // =============================================================================
 // FX LIVE COMMANDS — enc/pot values → Master FX engine
 // Ranges are intentionally conservative: audible first, no harsh clipping.
@@ -1463,6 +1913,10 @@ static void processJsonVariant(JsonVariant doc) {
         apply_remote_master_fx_param(doc["param"] | "", doc["value"]);
         return;
     }
+    if (strcmp(eventType, "raydrone") == 0) {
+        apply_remote_raydrone_state(doc.as<JsonObjectConst>());
+        return;
+    }
 
     const char* cmd = doc["cmd"];
     if (!cmd) return;
@@ -1574,6 +2028,7 @@ static void processJsonVariant(JsonVariant doc) {
                 forward_fx_samplerate_to_s3(p4.sample_rate_hz);
             }
             apply_remote_macro_fx_state(fx, "state_sync", lastRemoteStateSyncFxLogMs);
+            apply_remote_raydrone_state(fx["raydrone"].as<JsonObjectConst>());
         }
 
         const char* kit = doc["kit"] | "";
@@ -1944,6 +2399,7 @@ static void onWiFiConnected(void) {
         udpStarted = true;
         P4_LOG_PRINTF("[UDP] Listening on port %d\n", UDP_PORT);
         udp_request_master_sync();
+        retry_pending_raydrone(millis(), true);
     } else {
         P4_LOG_PRINTLN("[UDP] Failed to start!");
     }
@@ -1970,11 +2426,12 @@ static void onWiFiDisconnected(void) {
 void udp_handler_init(void) {
     P4_LOG_PRINTLN("[UDP] Init WiFi/UDP handler");
     s_udp_tx_stage_mutex = xSemaphoreCreateMutex();
+    s_raydrone_tx_mutex = xSemaphoreCreateMutex();
     // Internal RAM keeps the queue usable while flash/NVS temporarily changes
     // external-memory cache state. Depth 24 still covers the largest command
     // burst (a complete deferred pattern) plus interactive input.
     s_udp_tx_queue = xQueueCreate(UDP_TX_QUEUE_DEPTH, sizeof(UdpTxPacket));
-    if (!s_udp_tx_stage_mutex || !s_udp_tx_queue) {
+    if (!s_udp_tx_stage_mutex || !s_raydrone_tx_mutex || !s_udp_tx_queue) {
         P4_LOG_PRINTLN("[UDP] Failed to create TX queue");
     }
     startWiFi();
@@ -2066,6 +2523,10 @@ void udp_handler_process(void) {
 
     // --- Apply HTTP bodies fetched by the worker task (non-blocking) ---
     http_consume_results();
+
+    // Retain the exact requestId across retries. The master can therefore
+    // deduplicate a lost ACK without reapplying the user action.
+    retry_pending_raydrone(now, false);
 
     // --- Drain all cross-task outgoing commands from one WiFiUDP owner ---
     // 24 entries cover a full deferred-pattern burst plus interactive input.

@@ -221,6 +221,7 @@ lv_obj_t* scr_sdcard = NULL;
 lv_obj_t* scr_performance = NULL;
 lv_obj_t* scr_piano = NULL;       /* v2.6 — PIANO live keyboard */
 lv_obj_t* scr_piano_params = NULL; /* v2.7 — synth engine parameter editor */
+lv_obj_t* scr_raydrone = NULL;     /* RayDrone live-input master insert */
 lv_obj_t* scr_fx_xy = NULL;       /* v3.2 — FX XY performance pad */
 static lv_obj_t* scr_screensaver = NULL; /* QR screensaver (60s idle) */
 
@@ -3725,6 +3726,11 @@ static void fx_xy_open_cb(lv_event_t* e) {
     ui_navigate_to(13);   // FX XY performance pad
 }
 
+static void fx_raydrone_open_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    ui_navigate_to(12);
+}
+
 static void create_fx_screen(void) {
     scr_fx = lv_obj_create(NULL);
     apply_screen_theme_bg(scr_fx);
@@ -3737,6 +3743,19 @@ static void create_fx_screen(void) {
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(title, RED808_ACCENT, 0);
     lv_obj_set_pos(title, 60, 10);
+
+    // Dedicated RayDrone editor. Keep it outside the 12-card/page model so the
+    // existing 3/6/12 layouts and four page dots remain unchanged.
+    lv_obj_t* raydrone_btn = lv_btn_create(scr_fx);
+    lv_obj_set_size(raydrone_btn, 190, 42);
+    lv_obj_set_pos(raydrone_btn, 500, 8);
+    apply_control_button_style(raydrone_btn, RED808_ACCENT2, true, 8);
+    lv_obj_add_event_cb(raydrone_btn, fx_raydrone_open_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* raydrone_lbl = lv_label_create(raydrone_btn);
+    lv_label_set_text(raydrone_lbl, "RAYDRONE  " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_font(raydrone_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(raydrone_lbl, RED808_TEXT, 0);
+    lv_obj_center(raydrone_lbl);
 
     for (int cell = 0; cell < FX_CARD_COUNT; cell++) {
         // Card container
@@ -3995,6 +4014,388 @@ static void update_fx_screen(void) {
             }
         }
     }
+}
+
+// =============================================================================
+// RAYDRONE — dedicated live-input master insert (screen id 12)
+// =============================================================================
+enum RaydroneUiControl : uint8_t {
+    RAY_UI_CHARACTER = 0,
+    RAY_UI_MOTION,
+    RAY_UI_SPACE,
+    RAY_UI_VOLUME,
+    RAY_UI_MIX,
+    RAY_UI_CONTROL_COUNT,
+};
+
+static lv_obj_t* s_raydrone_active_btn = NULL;
+static lv_obj_t* s_raydrone_active_lbl = NULL;
+static lv_obj_t* s_raydrone_material_btn = NULL;
+static lv_obj_t* s_raydrone_material_lbl = NULL;
+static lv_obj_t* s_raydrone_sliders[RAY_UI_CONTROL_COUNT] = {};
+static lv_obj_t* s_raydrone_value_lbls[RAY_UI_CONTROL_COUNT] = {};
+static lv_obj_t* s_raydrone_auto_slider = NULL;
+static lv_obj_t* s_raydrone_auto_value_lbl = NULL;
+static bool s_raydrone_ui_syncing = false;
+
+static const char* const RAYDRONE_MATERIAL_NAMES[RAYDRONE_MATERIAL_COUNT] = {
+    "Vacio", "Metal", "Madera", "Cristal", "Agua", "Plasma"
+};
+static const char* const RAYDRONE_CONTROL_NAMES[RAY_UI_CONTROL_COUNT] = {
+    "CHARACTER", "MOTION", "SPACE", "VOLUME", "MIX"
+};
+static const uint32_t RAYDRONE_CONTROL_COLORS[RAY_UI_CONTROL_COUNT] = {
+    0xA17BFF, 0x27B0D0, 0x31D2A1, 0xF5BC31, 0xF2466B
+};
+
+static uint8_t raydrone_control_mask(int control) {
+    switch (control) {
+        case RAY_UI_CHARACTER: return RAYDRONE_UPDATE_CHARACTER;
+        case RAY_UI_MOTION:    return RAYDRONE_UPDATE_MOTION;
+        case RAY_UI_SPACE:     return RAYDRONE_UPDATE_SPACE;
+        case RAY_UI_VOLUME:    return RAYDRONE_UPDATE_VOLUME;
+        case RAY_UI_MIX:       return RAYDRONE_UPDATE_MIX;
+        default:               return 0;
+    }
+}
+
+static void update_raydrone_screen(void);
+
+static void update_raydrone_screen(void) {
+    static RaydroneConfigPayload prev = {};
+    static bool prev_valid = false;
+    static uint32_t prev_gen = 0;
+
+    RaydroneConfigPayload state = p4_raydrone_snapshot();
+    if (state.version != RAYDRONE_CONFIG_VERSION) {
+        state.version = RAYDRONE_CONFIG_VERSION;
+    }
+    state.flags &= RAYDRONE_FLAG_ACTIVE;
+    state.material = (uint8_t)constrain((int)state.material, 0, RAYDRONE_MATERIAL_COUNT - 1);
+    state.character = (uint8_t)constrain((int)state.character, 0, RAYDRONE_CHARACTER_SAFE_MAX);
+    state.motion = (uint8_t)constrain((int)state.motion, 0, 100);
+    state.space = (uint8_t)constrain((int)state.space, 0, 100);
+    state.volume = (uint8_t)constrain((int)state.volume, 0, 100);
+    state.mix = (uint8_t)constrain((int)state.mix, 0, 100);
+
+    if (prev_valid && prev_gen == s_ui_refresh_gen &&
+        memcmp(&prev, &state, sizeof(state)) == 0) {
+        return;
+    }
+    prev = state;
+    prev_valid = true;
+    prev_gen = s_ui_refresh_gen;
+
+    bool active = (state.flags & RAYDRONE_FLAG_ACTIVE) != 0;
+    if (s_raydrone_active_btn) {
+        apply_control_button_style(
+            s_raydrone_active_btn,
+            active ? RED808_SUCCESS : RED808_ERROR,
+            active,
+            8);
+        lv_obj_set_style_shadow_width(s_raydrone_active_btn, active ? 18 : 0, 0);
+        lv_obj_set_style_shadow_color(s_raydrone_active_btn, RED808_SUCCESS, 0);
+        lv_obj_set_style_shadow_opa(
+            s_raydrone_active_btn, active ? LV_OPA_60 : LV_OPA_0, 0);
+    }
+    if (s_raydrone_active_lbl) {
+        lv_label_set_text(s_raydrone_active_lbl, active ? "ON" : "OFF");
+        lv_obj_set_style_text_color(
+            s_raydrone_active_lbl, active ? RED808_TEXT : RED808_TEXT_DIM, 0);
+    }
+    if (s_raydrone_material_lbl) {
+        lv_label_set_text_fmt(
+            s_raydrone_material_lbl, "%s  " LV_SYMBOL_LOOP,
+            RAYDRONE_MATERIAL_NAMES[state.material]);
+    }
+
+    s_raydrone_ui_syncing = true;
+    for (int i = 0; i < RAY_UI_CONTROL_COUNT; i++) {
+        uint8_t value = 0;
+        switch (i) {
+            case RAY_UI_CHARACTER: value = state.character; break;
+            case RAY_UI_MOTION:    value = state.motion; break;
+            case RAY_UI_SPACE:     value = state.space; break;
+            case RAY_UI_VOLUME:    value = state.volume; break;
+            case RAY_UI_MIX:       value = state.mix; break;
+        }
+        if (s_raydrone_sliders[i]) {
+            lv_slider_set_value(s_raydrone_sliders[i], value, LV_ANIM_OFF);
+        }
+        if (s_raydrone_value_lbls[i]) {
+            lv_label_set_text_fmt(s_raydrone_value_lbls[i], "%u%%", (unsigned)value);
+        }
+    }
+    if (s_raydrone_auto_slider) {
+        lv_slider_set_value(s_raydrone_auto_slider, state.evolution, LV_ANIM_OFF);
+    }
+    if (s_raydrone_auto_value_lbl) {
+        lv_label_set_text_fmt(s_raydrone_auto_value_lbl, "%u%%", (unsigned)state.evolution);
+    }
+    s_raydrone_ui_syncing = false;
+}
+
+static void raydrone_back_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    ui_navigate_to(8);
+}
+
+static void raydrone_active_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    udp_raydrone_toggle_active();
+    update_raydrone_screen();
+}
+
+static void raydrone_material_cb(lv_event_t* e) {
+    LV_UNUSED(e);
+    udp_raydrone_cycle_material();
+    update_raydrone_screen();
+}
+
+static void raydrone_auto_cb(lv_event_t* e) {
+    if (s_raydrone_ui_syncing) return;
+    lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
+    const uint8_t value = (uint8_t)constrain((int)lv_slider_get_value(slider), 0, 100);
+    if (s_raydrone_auto_value_lbl) {
+        lv_label_set_text_fmt(s_raydrone_auto_value_lbl, "%u%%", (unsigned)value);
+    }
+    static uint32_t last_tx_ms = 0;
+    const uint32_t now = millis();
+    const lv_event_code_t code = lv_event_get_code(e);
+    const bool final_value = code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST;
+    const bool transmit = final_value || last_tx_ms == 0 || (uint32_t)(now - last_tx_ms) >= 25;
+    udp_set_raydrone_value(RAYDRONE_UPDATE_EVOLUTION, value, transmit);
+    if (transmit) last_tx_ms = now;
+}
+
+static void raydrone_slider_cb(lv_event_t* e) {
+    if (s_raydrone_ui_syncing) return;
+    int control = (int)(intptr_t)lv_event_get_user_data(e);
+    if (control < 0 || control >= RAY_UI_CONTROL_COUNT) return;
+
+    lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
+    const int max_value = control == RAY_UI_CHARACTER ? RAYDRONE_CHARACTER_SAFE_MAX : 100;
+    uint8_t value = (uint8_t)constrain((int)lv_slider_get_value(slider), 0, max_value);
+    if (s_raydrone_value_lbls[control]) {
+        lv_label_set_text_fmt(
+            s_raydrone_value_lbls[control], "%u%%", (unsigned)value);
+    }
+
+    static uint32_t last_tx_ms[RAY_UI_CONTROL_COUNT] = {};
+    uint32_t now = millis();
+    lv_event_code_t code = lv_event_get_code(e);
+    bool final_value = code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST;
+    bool transmit = final_value || last_tx_ms[control] == 0 ||
+                    (uint32_t)(now - last_tx_ms[control]) >= 25;
+    const uint8_t updateMask = raydrone_control_mask(control);
+    udp_set_raydrone_value(updateMask, value, transmit);
+    if (transmit) {
+        last_tx_ms[control] = now;
+    }
+}
+
+static void create_raydrone_screen(void) {
+    scr_raydrone = lv_obj_create(NULL);
+    apply_screen_theme_bg(scr_raydrone);
+    lv_obj_clear_flag(scr_raydrone, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* back_btn = lv_btn_create(scr_raydrone);
+    lv_obj_set_size(back_btn, 112, 42);
+    lv_obj_set_pos(back_btn, 12, 8);
+    apply_control_button_style(back_btn, RED808_CYAN, false, 8);
+    lv_obj_add_event_cb(back_btn, raydrone_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t* back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT "  FX");
+    lv_obj_set_style_text_font(back_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(back_lbl);
+
+    lv_obj_t* title = lv_label_create(scr_raydrone);
+    lv_label_set_text(title, "RAYDRONE");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(title, RED808_ACCENT2, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t* subtitle = lv_label_create(scr_raydrone);
+    lv_label_set_text(subtitle, "LIVE INPUT  /  GRANULAR MASTER INSERT");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(subtitle, RED808_TEXT_DIM, 0);
+    lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 43);
+
+    s_raydrone_active_btn = lv_btn_create(scr_raydrone);
+    lv_obj_set_size(s_raydrone_active_btn, 112, 42);
+    lv_obj_set_pos(s_raydrone_active_btn, LCD_H_RES - 124, 8);
+    lv_obj_add_event_cb(
+        s_raydrone_active_btn, raydrone_active_cb, LV_EVENT_CLICKED, NULL);
+    s_raydrone_active_lbl = lv_label_create(s_raydrone_active_btn);
+    lv_obj_set_style_text_font(s_raydrone_active_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_center(s_raydrone_active_lbl);
+
+    lv_obj_t* material_card =
+        create_section_shell(scr_raydrone, 14, 70, 224, 516);
+    lv_obj_set_style_border_color(material_card, RED808_ACCENT2, 0);
+    lv_obj_set_style_border_opa(material_card, LV_OPA_70, 0);
+
+    lv_obj_t* material_title = lv_label_create(material_card);
+    lv_label_set_text(material_title, "MATERIAL");
+    lv_obj_set_style_text_font(material_title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(material_title, RED808_ACCENT2, 0);
+    lv_obj_align(material_title, LV_ALIGN_TOP_MID, 0, 10);
+
+    s_raydrone_material_btn = lv_btn_create(material_card);
+    lv_obj_set_size(s_raydrone_material_btn, 184, 104);
+    lv_obj_align(s_raydrone_material_btn, LV_ALIGN_TOP_MID, 0, 56);
+    apply_control_button_style(
+        s_raydrone_material_btn, RED808_ACCENT2, false, 8);
+    lv_obj_add_event_cb(
+        s_raydrone_material_btn, raydrone_material_cb, LV_EVENT_CLICKED, NULL);
+    s_raydrone_material_lbl = lv_label_create(s_raydrone_material_btn);
+    lv_obj_set_style_text_font(
+        s_raydrone_material_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_raydrone_material_lbl, RED808_TEXT, 0);
+    lv_obj_center(s_raydrone_material_lbl);
+
+    lv_obj_t* material_hint = lv_label_create(material_card);
+    lv_label_set_text(
+        material_hint,
+        "Toca para recorrer\nVacio / Metal / Madera\nCristal / Agua / Plasma");
+    lv_obj_set_width(material_hint, 184);
+    lv_obj_set_style_text_align(material_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(material_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(material_hint, RED808_TEXT_DIM, 0);
+    lv_obj_align(material_hint, LV_ALIGN_TOP_MID, 0, 184);
+
+    lv_obj_t* signal_title = lv_label_create(material_card);
+    lv_label_set_text(signal_title, "SIGNAL FLOW");
+    lv_obj_set_style_text_font(signal_title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(signal_title, RED808_CYAN, 0);
+    lv_obj_align(signal_title, LV_ALIGN_TOP_MID, 0, 304);
+
+    lv_obj_t* signal = lv_label_create(material_card);
+    lv_label_set_text(
+        signal, "INPUT  >  RAYDRONE\nOUTPUT  >  RECURSION\nDRY / WET");
+    lv_obj_set_width(signal, 184);
+    lv_obj_set_style_text_align(signal, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(signal, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(signal, RED808_TEXT, 0);
+    lv_obj_align(signal, LV_ALIGN_TOP_MID, 0, 338);
+
+    lv_obj_t* auto_title = lv_label_create(material_card);
+    lv_label_set_text(auto_title, "AUTOEVOLUCION / RECURSION");
+    lv_obj_set_style_text_font(auto_title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(auto_title, RED808_CYAN, 0);
+    lv_obj_align(auto_title, LV_ALIGN_TOP_MID, 0, 404);
+
+    s_raydrone_auto_slider = lv_slider_create(material_card);
+    lv_obj_set_size(s_raydrone_auto_slider, 184, 22);
+    lv_obj_set_pos(s_raydrone_auto_slider, 20, 427);
+    lv_slider_set_range(s_raydrone_auto_slider, 0, 100);
+    lv_obj_set_style_bg_color(s_raydrone_auto_slider, lv_color_hex(0x202020), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_raydrone_auto_slider, RED808_CYAN, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_raydrone_auto_slider, lv_color_white(), LV_PART_KNOB);
+    lv_obj_set_style_pad_hor(s_raydrone_auto_slider, 8, LV_PART_KNOB);
+    lv_obj_set_style_pad_ver(s_raydrone_auto_slider, 6, LV_PART_KNOB);
+    lv_obj_add_event_cb(s_raydrone_auto_slider, raydrone_auto_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_raydrone_auto_slider, raydrone_auto_cb,
+                        LV_EVENT_RELEASED, NULL);
+
+    s_raydrone_auto_value_lbl = lv_label_create(material_card);
+    lv_label_set_text(s_raydrone_auto_value_lbl, "0%  OFF");
+    lv_obj_set_style_text_font(s_raydrone_auto_value_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_raydrone_auto_value_lbl, RED808_TEXT_DIM, 0);
+    lv_obj_align(s_raydrone_auto_value_lbl, LV_ALIGN_TOP_MID, 0, 452);
+
+    const int card_x = 250;
+    const int card_y = 70;
+    const int card_w = 142;
+    const int card_h = 516;
+    const int card_gap = 10;
+    for (int i = 0; i < RAY_UI_CONTROL_COUNT; i++) {
+        lv_color_t color = lv_color_hex(RAYDRONE_CONTROL_COLORS[i]);
+        lv_obj_t* card = lv_obj_create(scr_raydrone);
+        lv_obj_set_pos(card, card_x + i * (card_w + card_gap), card_y);
+        lv_obj_set_size(card, card_w, card_h);
+        lv_obj_set_style_pad_all(card, 0, 0);
+        lv_obj_set_style_radius(card, 8, 0);
+        lv_obj_set_style_bg_color(card, RED808_SURFACE, 0);
+        lv_obj_set_style_bg_grad_color(card, RED808_PANEL, 0);
+        lv_obj_set_style_bg_grad_dir(card, LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_border_color(card, color, 0);
+        lv_obj_set_style_border_opa(card, LV_OPA_60, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* name = lv_label_create(card);
+        lv_label_set_text(name, RAYDRONE_CONTROL_NAMES[i]);
+        lv_obj_set_width(name, card_w);
+        lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(name, color, 0);
+        lv_obj_set_pos(name, 0, 16);
+
+        s_raydrone_value_lbls[i] = lv_label_create(card);
+        lv_obj_set_width(s_raydrone_value_lbls[i], card_w);
+        lv_obj_set_style_text_align(
+            s_raydrone_value_lbls[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(
+            s_raydrone_value_lbls[i], &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_color(s_raydrone_value_lbls[i], RED808_TEXT, 0);
+        lv_obj_set_pos(s_raydrone_value_lbls[i], 0, 48);
+
+        lv_obj_t* max_lbl = lv_label_create(card);
+        lv_label_set_text(max_lbl, i == RAY_UI_CHARACTER ? "35" : "100");
+        lv_obj_set_style_text_font(max_lbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(max_lbl, RED808_TEXT_DIM, 0);
+        lv_obj_set_pos(max_lbl, 18, 110);
+
+        lv_obj_t* min_lbl = lv_label_create(card);
+        lv_label_set_text(min_lbl, "0");
+        lv_obj_set_style_text_font(min_lbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(min_lbl, RED808_TEXT_DIM, 0);
+        lv_obj_set_pos(min_lbl, 24, 470);
+
+        s_raydrone_sliders[i] = lv_slider_create(card);
+        lv_obj_set_size(s_raydrone_sliders[i], 24, 350);
+        lv_obj_set_pos(s_raydrone_sliders[i], (card_w - 24) / 2, 112);
+        lv_slider_set_range(s_raydrone_sliders[i], 0,
+                            i == RAY_UI_CHARACTER ? RAYDRONE_CHARACTER_SAFE_MAX : 100);
+        lv_obj_set_style_bg_color(
+            s_raydrone_sliders[i], lv_color_hex(0x202020), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(
+            s_raydrone_sliders[i], LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_width(s_raydrone_sliders[i], 1, LV_PART_MAIN);
+        lv_obj_set_style_border_color(
+            s_raydrone_sliders[i], RED808_BORDER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(
+            s_raydrone_sliders[i], color, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(
+            s_raydrone_sliders[i], LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(
+            s_raydrone_sliders[i], lv_color_white(), LV_PART_KNOB);
+        lv_obj_set_style_bg_opa(
+            s_raydrone_sliders[i], LV_OPA_COVER, LV_PART_KNOB);
+        lv_obj_set_style_pad_hor(s_raydrone_sliders[i], 12, LV_PART_KNOB);
+        lv_obj_set_style_pad_ver(s_raydrone_sliders[i], 8, LV_PART_KNOB);
+        lv_obj_set_style_radius(
+            s_raydrone_sliders[i], LV_RADIUS_CIRCLE, LV_PART_KNOB);
+        lv_obj_set_style_shadow_color(
+            s_raydrone_sliders[i], color, LV_PART_KNOB);
+        lv_obj_set_style_shadow_width(s_raydrone_sliders[i], 12, LV_PART_KNOB);
+        lv_obj_set_style_shadow_opa(
+            s_raydrone_sliders[i], LV_OPA_60, LV_PART_KNOB);
+        lv_obj_add_event_cb(
+            s_raydrone_sliders[i], raydrone_slider_cb,
+            LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(
+            s_raydrone_sliders[i], raydrone_slider_cb,
+            LV_EVENT_RELEASED, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(
+            s_raydrone_sliders[i], raydrone_slider_cb,
+            LV_EVENT_PRESS_LOST, (void*)(intptr_t)i);
+    }
+
+    update_raydrone_screen();
 }
 
 // =============================================================================
@@ -4854,7 +5255,7 @@ static void create_sequencer_screen(void) {
         lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
 
         seq_status_pat_lbl = lv_label_create(scr_sequencer);
-        lv_label_set_text_fmt(seq_status_pat_lbl, "PATTERN %02d", p4.current_pattern + 1);
+        lv_label_set_text_fmt(seq_status_pat_lbl, "P%02d", p4.current_pattern + 1);
         lv_obj_set_style_text_font(seq_status_pat_lbl, &lv_font_montserrat_10, 0);
         lv_obj_set_style_text_color(seq_status_pat_lbl, RED808_TEXT_DIM, 0);
         lv_obj_set_pos(seq_status_pat_lbl, 70, SEQ_STATUS_Y + 2);
@@ -4990,7 +5391,7 @@ static void update_sequencer_screen(void) {
     static int prev_stp_pat = -1;
     if (seq_status_pat_lbl && p4.current_pattern != prev_stp_pat) {
         prev_stp_pat = p4.current_pattern;
-        lv_label_set_text_fmt(seq_status_pat_lbl, "PATTERN %02d", p4.current_pattern + 1);
+        lv_label_set_text_fmt(seq_status_pat_lbl, "P%02d", p4.current_pattern + 1);
     }
     static int prev_stp_bpm_int = -1, prev_stp_bpm_frac = -1;
     if (seq_status_bpm_lbl &&
@@ -9643,6 +10044,7 @@ static void ui_reload_themed_screens(void) {
     if (scr_performance) { lv_obj_del(scr_performance); scr_performance = NULL; }
     if (scr_piano)       { lv_obj_del(scr_piano);       scr_piano       = NULL; }
     if (scr_piano_params){ lv_obj_del(scr_piano_params);scr_piano_params= NULL; }
+    if (scr_raydrone)    { lv_obj_del(scr_raydrone);    scr_raydrone    = NULL; }
     if (scr_fx_xy)       { lv_obj_del(scr_fx_xy);       scr_fx_xy       = NULL; }
 
     // Clear widget pointers (prevent stale access in update functions)
@@ -9784,6 +10186,12 @@ static void ui_reload_themed_screens(void) {
     s_pp_wave_card = NULL; s_pp_wave_line = NULL; s_pp_wave_lbl = NULL;
     s_fxxy_pad = NULL; s_fxxy_dot = NULL;
     s_fxxy_x_lbl = NULL; s_fxxy_y_lbl = NULL; s_fxxy_mode_lbl = NULL;
+    s_raydrone_active_btn = NULL; s_raydrone_active_lbl = NULL;
+    s_raydrone_material_btn = NULL; s_raydrone_material_lbl = NULL;
+    memset(s_raydrone_sliders, 0, sizeof(s_raydrone_sliders));
+    memset(s_raydrone_value_lbls, 0, sizeof(s_raydrone_value_lbls));
+    s_raydrone_auto_slider = NULL; s_raydrone_auto_value_lbl = NULL;
+    s_raydrone_ui_syncing = false;
 
     // Restore navigation (go to live if was on unknown screen)
     int nav_to = (saved_screen == 9) ? 9 : 2;  // stay in sdcard if we were there
@@ -9793,6 +10201,7 @@ static void ui_reload_themed_screens(void) {
     if (saved_screen == 8) nav_to = 8;
     if (saved_screen == 10) nav_to = 10;   /* PIANO */
     if (saved_screen == 11) nav_to = 11;   /* PIANO PARAMS (synth editor) */
+    if (saved_screen == 12) nav_to = 12;   /* RAYDRONE */
     if (saved_screen == 13) nav_to = 13;   /* FX XY PAD */
     ui_navigate_to(nav_to);
 
@@ -9814,6 +10223,7 @@ void ui_navigate_to(int screen_id) {
         case 9:  if (!scr_sdcard)       create_sdcard_screen(); break;
         case 10: if (!scr_piano)        create_piano_screen(); break;
         case 11: if (!scr_piano_params) create_piano_params_screen(); break;
+        case 12: if (!scr_raydrone)     create_raydrone_screen(); break;
         case 13: if (!scr_fx_xy)        create_fx_xy_screen(); break;
         default: break;
     }
@@ -9822,7 +10232,7 @@ void ui_navigate_to(int screen_id) {
         NULL, scr_performance, scr_volumes, scr_fx, scr_sdcard,
         scr_piano,        /* 10 = PIANO (replaces stubbed performance slot) */
         scr_piano_params, /* 11 = PIANO PARAMS (synth editor) */
-        NULL,             /* 12 = reserved (guitar screen removed) */
+        scr_raydrone,     /* 12 = RAYDRONE master insert */
         scr_fx_xy         /* 13 = FX XY PAD */
     };
     int count = sizeof(targets) / sizeof(targets[0]);
@@ -9851,6 +10261,7 @@ void ui_navigate_to(int screen_id) {
         // Entering the XY pad: re-place the dot from the live FX state (the
         // master may have moved cutoff/reso since the screen was created).
         if (screen_id == 13) fxxy_sync_from_state();
+        if (screen_id == 12) update_raydrone_screen();
         // Leaving a screen: persist any pending XTRA param edits now instead
         // of waiting out the debounce window.
         xtra_param_save_flush();
@@ -10419,6 +10830,7 @@ void ui_update_current_screen(void) {
     // up on the next scheduled update after entering the screen.
     if (udp_consume_fx_screen_dirty()) {
         if (lv_scr_act() == scr_fx) update_fx_screen();
+        else if (lv_scr_act() == scr_raydrone) update_raydrone_screen();
     }
 
     // Per-screen pacing. LIVE and STEPS need 60Hz for pad fades/playhead.
@@ -10432,6 +10844,7 @@ void ui_update_current_screen(void) {
     else if (active == scr_piano) period_ms = 16;
     else if (active == scr_piano_params) period_ms = 50;
     else if (active == scr_fx) period_ms = 16;
+    else if (active == scr_raydrone) period_ms = 33;
     if (now - last_active_update_ms < period_ms) return;
     last_active_update_ms = now;
 
@@ -10439,6 +10852,7 @@ void ui_update_current_screen(void) {
     if (active == scr_live) update_live_screen();
     else if (active == scr_sequencer) update_sequencer_screen();
     else if (active == scr_fx) update_fx_screen();
+    else if (active == scr_raydrone) update_raydrone_screen();
     else if (active == scr_volumes) update_volumes_screen();
     else if (active == scr_piano || active == scr_piano_params) update_piano_screen();
     else if (active == scr_sdcard &&

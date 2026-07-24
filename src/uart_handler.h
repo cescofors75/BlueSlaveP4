@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <atomic>
 #include "../include/uart_protocol.h"
+#include "../../shared/raydrone_protocol.h"
 
 // Initialize UART1 for S3 communication
 void uart_handler_init(void);
@@ -67,6 +68,12 @@ void p4_publish_pending_melody(uint8_t engine, uint8_t octave,
                                bool rec, uint8_t pad);
 bool p4_consume_pending_melody(uint8_t* engine, uint8_t* octave,
                                bool* rec, uint8_t* pad);
+// Raydrone is shared by the Core-0 LVGL task and Core-1 network loop.
+RaydroneConfigPayload p4_raydrone_snapshot(void);
+RaydroneConfigPayload p4_raydrone_update(
+    const RaydroneConfigPayload& patch, uint8_t update_mask);
+void p4_raydrone_store(const RaydroneConfigPayload& config);
+
 struct P4State {
     // System
     int  bpm_int;           // 40-240
@@ -97,6 +104,7 @@ struct P4State {
     int  bitcrush_bits;    // 4-16
     int  sample_rate_hz;   // 1000-44100
     int  fx_resp_mode;     // 0-1
+    RaydroneConfigPayload raydrone; // Atomic web-basic RayDrone control snapshot
 
     // Tracks
     bool track_muted[16];

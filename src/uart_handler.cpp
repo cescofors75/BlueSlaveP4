@@ -27,7 +27,86 @@ P4State p4 = {
     .distortion_pct  = 0,                    // OFF
     .bitcrush_bits   = 16,                   // 16-bit = bypass
     .sample_rate_hz  = 32000,                // neutral for UI SRATE mapping
+    .raydrone        = {
+        RAYDRONE_CONFIG_VERSION,
+        0,
+        RAYDRONE_DEFAULT_MATERIAL,
+        RAYDRONE_DEFAULT_CHARACTER,
+        RAYDRONE_DEFAULT_MOTION,
+        RAYDRONE_DEFAULT_SPACE,
+        RAYDRONE_DEFAULT_VOLUME,
+        RAYDRONE_DEFAULT_MIX,
+        RAYDRONE_DEFAULT_EVOLUTION,
+    },
 };
+
+static portMUX_TYPE s_raydrone_state_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static RaydroneConfigPayload normalize_raydrone(
+    const RaydroneConfigPayload& source) {
+    RaydroneConfigPayload safe = source;
+    safe.version = RAYDRONE_CONFIG_VERSION;
+    safe.flags &= RAYDRONE_FLAG_ACTIVE;
+    if (safe.material >= RAYDRONE_MATERIAL_COUNT) {
+        safe.material = RAYDRONE_MATERIAL_COUNT - 1;
+    }
+    if (safe.character > RAYDRONE_CHARACTER_SAFE_MAX) safe.character = RAYDRONE_CHARACTER_SAFE_MAX;
+    if (safe.motion > 100) safe.motion = 100;
+    if (safe.space > 100) safe.space = 100;
+    if (safe.volume > 100) safe.volume = 100;
+    if (safe.mix > 100) safe.mix = 100;
+    if (safe.evolution > 100) safe.evolution = 100;
+    return safe;
+}
+
+RaydroneConfigPayload p4_raydrone_snapshot(void) {
+    RaydroneConfigPayload snapshot;
+    portENTER_CRITICAL(&s_raydrone_state_mux);
+    snapshot = p4.raydrone;
+    portEXIT_CRITICAL(&s_raydrone_state_mux);
+    return snapshot;
+}
+
+RaydroneConfigPayload p4_raydrone_update(
+    const RaydroneConfigPayload& patch, uint8_t update_mask) {
+    portENTER_CRITICAL(&s_raydrone_state_mux);
+    RaydroneConfigPayload next = p4.raydrone;
+    if (update_mask & RAYDRONE_UPDATE_ACTIVE) {
+        next.flags = patch.flags;
+    }
+    if (update_mask & RAYDRONE_UPDATE_MATERIAL) {
+        next.material = patch.material;
+    }
+    if (update_mask & RAYDRONE_UPDATE_CHARACTER) {
+        next.character = patch.character;
+    }
+    if (update_mask & RAYDRONE_UPDATE_MOTION) {
+        next.motion = patch.motion;
+    }
+    if (update_mask & RAYDRONE_UPDATE_SPACE) {
+        next.space = patch.space;
+    }
+    if (update_mask & RAYDRONE_UPDATE_VOLUME) {
+        next.volume = patch.volume;
+    }
+    if (update_mask & RAYDRONE_UPDATE_MIX) {
+        next.mix = patch.mix;
+    }
+    if (update_mask & RAYDRONE_UPDATE_EVOLUTION) {
+        next.evolution = patch.evolution;
+    }
+    next = normalize_raydrone(next);
+    p4.raydrone = next;
+    portEXIT_CRITICAL(&s_raydrone_state_mux);
+    return next;
+}
+
+void p4_raydrone_store(const RaydroneConfigPayload& config) {
+    const RaydroneConfigPayload safe = normalize_raydrone(config);
+    portENTER_CRITICAL(&s_raydrone_state_mux);
+    p4.raydrone = safe;
+    portEXIT_CRITICAL(&s_raydrone_state_mux);
+}
 
 // P4 SD remote browse state
 P4SdState p4sd = {};
@@ -244,6 +323,18 @@ void uart_handler_init(void) {
     p4.resonance_x10 = 10;
     p4.bitcrush_bits = 16;
     p4.sample_rate_hz = 32000;
+    const RaydroneConfigPayload raydrone_defaults = {
+        RAYDRONE_CONFIG_VERSION,
+        0,
+        RAYDRONE_DEFAULT_MATERIAL,
+        RAYDRONE_DEFAULT_CHARACTER,
+        RAYDRONE_DEFAULT_MOTION,
+        RAYDRONE_DEFAULT_SPACE,
+        RAYDRONE_DEFAULT_VOLUME,
+        RAYDRONE_DEFAULT_MIX,
+        RAYDRONE_DEFAULT_EVOLUTION,
+    };
+    p4_raydrone_store(raydrone_defaults);
     for (int i = 0; i < 16; i++) p4.track_volume[i] = 75;
 
     // SD / MIDI load state

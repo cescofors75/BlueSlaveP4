@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "../../shared/raydrone_protocol.h"
 
 // Initialize WiFi + UDP
 void udp_handler_init(void);
@@ -51,6 +52,12 @@ void udp_send_set_sample_rate(int rateHz);
 void udp_send_fx_enc(int enc_id, uint8_t value, bool muted);
 // pot_id: 0=Fold macro, 1=Crush macro, 2=Phaser macro
 void udp_send_fx_pot(int pot_id, uint8_t value, bool muted);
+
+// RayDrone uses partial JSON edits; S3 merges them into one atomic Daisy payload.
+void udp_raydrone_toggle_active(void);
+void udp_raydrone_cycle_material(void);
+void udp_set_raydrone_value(uint8_t update_mask, uint8_t value,
+                            bool transmit);
 
 // Solo
 void udp_send_solo(int track, bool soloed);
